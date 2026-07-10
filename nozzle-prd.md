@@ -4,7 +4,7 @@
 
 **Product:** Open-source, Drizzle-native sharding and fleet management for Cloudflare D1
 
-**Status:** Pre-implementation product contract
+**Status:** Implementation in progress; unreleased
 
 **Release policy:** One complete public release. Nozzle is either complete against this document or it is not released.
 
@@ -13,6 +13,8 @@
 Normative terms such as **MUST**, **MUST NOT**, **SHOULD**, and **MAY** describe release requirements.
 
 This file is the sole product source of truth. Requirements, architecture decisions, rationale, rejected alternatives, risks, and release-blocking proof obligations MUST be maintained here together. Other documentation may explain this contract but MUST NOT redefine it.
+
+Normative product requirements and accepted architecture decisions may exist only in this file. Supporting guides, READMEs, schemas, examples, `AGENTS.md`, skills, RFCs, ADRs, and generated evidence are derivative. A conflict is a release failure and this file wins. An RFC or ADR has no accepted force until its decision is incorporated into section 29.
 
 ## 1. Product contract
 
@@ -341,7 +343,12 @@ The control database MUST include versioned equivalents of:
 - `nozzle_schema_versions`
 - `nozzle_migrations`
 - `nozzle_operations`
+- `nozzle_operation_effects`
 - `nozzle_operation_steps`
+- `nozzle_operation_transitions`
+- `nozzle_provider_attempts`
+- `nozzle_provider_attempt_outcomes`
+- `nozzle_d1_resources`
 - `nozzle_leases`
 - `nozzle_idempotency_keys`
 - `nozzle_capacity_samples`
@@ -349,7 +356,9 @@ The control database MUST include versioned equivalents of:
 - `nozzle_controllers`
 - `nozzle_audit_log`
 
-Operations MUST be reconstructible from step-level records. Configuration and topology versions MUST be immutable after publication.
+`nozzle_operations`, `nozzle_operation_steps`, and immutable transition receipts are the canonical envelope for every mutating command, including provisioning, migration, movement, saga, backup, restore, retirement, and deletion. Domain-specific tables are materialized checkpoints keyed by and foreign-keyed to that canonical operation; they MUST NOT form an independent operation authority. A contradiction between the generic ledger and a domain checkpoint enters `intervention_required`.
+
+Operations MUST be reconstructible from checksum-verified canonical input, capability snapshot, plan, step, transition, and subordinate receipt records without relying on process memory. Configuration and topology versions MUST be immutable after publication.
 
 Control schema version 1 persists lease rows instead of deleting them, so fencing tokens can never reset. Lease acquisition, renewal, release, and authorization use D1 server time, the shared pure lease reference model, and exact optimistic compare-and-swap predicates. A takeover advances the token by exactly one and is permitted only after release or authoritative expiry; shard-local triggers independently reject token rollback, token jumps, unfenced identity changes, active-lease takeover, and deletion. Compare-and-swap retries are bounded at 16 before the operation enters an actionable intervention state.
 
@@ -419,7 +428,7 @@ Additional APIs include:
 await nozzle.session(workspaceId, token)
 await nozzle.locate(workspaceId)
 await nozzle.fanOut(options)
-await nozzle.saga("operation-name", steps)
+await nozzle.saga("transfer.v1", { idempotencyKey, input })
 ```
 
 All public APIs MUST have stable error identities, runtime validation, TypeScript types, examples, and compatibility tests.
@@ -574,6 +583,21 @@ Every mutating operation MUST be represented as a persisted state machine with:
 
 Restarting a command with the same operation ID MUST resume safely. Starting an incompatible operation while another holds the relevant fence MUST fail clearly.
 
+Every physical provider dispatch follows this protocol:
+
+1. persist and audit the step transition to `running` under a live fenced lease;
+2. persist an immutable provider-attempt acceptance receipt containing the provider target, endpoint, request checksum, attempt ID, actor binding, and lease fence before dispatch;
+3. never dispatch without that receipt;
+4. recover an orphaned provider step with no accepted receipt as proven not dispatched and therefore eligible for its first physical attempt;
+5. recover an accepted receipt without a terminal receipt as `unknown`;
+6. use a terminal receipt to reconcile the generic step even if the original executor died before recording the step outcome;
+7. reject a late response under an expired fence as authority for a control-state transition; and
+8. observe every unknown effect before another physical attempt.
+
+The operation transition receipt, step state, derived operation status, and audit event MUST commit atomically. Provider receipts are subordinate immutable evidence, and the subsequent audited transition MUST reference their checksum exactly. The audit chain is totally ordered per environment using D1 server time. Provider outcome certainty and logical repeatability are separate facts: `unknown` always requires observation, while `retryable_failed` means non-application has already been proven.
+
+Provider-attempt purpose is immutable. An `effect` receipt is accepted only for the exact active attempt of a `running` step under the same fence. A `reconciliation` receipt is non-mutating, is accepted only while the step is `unknown`, and requires a strictly newer active fence. A provider-backed step can record success, definite rejection, or unknown outcome only when the corresponding terminal receipt state and outcome checksum match exactly; reconciliation requires a separate confirmed observation receipt.
+
 ### 14.2 Provisioning and adoption
 
 Nozzle MUST:
@@ -590,6 +614,18 @@ Nozzle MUST:
 - support multiple Cloudflare accounts, authentication profiles, and environments as explicitly separate targets and fleets without accidental cross-target mutation.
 
 Resource creation MUST NOT assume the provider accepts an idempotency key when it does not. Nozzle must implement idempotency at its own operation layer.
+
+A D1 resource's canonical identity is its provider-target checksum, fleet and environment, logical shard, collision-resistant resource-generation ID, and provider UUID. A database name is a selector, never sufficient identity. Every generation receives a public-safe random token sealed into the operation input and generated name. The installed shard marker repeats the generation, fleet, shard, creation operation, plan, provider UUID, and target identities.
+
+The D1 resource lifecycle stores stable materialization facts only: `planned`, `registered`, `ready`, `quarantined`, `retired`, `deleted`, and `abandoned`. Transient execution facts such as creating, updating, deleting, running, failed, or unknown exist only in the canonical operation step. `planned -> registered` atomically records the provider UUID; `registered -> ready` requires a fresh matching direct observation; quarantine recovery requires a fresh observation recorded after quarantine; `retired -> deleted` requires a fresh structured direct-UUID absence observation recorded after retirement; `planned -> abandoned` is allowed only before any provider binding. The UUID remains in the deleted tombstone and can never be rebound.
+
+Desired intent, recorded provider binding, and observed provider state are distinct fields. Every observation is version-stamped against the resource state so an old healthy observation cannot recover a quarantine and an old absence observation cannot confirm deletion. Every materialization version is linked atomically to an append-only `nozzle_operation_effects` receipt containing the succeeded canonical transition, exact fence, prior and next resource versions, evidence checksum, canonical reconstructible record, and record checksum.
+
+Name-only adoption is prohibited. A marked resource may be resumed or adopted automatically only when the marker and every immutable property match. An unmarked database requires an explicit adoption authorization plus provider-target, UUID, schema, data, jurisdiction, and conflict inspection.
+
+Canonical jurisdiction is `global`, `eu`, or `fedramp`. `global` is encoded by omitting Cloudflare jurisdiction and normalized from an omitted or null observed value. Jurisdiction is enforced immutable desired state. A primary-location hint is a creation-time preference, is not observable afterward, and cannot establish identity or drift. Nozzle rejects supplying both jurisdiction and a location hint.
+
+Unknown create is reconciled through the documented provider-side name search, complete pagination of that search, exact local name filtering, direct UUID inspection, generation-token matching, and immutable-property validation; it is never retried blindly. The provider's `total_count` for a name search is account-global and MUST NOT be treated as the filtered result count. If an ambiguous create has no visible exact-name candidate, the operation remains `await_create_visibility`; zero visible results do not prove non-application and cannot authorize another create. Unknown delete is reconciled by a structured Cloudflare API `404` from direct GET of the exact recorded UUID; an unstructured 404 or list omission is insufficient. Delete always targets a recorded UUID and requires a matching marker, zero ownership, routes, bindings, and recovery obligations, an elapsed safety window, and sealed irreversible authorization.
 
 ### 14.3 Capacity planning
 
@@ -623,6 +659,10 @@ Storage thresholds alone are insufficient. A small but overloaded database MUST 
 Reconciliation MUST compare desired, recorded, and observed state. It MUST produce an inspectable plan before mutation and MUST be safe under concurrent processes, API rate limits, partial failure, and stale observations.
 
 Reconciliation MUST never recreate or delete a resource based solely on a missing cache entry.
+
+A pagination-complete D1 inventory means only that every requested offset page decoded consistently. It is not a provider snapshot. Every scan records its target, start and end time, page evidence, UUID set, response checksums, and rate-limit evidence. Incomplete, inconsistent, duplicated, or over-budget scans permit diagnostics only. A recorded UUID missing from a list is verified by direct GET before any state change. Creation uses a fresh exact-name observation under a target-and-name lease, and every mutation revalidates exact resource identity and immutable properties immediately before dispatch.
+
+One durable rate gate per provider target and credential-identity checksum coordinates Nozzle controllers. `Retry-After` is a minimum delay; `Ratelimit` and `Ratelimit-Policy` update the gate before bounded jittered backoff. Nozzle MUST disclose that provider-account activity outside Nozzle is not fully observable.
 
 ## 15. Migrations and deployment coordination
 
@@ -867,9 +907,15 @@ Fan-out MUST support:
 
 Fan-out MUST NOT imply a global snapshot or transparent distributed join.
 
+The first page seals the query checksum, schema identity, route-manifest checksum, exact shard set, immutable total order, partial policy, cumulative budgets, per-shard positions and bookmarks, and expiry. Continuations use keyset predicates, never SQL offset. Nozzle appends canonical shard ID and primary key as hidden tie-breakers and rejects safe cursor mode when a requested ordering column is not declared immutable.
+
+Per-shard positions advance only through rows actually emitted. A topology or route-manifest change returns `RouteVersionConflictError`; version 1 does not translate cursors across movement. If any shard fails and partial results are allowed, the result is marked incomplete and carries no continuation cursor. Cumulative rows, bytes, cost, pages, and deadline carry forward so a continuation cannot reset budgets. Tokens are integrity-protected, expiring, bounded, and contain no raw query values; version 1 rejects per-shard state that exceeds the token cap rather than adding server-side cursor state.
+
+Concurrent inserts, updates, and deletes may appear in or disappear from later pages. No global as-of set is claimed. With fixed topology, complete shards, immutable ordering, and a quiescent dataset, each unchanged row is emitted exactly once. The implementation uses a bounded heap-based K-way merge with `O(K log S)` work and is differential-tested against a straightforward collect-and-sort reference.
+
 ### 17.2 Sagas
 
-Multi-shard writes use explicit durable sagas.
+Multi-shard writes use explicit durable sagas. Saga definitions are immutable, versioned descriptors registered at build or deploy time. Each step names versioned forward, observe, and compensation actions plus an artifact checksum. A required action version cannot be removed while a nonterminal saga or retained recovery record references it.
 
 Saga support MUST include:
 
@@ -885,6 +931,10 @@ Saga support MUST include:
 - no exactly-once guarantee.
 
 Nozzle MUST surface partial commitment honestly.
+
+Saga version 1 is deliberately serial. It executes forward actions in sealed order, stops launching forwards after terminal failure, and reconciles an unknown forward before compensation. Confirmed forward effects compensate in strict reverse order. An unknown compensation is reconciled before continuing. Compensation is a new effect, not rollback; failed or unknown compensation surfaces partial commitment and may require intervention. Cancellation and timeout are durable requests that stop new actions, reconcile in-flight unknowns, and then compensate confirmed effects; they are not claims that in-flight work stopped.
+
+Every D1 saga action writes its shard-local idempotency and result receipt atomically with the application mutation. External actions require an adapter that proves idempotency or provides an observation oracle. A noncompensable mutation is rejected unless it is marked irreversible, ordered last, and protected by sealed authorization. Sagas use the canonical operation envelope rather than an independent orchestration authority.
 
 ## 18. Backup, restore, and deletion
 
@@ -1132,7 +1182,7 @@ Generated artifacts include:
 
 Generated files MUST be deterministic, formatted, checksummed where appropriate, clearly marked, and either intentionally tracked or written under an ignored local-state path.
 
-Wrangler configuration remains an inspectable source of truth. Nozzle MUST merge or generate configuration without silently discarding user settings or comments.
+Wrangler configuration remains authoritative user infrastructure input for one installation, not a competing product source of truth. Nozzle MUST merge or generate configuration without silently discarding user settings or comments.
 
 ## 23. CLI
 
@@ -1296,7 +1346,7 @@ Use `fast-check` or an equivalent generator to establish invariants over large g
 - duplicate execution is equivalent to one logical execution;
 - partition-scoped queries never widen their tenant predicate;
 - placement never violates jurisdiction or capacity constraints;
-- fan-out pagination neither duplicates nor omits rows for a fixed topology;
+- fan-out pagination neither duplicates nor omits rows for a fixed topology and quiescent dataset; under concurrent mutation it satisfies the documented monotonic keyset contract without claiming a snapshot;
 - configuration parse/serialize/upgrade round trips preserve meaning;
 - error redaction never reveals generated secret values.
 
@@ -2028,6 +2078,14 @@ No distributed system is literally failure-proof. For Nozzle, bulletproof means:
 44. Public source configuration is tracked; live topology, credentials, logs, backups, local databases, and operational state are ignored.
 45. Generated files declare generator version, input checksum, commit safety, edit policy, and regeneration command.
 46. Public packages use only a namespace controlled by the project. The unrelated unscoped `nozzle` npm package is never a release target.
+47. Generic operations are the canonical mutation envelope; domain tables are checked materializations rather than independent operation authorities.
+48. Provider dispatch requires a durable accepted-attempt receipt; accepted without a terminal outcome becomes unknown after fencing, while receipt absence proves no dispatch.
+49. Provider target, fleet and environment, resource generation, and D1 UUID form resource identity; names alone never authorize adoption or deletion.
+50. Fan-out continuations are keyset-based, topology-pinned, cumulative-budgeted, and explicitly non-snapshot.
+51. Saga version 1 is serial, descriptor-driven, receipt-backed, and reverse-compensating.
+52. This Markdown file and its stable requirement markers are the only normative requirement registry.
+53. D1 resource lifecycle stores stable materialization facts; transient execution state belongs only to the canonical operation step.
+54. A zero-result observation after ambiguous create remains unresolved and can never authorize an automatic second create.
 
 ### 29.4 Mechanisms intentionally rejected
 
@@ -2050,6 +2108,14 @@ The baseline architecture rejects:
 - silent support for unknown Drizzle or Wrangler versions;
 - treating an unknown provider outcome as success or failure;
 - provider deletion before quarantine and verification.
+- treating offset-paginated provider inventory as a snapshot;
+- name-only adoption or deletion;
+- blind retry of an ambiguous provider mutation;
+- offset-based fan-out continuation;
+- continuing an ordered cursor after partial shard failure;
+- arbitrary invocation-time saga closures;
+- compensation before an unknown forward outcome is reconciled;
+- independent domain operation authorities.
 
 ### 29.5 Risk register
 
@@ -2063,6 +2129,7 @@ The baseline architecture rejects:
 8. **Automatic movement oscillates:** require sustained thresholds, hysteresis, cooldown, movement cost, and minimum expected benefit.
 9. **Dedicated tenants bypass bucket fencing:** use reserved buckets and persistent former-source partition fences.
 10. **Product or package naming is unavailable:** keep names provisional, publish under a controlled namespace, and complete independent naming review.
+11. **Per-environment audit-head contention exceeds the bounded retry budget:** benchmark concurrent controllers and scale workloads against the production append path; change the partitioning strategy only if the simple total order misses the release budget.
 
 ### 29.6 Release-blocking proof obligations
 
@@ -2084,6 +2151,12 @@ These are not future iterations. Every obligation MUST have passing evidence bef
 14. **Credential adapters:** prove the Wrangler-profile/API-token matrix, absence of private auth-file access, and structured reconciliation of every non-JSON mutation.
 15. **Operational data plane:** prove remote movement through operation and leaf Workers with bounded memory and payloads, restart at every checkpoint, capability rejection, key rotation, mixed topologies, and measured throughput and cost.
 16. **Relational movement boundary:** prove acyclic graphs copy and replay in valid order and unsupported cycles, self-references, and triggers fail configuration unless a custom adapter passes the complete safety contract.
+17. **Provider inventory and identity:** prove inventory churn, duplicate names, stale scans, unknown create and delete, direct-UUID absence checks, and cross-target mutation rejection.
+18. **Provider crash gaps:** prove every crash point before and after step acceptance, provider-attempt acceptance, terminal receipt, generic step transition, audit append, and process or deployment restart.
+19. **Canonical envelope consistency:** prove operation transition, step state, derived status, audit event, provider receipt reference, and every domain checkpoint are atomic or deterministically reconcilable and contradictions fail closed.
+20. **Fan-out continuation:** prove concurrent-write semantics, topology mismatch, keyset tie-breakers, cursor tampering and expiry, partial failure without continuation, and cumulative budgets.
+21. **Saga recovery:** prove handler-version retention, shard-local effect receipts, every forward and compensation unknown-outcome combination, cancellation, timeout, and process or deployment restart.
+22. **Resource projection recovery:** prove every operation-effect/resource-commit crash point, append-only reconstruction, stale observation rejection, identity immutability, tombstone retention, and concurrent version races.
 
 ### 29.7 Decision-change rule
 
@@ -2096,6 +2169,7 @@ The same change MUST update the affected requirement, tests, threat model, migra
 This PRD is based on current public documentation and MUST be revalidated during implementation and release qualification:
 
 - [Cloudflare D1 limits](https://developers.cloudflare.com/d1/platform/limits/)
+- [Cloudflare D1 management API](https://developers.cloudflare.com/api/resources/d1/)
 - [Cloudflare D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/)
 - [Cloudflare D1 Workers Binding API](https://developers.cloudflare.com/d1/worker-api/)
 - [Cloudflare D1 read replication](https://developers.cloudflare.com/d1/best-practices/read-replication/)
