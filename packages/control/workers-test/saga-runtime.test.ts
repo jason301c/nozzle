@@ -253,6 +253,7 @@ describe("real workerd D1 saga projection", () => {
     )
     const operations = new D1OperationStore(env.DB, digest)
     const leases = new D1LeaseStore(env.DB)
+    const attempts = new D1SagaAttemptStore(env.DB, digest)
     const coordinator = new D1SagaCoordinatorStore(env.DB, digest)
     await operations.create({
       actorChecksum: "workerd-coordinator-actor",
@@ -310,6 +311,36 @@ describe("real workerd D1 saga projection", () => {
     })
     expect(initialized).toMatchObject({ stateVersion: 0, status: "planned" })
     expect(begun).toMatchObject({ disposition: "execute" })
+    await attempts.accept({
+      attemptId: actionAttemptId,
+      inputJson: invocation.stepInputJsons.write as string,
+      phase: "forward",
+      proof,
+      purpose: "effect",
+      sagaId,
+      sagaStepId: "write",
+    })
+    const outcome = await attempts.complete({
+      attemptId: actionAttemptId,
+      evidenceJson: '{"source":"workerd-coordinator"}',
+      outputJson: '{"written":true}',
+      proof,
+      state: "confirmed",
+    })
+    if (outcome.state !== "confirmed") throw new Error("Expected a confirmed action outcome.")
+    const settled = await coordinator.settleActionFromReceipt({
+      actorChecksum: "workerd-coordinator-actor",
+      attemptId: actionAttemptId,
+      operationId,
+      phase: "forward",
+      proof,
+      sagaId,
+      stepId: "write",
+    })
+    expect(settled.steps.write?.forward).toMatchObject({
+      resultChecksum: outcome.outputChecksum,
+      state: "succeeded",
+    })
     const counts = await env.DB.prepare(
       `SELECT
         (SELECT count(*) FROM "nozzle_operation_effects"
@@ -317,11 +348,29 @@ describe("real workerd D1 saga projection", () => {
         (SELECT "state_version" FROM "nozzle_sagas" WHERE "saga_id" = ?1) AS "saga_version",
         (SELECT json_extract("record_json", '$.startedAttempts')
          FROM "nozzle_operation_steps"
-         WHERE "operation_id" = ?2 AND "step_id" = ?3) AS "operation_attempts"`,
+         WHERE "operation_id" = ?2 AND "step_id" = ?3) AS "operation_attempts",
+        (SELECT json_extract("record_json", '$.state')
+         FROM "nozzle_operation_steps"
+         WHERE "operation_id" = ?2 AND "step_id" = ?3) AS "operation_state",
+        (SELECT json_extract("record_json", '$.resultChecksum')
+         FROM "nozzle_operation_steps"
+         WHERE "operation_id" = ?2 AND "step_id" = ?3) AS "operation_result"`,
     )
       .bind(sagaId, operationId, sagaActionOperationStepId("write", "forward"))
-      .first<{ effects: number; operation_attempts: number; saga_version: number }>()
-    expect(counts).toEqual({ effects: 2, operation_attempts: 1, saga_version: 1 })
+      .first<{
+        effects: number
+        operation_attempts: number
+        operation_result: string
+        operation_state: string
+        saga_version: number
+      }>()
+    expect(counts).toEqual({
+      effects: 3,
+      operation_attempts: 1,
+      operation_result: outcome.outcomeChecksum,
+      operation_state: "succeeded",
+      saga_version: 2,
+    })
   })
 
   it("atomically advances a saga only through exact fenced operation transitions", async () => {
@@ -538,7 +587,9 @@ describe("real workerd D1 saga projection", () => {
           WHERE "resource_kind" = 'saga' AND "resource_id" = ?1) AS "effects",
          (SELECT count(*) FROM "nozzle_saga_action_attempts"
           WHERE "saga_id" = ?1) AS "attempts",
-         (SELECT count(*) FROM "nozzle_saga_action_attempt_outcomes") AS "outcomes"`,
+         (SELECT count(*) FROM "nozzle_saga_action_attempt_outcomes" AS "outcome"
+          JOIN "nozzle_saga_action_attempts" AS "attempt" USING ("attempt_id")
+          WHERE "attempt"."saga_id" = ?1) AS "outcomes"`,
     )
       .bind(sagaId)
       .first<{ attempts: number; effects: number; outcomes: number; sagas: number }>()

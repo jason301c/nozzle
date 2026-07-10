@@ -18,7 +18,7 @@ import type {
 } from "../src/database.js"
 import { D1LeaseStore } from "../src/lease-store.js"
 import { D1OperationStore } from "../src/operation-store.js"
-import { sagaActionInputChecksum } from "../src/saga-attempt-store.js"
+import { D1SagaAttemptStore, sagaActionInputChecksum } from "../src/saga-attempt-store.js"
 import { D1SagaCoordinatorStore, type InitializeSagaInput } from "../src/saga-coordinator-store.js"
 import {
   D1SagaStore,
@@ -182,6 +182,12 @@ type QueryFault =
         | "transition_mismatch"
     }
   | { readonly kind: "saga_operation_mismatch" }
+  | {
+      readonly kind:
+        | "settlement_effect_missing"
+        | "settlement_saga_missing"
+        | "settlement_transition_missing"
+    }
 
 class QueryFaultDatabase implements TransactionalControlDatabase {
   readonly #base: DatabaseAdapter
@@ -200,6 +206,25 @@ class QueryFaultDatabase implements TransactionalControlDatabase {
   }
 
   prepare(sql: string): ControlStatement {
+    if (
+      this.#fault.kind === "settlement_saga_missing" &&
+      sql.includes('FROM "nozzle_sagas" AS "saga"')
+    ) {
+      return new FixedStatement(null)
+    }
+    if (
+      this.#fault.kind === "settlement_transition_missing" &&
+      sql === 'SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1'
+    ) {
+      return new FixedStatement(null)
+    }
+    if (
+      this.#fault.kind === "settlement_effect_missing" &&
+      sql.includes('WHERE "transition_id" = ?1') &&
+      sql.includes("\"resource_kind\" = 'saga'")
+    ) {
+      return new FixedStatement(null)
+    }
     if (
       this.#fault.kind === "audit_snapshot" &&
       sql.includes('AS "now_ms"') &&
@@ -247,6 +272,8 @@ class QueryFaultDatabase implements TransactionalControlDatabase {
 }
 
 interface Fixture {
+  readonly actionInputJson: string
+  readonly attempts: D1SagaAttemptStore
   readonly base: DatabaseAdapter
   readonly coordinator: D1SagaCoordinatorStore
   readonly initialize: InitializeSagaInput
@@ -280,6 +307,7 @@ async function fixture(
   const operations = new D1OperationStore(base, digest)
   const leases = new D1LeaseStore(base)
   const sagas = new D1SagaStore(base, digest)
+  const attempts = new D1SagaAttemptStore(base, digest)
   const coordinator = new D1SagaCoordinatorStore(database, digest)
   const operationId = `coordinator-operation-${suffix}`
   const sagaId = `coordinator-saga-${suffix}`
@@ -292,7 +320,7 @@ async function fixture(
       steps: [
         {
           authorizationPolicyChecksum: null,
-          baseRetryDelayMs: 10,
+          baseRetryDelayMs: 0,
           compensationAction: {
             actionId: "a.compensate",
             artifactChecksum: "cc".repeat(32),
@@ -326,7 +354,8 @@ async function fixture(
     },
     digest,
   )
-  const actionInputChecksum = await sagaActionInputChecksum('{"value":1}', digest)
+  const actionInputJson = '{"value":1}'
+  const actionInputChecksum = await sagaActionInputChecksum(actionInputJson, digest)
   const capabilitySnapshotJson = '{"runtime":"coordinator-v1"}'
   const operationInputJson = JSON.stringify({ sagaId })
   const plan = await sealOperationPlan(
@@ -432,6 +461,8 @@ async function fixture(
     stepId: SAGA_INIT_OPERATION_STEP_ID,
   })
   return {
+    actionInputJson,
+    attempts,
     base,
     coordinator,
     initialize: {
@@ -458,6 +489,38 @@ async function fixture(
   }
 }
 
+async function terminalReceipt(
+  run: Fixture,
+  state: "confirmed" | "failed" | "not_applied" | "unknown",
+  attemptId = `${run.sagaId}:a:forward:1`,
+) {
+  await run.coordinator.beginAction(actionInput(run, attemptId))
+  await run.attempts.accept({
+    attemptId,
+    inputJson: run.actionInputJson,
+    phase: "forward",
+    proof: run.proof,
+    purpose: "effect",
+    sagaId: run.sagaId,
+    sagaStepId: "a",
+  })
+  return state === "confirmed"
+    ? run.attempts.complete({
+        attemptId,
+        evidenceJson: JSON.stringify({ attemptId, source: "provider" }),
+        outputJson: JSON.stringify({ attemptId, value: "created" }),
+        proof: run.proof,
+        state,
+      })
+    : run.attempts.complete({
+        attemptId,
+        errorJson: JSON.stringify({ attemptId, code: state }),
+        evidenceJson: JSON.stringify({ attemptId, source: "provider" }),
+        proof: run.proof,
+        state,
+      })
+}
+
 function actionInput(run: Fixture, attemptId = `${run.sagaId}:a:forward:1`) {
   return {
     actorChecksum: "coordinator-test-actor",
@@ -476,6 +539,279 @@ function count(database: DatabaseSync, table: string): number {
 }
 
 describe("D1SagaCoordinatorStore", () => {
+  it("atomically classifies a confirmed terminal receipt across both ledgers", async () => {
+    const run = await fixture("settle-confirmed")
+    await run.coordinator.initializeSaga(run.initialize)
+    const attemptId = `${run.sagaId}:a:forward:1`
+    const receipt = await terminalReceipt(run, "confirmed", attemptId)
+    if (receipt.state !== "confirmed") throw new Error("Expected a confirmed receipt.")
+
+    const settled = await run.coordinator.settleActionFromReceipt(actionInput(run, attemptId))
+    expect(settled.steps.a?.forward).toMatchObject({
+      lastAttemptId: attemptId,
+      resultChecksum: receipt.outputChecksum,
+      state: "succeeded",
+    })
+    expect(
+      (await run.operations.get(run.operationId))?.operation.steps["saga:forward:a"],
+    ).toMatchObject({
+      lastAttemptId: attemptId,
+      resultChecksum: receipt.outcomeChecksum,
+      state: "succeeded",
+    })
+    expect(count(run.base.database, "nozzle_operation_effects")).toBe(3)
+
+    await expect(
+      run.coordinator.settleActionFromReceipt(actionInput(run, attemptId)),
+    ).resolves.toEqual(settled)
+    expect(count(run.base.database, "nozzle_operation_effects")).toBe(3)
+  })
+
+  it("keeps retryable not-applied receipts retryable until the sealed budget is exhausted", async () => {
+    const run = await fixture("settle-retries")
+    await run.coordinator.initializeSaga(run.initialize)
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const attemptId = `${run.sagaId}:a:forward:${attempt}`
+      const receipt = await terminalReceipt(run, "not_applied", attemptId)
+      if (receipt.state === "accepted" || receipt.state === "confirmed") {
+        throw new Error("Expected a failed receipt.")
+      }
+      const settled = await run.coordinator.settleActionFromReceipt(actionInput(run, attemptId))
+      const action = settled.steps.a?.forward
+      const operationAction = (await run.operations.get(run.operationId))?.operation.steps[
+        "saga:forward:a"
+      ]
+      if (attempt < 3) {
+        expect(action).toMatchObject({
+          attempts: attempt,
+          errorChecksum: receipt.errorChecksum,
+          state: "retryable_failed",
+        })
+        expect(operationAction).toMatchObject({
+          errorChecksum: receipt.outcomeChecksum,
+          state: "retryable_failed",
+        })
+      } else {
+        expect(settled).toMatchObject({ status: "failed", terminationCause: "failure" })
+        expect(action).toMatchObject({
+          attempts: 3,
+          errorChecksum: receipt.errorChecksum,
+          state: "failed",
+        })
+        expect(operationAction).toMatchObject({
+          resultChecksum: receipt.outcomeChecksum,
+          state: "succeeded",
+        })
+        const effect = run.base.database
+          .prepare(
+            `SELECT "effect_kind" FROM "nozzle_operation_effects"
+             WHERE "operation_id" = ? AND "step_id" = 'saga:forward:a'
+             ORDER BY "created_at_ms" DESC, rowid DESC LIMIT 1`,
+          )
+          .get(run.operationId) as { effect_kind: string }
+        expect(effect.effect_kind).toBe("action:forward:failure:definitely_not_applied_terminal")
+      }
+      await expect(
+        run.coordinator.settleActionFromReceipt(actionInput(run, attemptId)),
+      ).resolves.toEqual(settled)
+      if (attempt === 2) {
+        await expect(
+          run.coordinator.settleActionFromReceipt(actionInput(run, `${run.sagaId}:a:forward:1`)),
+        ).rejects.toThrow(/not the current action attempt/u)
+      }
+    }
+  })
+
+  it.each([
+    ["failed", "failed", "succeeded", "failed"],
+    ["unknown", "unknown", "unknown", "running"],
+  ] as const)("maps a %s receipt without confusing protocol classification with business success", async (receiptState, sagaState, operationState, sagaStatus) => {
+    const run = await fixture(`settle-${receiptState}`)
+    await run.coordinator.initializeSaga(run.initialize)
+    const attemptId = `${run.sagaId}:a:forward:1`
+    const receipt = await terminalReceipt(run, receiptState, attemptId)
+    if (receipt.state === "accepted" || receipt.state === "confirmed") {
+      throw new Error("Expected a failed receipt.")
+    }
+
+    const settled = await run.coordinator.settleActionFromReceipt(actionInput(run, attemptId))
+    expect(settled.status).toBe(sagaStatus)
+    expect(settled.steps.a?.forward).toMatchObject({
+      errorChecksum: receipt.errorChecksum,
+      state: sagaState,
+    })
+    const operationAction = (await run.operations.get(run.operationId))?.operation.steps[
+      "saga:forward:a"
+    ]
+    expect(operationAction).toMatchObject(
+      operationState === "succeeded"
+        ? { resultChecksum: receipt.outcomeChecksum, state: operationState }
+        : { errorChecksum: receipt.outcomeChecksum, state: operationState },
+    )
+    await expect(
+      run.coordinator.settleActionFromReceipt(actionInput(run, attemptId)),
+    ).resolves.toEqual(settled)
+  })
+
+  it("fails closed if the generic operation action diverges before classification", async () => {
+    const run = await fixture("settle-active-divergence")
+    await run.coordinator.initializeSaga(run.initialize)
+    const attemptId = `${run.sagaId}:a:forward:1`
+    const receipt = await terminalReceipt(run, "confirmed", attemptId)
+    if (receipt.state !== "confirmed") throw new Error("Expected a confirmed receipt.")
+    await run.operations.completeStep({
+      actorChecksum: "coordinator-test-actor",
+      attemptId,
+      observedPostconditionChecksum: `${run.operationId}:forward:postcondition`,
+      operationId: run.operationId,
+      proof: run.proof,
+      resultChecksum: receipt.outcomeChecksum,
+      stepId: "saga:forward:a",
+    })
+
+    await expect(
+      run.coordinator.settleActionFromReceipt(actionInput(run, attemptId)),
+    ).rejects.toThrow(/contradicts the active coupled attempt/u)
+  })
+
+  it("rejects observation-only outcomes and missing exact replay evidence", async () => {
+    const observation = await fixture("settle-observation")
+    await observation.coordinator.initializeSaga(observation.initialize)
+    const effectAttemptId = `${observation.sagaId}:a:forward:1`
+    await terminalReceipt(observation, "unknown", effectAttemptId)
+    await observation.coordinator.settleActionFromReceipt(actionInput(observation, effectAttemptId))
+    await observation.leases.release({ proof: observation.proof })
+    const reacquired = await observation.leases.acquire({
+      acquisitionId: `${observation.sagaId}:observation-acquisition`,
+      holderId: `${observation.sagaId}:observation-controller`,
+      leaseKey: observation.proof.leaseKey,
+      ttlMs: 60_000,
+    })
+    if (!reacquired.acquired) throw new Error("Expected the observation lease.")
+    const observationProof = leaseProof(reacquired.record)
+    const observationAttemptId = `${effectAttemptId}:observation`
+    await observation.attempts.accept({
+      attemptId: observationAttemptId,
+      inputJson: '{"observe":true}',
+      phase: "forward",
+      proof: observationProof,
+      purpose: "observation",
+      sagaId: observation.sagaId,
+      sagaStepId: "a",
+    })
+    await observation.attempts.complete({
+      attemptId: observationAttemptId,
+      errorJson: '{"code":"indeterminate"}',
+      evidenceJson: '{"source":"provider"}',
+      proof: observationProof,
+      state: "indeterminate",
+    })
+    await expect(
+      observation.coordinator.settleActionFromReceipt({
+        ...actionInput(observation, observationAttemptId),
+        proof: observationProof,
+      }),
+    ).rejects.toThrow(/cannot be indeterminate/u)
+
+    const replay = await fixture("settle-replay-evidence")
+    await replay.coordinator.initializeSaga(replay.initialize)
+    const attemptId = `${replay.sagaId}:a:forward:1`
+    await terminalReceipt(replay, "confirmed", attemptId)
+    await replay.coordinator.settleActionFromReceipt(actionInput(replay, attemptId))
+    for (const [kind, message] of [
+      ["settlement_saga_missing", /saga does not exist/u],
+      ["settlement_transition_missing", /exact operation transition/u],
+      ["settlement_effect_missing", /exact coupled effect receipt/u],
+    ] as const) {
+      const faulted = new D1SagaCoordinatorStore(
+        new QueryFaultDatabase(replay.base, { kind }),
+        digest,
+      )
+      await expect(faulted.settleActionFromReceipt(actionInput(replay, attemptId))).rejects.toThrow(
+        message,
+      )
+    }
+  })
+
+  it("requires an exact terminal effect receipt and exact coupled attempt identity", async () => {
+    const missing = await fixture("settle-missing")
+    await missing.coordinator.initializeSaga(missing.initialize)
+    await expect(missing.coordinator.settleActionFromReceipt(actionInput(missing))).rejects.toThrow(
+      /not durably accepted/u,
+    )
+
+    const accepted = await fixture("settle-accepted")
+    await accepted.coordinator.initializeSaga(accepted.initialize)
+    const attemptId = `${accepted.sagaId}:a:forward:1`
+    await accepted.coordinator.beginAction(actionInput(accepted, attemptId))
+    await accepted.attempts.accept({
+      attemptId,
+      inputJson: accepted.actionInputJson,
+      phase: "forward",
+      proof: accepted.proof,
+      purpose: "effect",
+      sagaId: accepted.sagaId,
+      sagaStepId: "a",
+    })
+    await expect(
+      accepted.coordinator.settleActionFromReceipt(actionInput(accepted, attemptId)),
+    ).rejects.toThrow(/no terminal receipt/u)
+
+    const terminal = await terminalReceipt(accepted, "confirmed", attemptId)
+    expect(terminal.state).toBe("confirmed")
+    await expect(
+      accepted.coordinator.settleActionFromReceipt({
+        ...actionInput(accepted, attemptId),
+        operationId: "another-operation",
+      }),
+    ).rejects.toThrow(/different action/u)
+    await expect(
+      accepted.coordinator.settleActionFromReceipt({
+        ...actionInput(accepted, attemptId),
+        proof: { ...accepted.proof, acquisitionId: "another-acquisition" },
+      }),
+    ).rejects.toThrow(/different lease fence/u)
+  })
+
+  it("recovers an exact terminal settlement after losing the D1 response", async () => {
+    const run = await fixture("settle-lost-response")
+    await run.coordinator.initializeSaga(run.initialize)
+    const attemptId = `${run.sagaId}:a:forward:1`
+    const receipt = await terminalReceipt(run, "confirmed", attemptId)
+    const faulted = new D1SagaCoordinatorStore(
+      new FaultDatabase(run.base, { kind: "commit_then_throw" }),
+      digest,
+    )
+
+    const settled = await faulted.settleActionFromReceipt(actionInput(run, attemptId))
+    expect(settled.steps.a?.forward).toMatchObject({
+      resultChecksum: receipt.state === "confirmed" ? receipt.outputChecksum : undefined,
+      state: "succeeded",
+    })
+    expect(count(run.base.database, "nozzle_operation_effects")).toBe(3)
+  })
+
+  it("rolls terminal settlement back as one unit when an interior statement fails", async () => {
+    const run = await fixture("settle-rollback")
+    await run.coordinator.initializeSaga(run.initialize)
+    const attemptId = `${run.sagaId}:a:forward:1`
+    await terminalReceipt(run, "confirmed", attemptId)
+    const faulted = new D1SagaCoordinatorStore(
+      new FaultDatabase(run.base, { index: 3, kind: "rollback_before" }),
+      digest,
+    )
+
+    await expect(faulted.settleActionFromReceipt(actionInput(run, attemptId))).rejects.toThrow(
+      /Settling a saga action exceeded/u,
+    )
+    expect((await run.sagas.get(run.sagaId))?.steps.a?.forward.state).toBe("running")
+    expect(
+      (await run.operations.get(run.operationId))?.operation.steps["saga:forward:a"]?.state,
+    ).toBe("running")
+    expect(count(run.base.database, "nozzle_operation_effects")).toBe(2)
+  })
+
   it("atomically initializes both ledgers and begins an action with synchronized attempts", async () => {
     const run = await fixture("atomic")
     const initialized = await run.coordinator.initializeSaga(run.initialize)

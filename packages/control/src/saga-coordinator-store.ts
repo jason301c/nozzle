@@ -8,10 +8,15 @@ import {
   loadAuditEvent,
   NozzleError,
   type OperationRecord,
+  type OperationStepPlan,
   type OperationStepRecord,
   operationStatus,
+  recordSagaActionFailure,
+  recordSagaActionSuccess,
+  recordStepFailure,
   recordStepSuccess,
   type SagaActionPhase,
+  type SagaActionRecord,
   type SagaBeginDecision,
   type SagaDescriptor,
   type SagaRecord,
@@ -26,8 +31,10 @@ import { D1LeaseStore } from "./lease-store.js"
 import {
   D1OperationStore,
   type LoadedOperation,
+  operationStepRecordJson,
   operationTransitionIdentity,
 } from "./operation-store.js"
+import { D1SagaAttemptStore, type SagaAttemptRecord } from "./saga-attempt-store.js"
 import {
   D1SagaStore,
   SAGA_INIT_OPERATION_STEP_ID,
@@ -119,6 +126,8 @@ export interface BeginCoordinatedSagaActionInput {
   readonly sagaId: string
   readonly stepId: string
 }
+
+export type SettleCoordinatedSagaActionInput = BeginCoordinatedSagaActionInput
 
 function configuration(message: string): never {
   throw new NozzleError("ConfigurationError", message)
@@ -225,11 +234,32 @@ function alignedBeginDecision(
   return expected[operationDisposition] === sagaDisposition
 }
 
+function terminalAttempt(
+  receipt: SagaAttemptRecord,
+): asserts receipt is Exclude<SagaAttemptRecord, { readonly state: "accepted" }> {
+  if (receipt.state === "accepted") resume("The saga action attempt has no terminal receipt.")
+}
+
+function classifiedEffectKind(
+  phase: SagaActionPhase,
+  receipt: Exclude<SagaAttemptRecord, { readonly state: "accepted" }>,
+  action: SagaRecord["steps"][string][SagaActionPhase],
+): string {
+  if (receipt.state === "confirmed") return `action:${phase}:success`
+  if (receipt.state === "unknown") return `action:${phase}:failure:unknown`
+  const classification =
+    receipt.state === "not_applied" && action.state === "retryable_failed"
+      ? "definitely_not_applied_retryable"
+      : "definitely_not_applied_terminal"
+  return `action:${phase}:failure:${classification}`
+}
+
 export class D1SagaCoordinatorStore {
   readonly #database: TransactionalControlDatabase
   readonly #digest: DigestFunction
   readonly #leases: D1LeaseStore
   readonly #operations: D1OperationStore
+  readonly #attempts: D1SagaAttemptStore
   readonly #sagas: D1SagaStore
 
   constructor(database: TransactionalControlDatabase, digest: DigestFunction) {
@@ -246,6 +276,7 @@ export class D1SagaCoordinatorStore {
     this.#digest = digest
     this.#leases = new D1LeaseStore(database)
     this.#operations = new D1OperationStore(database, digest)
+    this.#attempts = new D1SagaAttemptStore(database, digest)
     this.#sagas = new D1SagaStore(database, digest)
   }
 
@@ -311,8 +342,8 @@ export class D1SagaCoordinatorStore {
   ): readonly ControlStatement[] {
     const beforeRecord = input.beforeOperation.operation.steps[input.stepId] as OperationStepRecord
     const afterRecord = input.afterOperation.steps[input.stepId] as OperationStepRecord
-    const beforeJson = JSON.stringify(beforeRecord)
-    const afterJson = JSON.stringify(afterRecord)
+    const beforeJson = operationStepRecordJson(beforeRecord)
+    const afterJson = operationStepRecordJson(afterRecord)
     const fromStatus = operationStatus(input.beforeOperation.operation)
     const toStatus = operationStatus(input.afterOperation)
     const beforeSagaJson = input.beforeSaga === undefined ? undefined : encode(input.beforeSaga)
@@ -532,8 +563,8 @@ export class D1SagaCoordinatorStore {
   async #verify(input: CoupledTransition, recordJson: string, recordChecksum: string) {
     const beforeRecord = input.beforeOperation.operation.steps[input.stepId] as OperationStepRecord
     const afterRecord = input.afterOperation.steps[input.stepId] as OperationStepRecord
-    const beforeJson = JSON.stringify(beforeRecord)
-    const afterJson = JSON.stringify(afterRecord)
+    const beforeJson = operationStepRecordJson(beforeRecord)
+    const afterJson = operationStepRecordJson(afterRecord)
     const fromStatus = operationStatus(input.beforeOperation.operation)
     const toStatus = operationStatus(input.afterOperation)
     const transition = await this.#database
@@ -784,5 +815,210 @@ export class D1SagaCoordinatorStore {
       }
     }
     return intervention("Beginning a saga action exceeded the bounded coupled retry budget.")
+  }
+
+  async settleActionFromReceipt(input: SettleCoordinatedSagaActionInput): Promise<SagaRecord> {
+    boundedText(input.actorChecksum, "Saga coordinator actor checksum")
+    boundedText(input.attemptId, "Saga action attempt ID")
+    const operationStepId = sagaActionOperationStepId(input.stepId, input.phase)
+    const receipt = await this.#attempts.get(input.attemptId)
+    if (receipt === undefined) return resume("The saga action attempt was not durably accepted.")
+    terminalAttempt(receipt)
+    if (receipt.state === "indeterminate") {
+      return intervention("An effect receipt cannot be indeterminate.")
+    }
+    if (
+      receipt.sagaId !== input.sagaId ||
+      receipt.operationId !== input.operationId ||
+      receipt.operationStepId !== operationStepId ||
+      receipt.sagaStepId !== input.stepId ||
+      receipt.phase !== input.phase ||
+      receipt.purpose !== "effect"
+    ) {
+      return intervention("The terminal saga receipt belongs to a different action.")
+    }
+    if (
+      receipt.leaseKey !== input.proof.leaseKey ||
+      receipt.holderId !== input.proof.holderId ||
+      receipt.acquisitionId !== input.proof.acquisitionId ||
+      receipt.fencingToken !== input.proof.fencingToken
+    ) {
+      return resume("The terminal saga receipt was accepted under a different lease fence.")
+    }
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+      const beforeOperation = await this.#operation(input.operationId)
+      const beforeSaga = await this.#saga(input.sagaId, input.operationId)
+      if (beforeSaga === undefined) return resume("The saga does not exist.")
+      const action = beforeSaga.steps[input.stepId]?.[input.phase] as SagaActionRecord
+      const operationAction = beforeOperation.operation.steps[
+        operationStepId
+      ] as OperationStepRecord
+      if (action.state !== "running") {
+        if (action.lastAttemptId !== input.attemptId) {
+          return resume("The terminal saga receipt is not the current action attempt.")
+        }
+        const transitionKind = operationAction.state === "succeeded" ? "succeeded" : "failed"
+        const transitionId = operationTransitionIdentity(transitionKind, [
+          input.operationId,
+          operationStepId,
+          input.attemptId,
+        ])
+        const effectKind = classifiedEffectKind(input.phase, receipt, action)
+        const transition = await this.#database
+          .prepare(`SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1`)
+          .bind(transitionId)
+          .first<TransitionReceiptRow>()
+        if (
+          transition === null ||
+          !exactColumns(transition as unknown as Record<string, unknown>, {
+            acquisition_id: receipt.acquisitionId,
+            fencing_token: receipt.fencingToken,
+            holder_id: receipt.holderId,
+            lease_key: receipt.leaseKey,
+            operation_id: input.operationId,
+            step_id: operationStepId,
+            to_operation_status: operationStatus(beforeOperation.operation),
+            to_record_json: operationStepRecordJson(operationAction),
+            transition_id: transitionId,
+          })
+        ) {
+          return intervention("The classified saga action lacks its exact operation transition.")
+        }
+        const recordJson = encode(beforeSaga)
+        const recordChecksum = await this.#recordChecksum(recordJson)
+        const effectId = await this.#identity("saga-effect", [
+          transitionId,
+          input.sagaId,
+          effectKind,
+          beforeSaga.stateVersion.toString(10),
+        ])
+        const effect = await this.#database
+          .prepare(
+            `SELECT * FROM "nozzle_operation_effects"
+             WHERE "transition_id" = ?1 AND "resource_kind" = 'saga' AND "resource_id" = ?2`,
+          )
+          .bind(transitionId, input.sagaId)
+          .first<EffectReceiptRow>()
+        if (
+          effect === null ||
+          !exactColumns(effect as unknown as Record<string, unknown>, {
+            acquisition_id: receipt.acquisitionId,
+            effect_id: effectId,
+            effect_kind: effectKind,
+            evidence_checksum: receipt.outcomeChecksum,
+            fencing_token: receipt.fencingToken,
+            from_state_version: beforeSaga.stateVersion - 1,
+            holder_id: receipt.holderId,
+            lease_key: receipt.leaseKey,
+            operation_id: input.operationId,
+            record_checksum: recordChecksum,
+            record_json: recordJson,
+            resource_id: input.sagaId,
+            resource_kind: "saga",
+            step_id: operationStepId,
+            to_state_version: beforeSaga.stateVersion,
+            transition_id: transitionId,
+          })
+        ) {
+          return intervention("The classified saga action lacks its exact coupled effect receipt.")
+        }
+        return beforeSaga
+      }
+      if (
+        operationAction.state !== "running" ||
+        action.activeAttemptId !== input.attemptId ||
+        operationAction.activeAttemptId !== input.attemptId
+      ) {
+        return intervention("The terminal saga receipt contradicts the active coupled attempt.")
+      }
+      const authorized = await this.#leases.authorizeAt(input.proof)
+      const planStep = beforeOperation.operation.plan.steps.find(
+        (step) => step.stepId === operationStepId,
+      ) as OperationStepPlan
+      let afterSaga: SagaRecord
+      let afterOperation: OperationRecord
+      let transitionKind: "failed" | "succeeded"
+      if (receipt.state === "confirmed") {
+        afterSaga = recordSagaActionSuccess(beforeSaga, {
+          attemptId: input.attemptId,
+          phase: input.phase,
+          resultChecksum: receipt.outputChecksum,
+          serverTimeMs: authorized.serverTimeMs,
+          stepId: input.stepId,
+        })
+        afterOperation = recordStepSuccess(beforeOperation.operation, {
+          attemptId: input.attemptId,
+          observedPostconditionChecksum: planStep.postconditionChecksum,
+          resultChecksum: receipt.outcomeChecksum,
+          stepId: operationStepId,
+        })
+        transitionKind = "succeeded"
+      } else {
+        const outcome =
+          receipt.state === "unknown"
+            ? "unknown"
+            : receipt.state === "not_applied"
+              ? "definitely_not_applied_retryable"
+              : "definitely_not_applied_terminal"
+        afterSaga = recordSagaActionFailure(beforeSaga, {
+          attemptId: input.attemptId,
+          errorChecksum: receipt.errorChecksum,
+          outcome,
+          phase: input.phase,
+          serverTimeMs: authorized.serverTimeMs,
+          stepId: input.stepId,
+        })
+        const afterAction = afterSaga.steps[input.stepId]?.[input.phase]
+        if (receipt.state !== "unknown" && afterAction?.state !== "retryable_failed") {
+          afterOperation = recordStepSuccess(beforeOperation.operation, {
+            attemptId: input.attemptId,
+            observedPostconditionChecksum: planStep.postconditionChecksum,
+            resultChecksum: receipt.outcomeChecksum,
+            stepId: operationStepId,
+          })
+          transitionKind = "succeeded"
+        } else {
+          afterOperation = recordStepFailure(beforeOperation.operation, {
+            attemptId: input.attemptId,
+            errorChecksum: receipt.outcomeChecksum,
+            outcome: receipt.state === "unknown" ? "unknown" : "definitely_not_applied",
+            stepId: operationStepId,
+          })
+          transitionKind = "failed"
+        }
+      }
+      const transitionId = operationTransitionIdentity(transitionKind, [
+        input.operationId,
+        operationStepId,
+        input.attemptId,
+      ])
+      const afterAction = afterSaga.steps[input.stepId]?.[input.phase] as SagaActionRecord
+      const effectKind = classifiedEffectKind(input.phase, receipt, afterAction)
+      const effectId = await this.#identity("saga-effect", [
+        transitionId,
+        input.sagaId,
+        effectKind,
+        afterSaga.stateVersion.toString(10),
+      ])
+      if (
+        await this.#commit({
+          actorChecksum: input.actorChecksum,
+          afterOperation,
+          afterSaga,
+          auditEventType: "saga.action.classified",
+          beforeOperation,
+          beforeSaga,
+          effectId,
+          effectKind,
+          evidenceChecksum: receipt.outcomeChecksum,
+          proof: input.proof,
+          stepId: operationStepId,
+          transitionId,
+        })
+      ) {
+        return afterSaga
+      }
+    }
+    return intervention("Settling a saga action exceeded the bounded coupled retry budget.")
   }
 }

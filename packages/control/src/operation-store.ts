@@ -234,6 +234,10 @@ function canonicalJsonValue(value: unknown): unknown {
   return value
 }
 
+export function operationStepRecordJson(record: OperationStepRecord): string {
+  return JSON.stringify(canonicalJsonValue(record))
+}
+
 function canonicalJson(value: unknown, label: string, persisted: boolean): string {
   const fail = persisted ? intervention : configuration
   if (typeof value !== "string" || value.length === 0) return fail(`${label} must be JSON text.`)
@@ -721,7 +725,7 @@ export class D1OperationStore {
               planStep.idempotencyKey,
               planStep.leaseKey,
               JSON.stringify(planStep),
-              JSON.stringify(initial.steps[planStep.stepId]),
+              operationStepRecordJson(initial.steps[planStep.stepId] as OperationStepRecord),
               input.plan.planChecksum,
               input.environmentId,
               input.idempotencyScope,
@@ -861,8 +865,8 @@ export class D1OperationStore {
     if (planStep.leaseKey !== input.proof.leaseKey) {
       return resume("The operation transition was authorized under the wrong lease key.")
     }
-    const beforeJson = JSON.stringify(beforeRecord)
-    const afterJson = JSON.stringify(afterRecord)
+    const beforeJson = operationStepRecordJson(beforeRecord)
+    const afterJson = operationStepRecordJson(afterRecord)
     const fromStatus = operationStatus(input.before.operation)
     const toStatus = operationStatus(after.operation)
     const auditSnapshot = await this.#auditSnapshot(input.before.environmentId)
@@ -1161,7 +1165,8 @@ export class D1OperationStore {
         if (
           receipt.operation_id !== input.operationId ||
           receipt.step_id !== input.stepId ||
-          receipt.to_record_json !== JSON.stringify(record) ||
+          receipt.to_record_json !==
+            (record === undefined ? undefined : operationStepRecordJson(record)) ||
           receipt.fencing_token !== input.proof.fencingToken ||
           receipt.lease_key !== input.proof.leaseKey ||
           receipt.holder_id !== input.proof.holderId ||
