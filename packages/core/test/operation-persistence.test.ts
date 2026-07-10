@@ -8,6 +8,7 @@ import {
   leaseProof,
   loadAuditEvent,
   loadOperationRecord,
+  markOperationStepNotRequired,
   markRunningStepsUnknownAfterCrash,
   type OperationPlan,
   type OperationRecord,
@@ -155,6 +156,33 @@ describe("persisted operation record integrity", () => {
       outcome: "not_applied",
       stepId: "one",
     })
+    const conditional = createOperationRecord(
+      await sealOperationPlan(
+        {
+          capabilitySnapshotChecksum: "capabilities",
+          idempotencyKey: "conditional-operation-key",
+          inputChecksum: "conditional-operation-input",
+          operationId: "conditional-operation",
+          operationType: "persistence-test",
+          steps: [
+            step(),
+            step({
+              activation: "conditional",
+              idempotencyKey: "conditional-step-key",
+              inputChecksum: "conditional-step-input",
+              postconditionChecksum: "conditional-postcondition",
+              preconditionChecksum: "conditional-precondition",
+              stepId: "conditional",
+            }),
+          ],
+        },
+        digest,
+      ),
+    )
+    const notRequired = markOperationStepNotRequired(conditional, {
+      evidenceChecksum: "conditional-decision",
+      stepId: "conditional",
+    })
 
     for (const operation of [
       pending,
@@ -169,6 +197,7 @@ describe("persisted operation record integrity", () => {
       crashUnknown,
       reconciledCrash,
       reconciledNever,
+      notRequired,
     ]) {
       const loaded = await roundTrip(operation)
       expect(loaded).toEqual(operation)
@@ -177,6 +206,9 @@ describe("persisted operation record integrity", () => {
       expect(Object.isFrozen(loaded.steps)).toBe(true)
       expect(Object.isFrozen(loaded.steps.one)).toBe(true)
       expect(Object.isFrozen(loaded.steps.one?.costCounters)).toBe(true)
+      if (loaded.steps.conditional !== undefined) {
+        expect(Object.isFrozen(loaded.steps.conditional)).toBe(true)
+      }
     }
   })
 
@@ -294,7 +326,6 @@ describe("persisted operation record integrity", () => {
       resultChecksum: "result",
       stepId: "one",
     }).steps.one as NonNullable<(typeof runningOperation.steps)[string]>
-
     const malformed = [
       { operation: pendingOperation, step: { ...pending, startedAttempts: 1 } },
       { operation: runningOperation, step: { ...running, startedAttempts: 0 } },
@@ -323,6 +354,14 @@ describe("persisted operation record integrity", () => {
         step: { ...running, state: "intervention_required", activeAttemptId: undefined },
       },
       { operation: pendingOperation, step: { ...pending, costCounters: { calls: 1 } } },
+      {
+        operation: pendingOperation,
+        step: {
+          ...pending,
+          reconciliationEvidenceChecksum: "decision",
+          state: "not_required",
+        },
+      },
     ]
     for (const item of malformed) {
       await expect(

@@ -14,15 +14,18 @@ export const OPERATION_STEP_STATES = [
   "succeeded",
   "failed",
   "intervention_required",
+  "not_required",
 ] as const
 
 export type OperationStepState = (typeof OPERATION_STEP_STATES)[number]
 export type RetryClassification = "idempotent" | "never" | "reconcile_first"
 export type CheckpointKind = "irreversible" | "reversible"
 export type EffectProtocol = "opaque" | "provider_receipt" | "saga_receipt"
+export type StepActivation = "conditional" | "required"
 export type DigestFunction = (input: Uint8Array) => Promise<string> | string
 
 export interface OperationStepPlanInput {
+  readonly activation?: StepActivation
   readonly checkpoint: CheckpointKind
   readonly dependsOn?: readonly string[]
   readonly effectProtocol?: EffectProtocol
@@ -46,6 +49,7 @@ export interface OperationPlanInput {
 }
 
 export interface OperationStepPlan extends OperationStepPlanInput {
+  readonly activation: StepActivation
   readonly dependsOn: readonly string[]
   readonly effectProtocol: EffectProtocol
 }
@@ -280,6 +284,10 @@ function normalizeStep(step: OperationStepPlanInput): OperationStepPlan {
   if (!(["idempotent", "never", "reconcile_first"] as const).includes(step.retryClassification)) {
     configurationError("Step retry classification is invalid.")
   }
+  const activation = step.activation ?? "required"
+  if (!(["conditional", "required"] as const).includes(activation)) {
+    configurationError("Step activation is invalid.")
+  }
   const effectProtocol = step.effectProtocol ?? "opaque"
   if (!(["opaque", "provider_receipt", "saga_receipt"] as const).includes(effectProtocol)) {
     configurationError("Step effect protocol is invalid.")
@@ -289,7 +297,12 @@ function normalizeStep(step: OperationStepPlanInput): OperationStepPlan {
     configurationError("Step dependencies must be unique and non-empty.")
   }
   for (const dependency of dependsOn) assertWellFormedString(dependency, "Step dependency")
-  return Object.freeze({ ...step, dependsOn: Object.freeze(dependsOn), effectProtocol })
+  return Object.freeze({
+    ...step,
+    activation,
+    dependsOn: Object.freeze(dependsOn),
+    effectProtocol,
+  })
 }
 
 function normalizePlan(input: OperationPlanInput): Omit<OperationPlan, "planChecksum"> {
@@ -314,6 +327,9 @@ function normalizePlan(input: OperationPlanInput): Omit<OperationPlan, "planChec
     }
     stepIds.add(step.stepId)
     idempotencyKeys.add(step.idempotencyKey)
+  }
+  if (!steps.some((step) => step.activation === "required")) {
+    configurationError("An operation requires at least one required step.")
   }
   for (const step of steps) {
     if (step.dependsOn.includes(step.stepId)) configurationError("A step cannot depend on itself.")
@@ -384,6 +400,7 @@ function planChecksumValues(plan: Omit<OperationPlan, "planChecksum">): readonly
       step.leaseKey,
       step.preconditionChecksum,
       step.postconditionChecksum,
+      step.activation,
       step.effectProtocol,
       step.retryClassification,
       step.checkpoint,
@@ -605,12 +622,14 @@ function loadPersistedStepRecord(value: unknown, planStep: OperationStepPlan): O
   )
   const state = value.state as OperationStepState
   const pending = state === "pending"
+  const neverAttempted = pending || state === "not_required"
   persistedInvariant(
-    pending === (value.startedAttempts === 0),
-    "Persisted pending state contradicts the attempt count.",
+    neverAttempted === (value.startedAttempts === 0),
+    "Persisted unattempted state contradicts the attempt count.",
   )
   persistedInvariant(
-    pending === (lastAttemptId === undefined) && pending === (fencingToken === undefined),
+    neverAttempted === (lastAttemptId === undefined) &&
+      neverAttempted === (fencingToken === undefined),
     "Persisted attempt identity is incomplete or unexpected.",
   )
   persistedInvariant(
@@ -632,6 +651,7 @@ function loadPersistedStepRecord(value: unknown, planStep: OperationStepPlan): O
       state === "succeeded" ||
       state === "retryable_failed" ||
       state === "failed" ||
+      state === "not_required" ||
       state === "intervention_required",
     "Persisted reconciliation evidence is attached to an invalid state.",
   )
@@ -656,6 +676,12 @@ function loadPersistedStepRecord(value: unknown, planStep: OperationStepPlan): O
       "Persisted intervention state has no reconciliation evidence.",
     )
   }
+  if (state === "not_required") {
+    persistedInvariant(
+      planStep.activation === "conditional" && reconciliationEvidenceChecksum !== undefined,
+      "A not-required step lacks its conditional decision evidence.",
+    )
+  }
   if (planStep.checkpoint === "reversible") {
     persistedInvariant(
       authorizationChecksum === undefined,
@@ -663,14 +689,14 @@ function loadPersistedStepRecord(value: unknown, planStep: OperationStepPlan): O
     )
   } else {
     persistedInvariant(
-      pending === (authorizationChecksum === undefined),
+      neverAttempted === (authorizationChecksum === undefined),
       "Persisted irreversible authorization state is inconsistent.",
     )
   }
-  if (pending) {
+  if (neverAttempted) {
     persistedInvariant(
       Object.keys(costCounters).length === 0 && Object.keys(progressCounters).length === 0,
-      "A pending step persisted progress or cost counters.",
+      "An unattempted step persisted progress or cost counters.",
     )
   }
   return Object.freeze({
@@ -739,7 +765,9 @@ function updateStep(
 
 export function operationStatus(operation: OperationRecord): OperationStatus {
   const states = Object.values(operation.steps).map((step) => step.state)
-  if (states.every((state) => state === "succeeded")) return "succeeded"
+  if (states.every((state) => state === "succeeded" || state === "not_required")) {
+    return "succeeded"
+  }
   if (states.includes("intervention_required")) return "intervention_required"
   if (states.includes("failed")) return "failed"
   if (states.includes("unknown")) return "reconciling"
@@ -1103,6 +1131,39 @@ function assertDependenciesSucceeded(operation: OperationRecord, step: Operation
   }
 }
 
+export function markOperationStepNotRequired(
+  operation: OperationRecord,
+  input: {
+    readonly evidenceChecksum: string
+    readonly stepId: string
+  },
+): OperationRecord {
+  assertWellFormedString(input.evidenceChecksum, "Conditional-step decision evidence checksum")
+  const planStep = getPlanStep(operation, input.stepId)
+  const record = getStepRecord(operation, input.stepId)
+  if (planStep.activation !== "conditional") {
+    configurationError("Only a conditional operation step can become not required.")
+  }
+  if (record.state === "not_required") {
+    if (record.reconciliationEvidenceChecksum === input.evidenceChecksum) return operation
+    interventionError("A duplicate conditional-step decision contradicts durable evidence.")
+  }
+  if (record.state !== "pending") {
+    resumeError("Only an unattempted pending step can become not required.")
+  }
+  return updateStep(
+    operation,
+    input.stepId,
+    Object.freeze({
+      costCounters: record.costCounters,
+      progressCounters: record.progressCounters,
+      reconciliationEvidenceChecksum: input.evidenceChecksum,
+      startedAttempts: 0,
+      state: "not_required",
+    }),
+  )
+}
+
 export function beginOperationStep(
   operation: OperationRecord,
   request: StepInvocationRequest,
@@ -1133,6 +1194,9 @@ export function beginOperationStep(
     })
   }
   if (record.state === "failed" || record.state === "intervention_required") {
+    return Object.freeze({ disposition: "blocked", operation })
+  }
+  if (record.state === "not_required") {
     return Object.freeze({ disposition: "blocked", operation })
   }
 

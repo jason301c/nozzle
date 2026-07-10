@@ -16,6 +16,7 @@ import {
   leaseProof,
   loadIrreversibleAuthorization,
   loadOperationPlan,
+  markOperationStepNotRequired,
   markRunningStepNotDispatchedAfterCrash,
   markRunningStepsUnknownAfterCrash,
   markRunningStepUnknownAfterCrash,
@@ -151,7 +152,7 @@ describe("immutable operation plans", () => {
     const noDependencies = { ...step("standalone") }
     delete noDependencies.dependsOn
     await expect(sealOperationPlan(planInput([noDependencies]), digest)).resolves.toMatchObject({
-      steps: [{ dependsOn: [], effectProtocol: "opaque" }],
+      steps: [{ activation: "required", dependsOn: [], effectProtocol: "opaque" }],
     })
   })
 
@@ -192,6 +193,8 @@ describe("immutable operation plans", () => {
     planInput([step("a", { checkpoint: "bad" as "reversible" })]),
     planInput([step("a", { retryClassification: "bad" as "never" })]),
     planInput([step("a", { effectProtocol: "bad" as "opaque" })]),
+    planInput([step("a", { activation: "bad" as "required" })]),
+    planInput([step("a", { activation: "conditional" })]),
     planInput([step("", {})]),
     planInput([step("a", { recoveryInstructions: "" })]),
   ])("rejects malformed or ambiguous plan input", async (input) => {
@@ -632,6 +635,82 @@ describe("sealed irreversible authorization", () => {
 })
 
 describe("operation crash, resume, and idempotency guards", () => {
+  it("settles unused conditional steps with durable evidence instead of fake success", async () => {
+    const activeLease = acquire()
+    const operation = createOperationRecord(
+      await plan([step("required"), step("unused", { activation: "conditional" })]),
+    )
+    expect(operationStatus(operation)).toBe("planned")
+    const notRequired = markOperationStepNotRequired(operation, {
+      evidenceChecksum: "sealed-branch-decision",
+      stepId: "unused",
+    })
+    expect(notRequired.steps.unused).toEqual({
+      costCounters: {},
+      progressCounters: {},
+      reconciliationEvidenceChecksum: "sealed-branch-decision",
+      startedAttempts: 0,
+      state: "not_required",
+    })
+    expect(
+      begin(notRequired, activeLease, {
+        idempotencyKey: "idempotency-unused",
+        precondition: "pre-unused",
+        stepId: "unused",
+      }).disposition,
+    ).toBe("blocked")
+    expect(
+      markOperationStepNotRequired(notRequired, {
+        evidenceChecksum: "sealed-branch-decision",
+        stepId: "unused",
+      }),
+    ).toBe(notRequired)
+    expect(() =>
+      markOperationStepNotRequired(notRequired, {
+        evidenceChecksum: "contradictory-decision",
+        stepId: "unused",
+      }),
+    ).toThrow(/contradicts durable evidence/u)
+    expect(() =>
+      markOperationStepNotRequired(operation, {
+        evidenceChecksum: "decision",
+        stepId: "required",
+      }),
+    ).toThrow(/conditional operation step/u)
+    expect(() =>
+      markOperationStepNotRequired(operation, { evidenceChecksum: "", stepId: "unused" }),
+    ).toThrow(/evidence checksum/u)
+
+    const requiredRunning = begin(notRequired, activeLease, {
+      idempotencyKey: "idempotency-required",
+      precondition: "pre-required",
+      stepId: "required",
+    }).operation
+    const complete = recordStepSuccess(requiredRunning, {
+      attemptId: "attempt-1",
+      observedPostconditionChecksum: "post-required",
+      resultChecksum: "required-result",
+      stepId: "required",
+    })
+    expect(operationStatus(complete)).toBe("succeeded")
+    expect(() =>
+      markOperationStepNotRequired(requiredRunning, {
+        evidenceChecksum: "too-late",
+        stepId: "required",
+      }),
+    ).toThrow(/conditional operation step/u)
+    expect(() =>
+      markOperationStepNotRequired(
+        begin(operation, activeLease, {
+          idempotencyKey: "idempotency-unused",
+          precondition: "pre-unused",
+          stepId: "unused",
+        }).operation,
+        { evidenceChecksum: "too-late", stepId: "unused" },
+      ),
+    ).toThrow(/unattempted pending/u)
+  })
+
   it("executes dependencies in order and exactly replays a completed logical result", async () => {
     const operation = createOperationRecord(
       await plan([step("first"), step("second", { dependsOn: ["first"] })]),

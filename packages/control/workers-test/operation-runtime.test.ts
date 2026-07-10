@@ -25,6 +25,86 @@ beforeAll(async () => {
 })
 
 describe("real workerd operation ledger", () => {
+  it("persists an unused conditional path without fabricating an attempt", async () => {
+    const store = new D1OperationStore(env.DB, digest)
+    const leases = new D1LeaseStore(env.DB)
+    const capabilitySnapshotJson = '{"runtime":"workerd-conditional-v1"}'
+    const inputJson = '{"branch":"required"}'
+    const operationId = "workerd-conditional-operation"
+    const leaseKey = "workerd:conditional"
+    const plan = await sealOperationPlan(
+      {
+        capabilitySnapshotChecksum: await digest(new TextEncoder().encode(capabilitySnapshotJson)),
+        idempotencyKey: "workerd-conditional-operation-key",
+        inputChecksum: await digest(new TextEncoder().encode(inputJson)),
+        operationId,
+        operationType: "workerd-conditional-test",
+        steps: [
+          {
+            checkpoint: "reversible",
+            idempotencyKey: "workerd-required-key",
+            inputChecksum: "workerd-required-input",
+            leaseKey,
+            postconditionChecksum: "workerd-required-postcondition",
+            preconditionChecksum: "workerd-required-precondition",
+            recoveryInstructions: "Execute the required branch.",
+            retryClassification: "idempotent",
+            stepId: "required",
+          },
+          {
+            activation: "conditional",
+            checkpoint: "reversible",
+            effectProtocol: "saga_receipt",
+            idempotencyKey: "workerd-conditional-key",
+            inputChecksum: "workerd-conditional-input",
+            leaseKey,
+            postconditionChecksum: "workerd-conditional-postcondition",
+            preconditionChecksum: "workerd-conditional-precondition",
+            recoveryInstructions: "Use the sealed branch decision.",
+            retryClassification: "reconcile_first",
+            stepId: "conditional",
+          },
+        ],
+      },
+      digest,
+    )
+    await store.create({
+      actorChecksum: "workerd-conditional-actor",
+      capabilitySnapshotJson,
+      environmentId: "workerd-conditional",
+      idempotencyScope: "workerd-conditional",
+      inputJson,
+      plan,
+      requiredShardIds: ["workerd-conditional-shard"],
+    })
+    const acquired = await leases.acquire({
+      acquisitionId: "workerd-conditional-acquisition",
+      holderId: "workerd-conditional-controller",
+      leaseKey,
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Conditional lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+    await expect(
+      store.markStepNotRequired({
+        actorChecksum: "workerd-conditional-actor",
+        decisionId: "workerd-conditional-decision",
+        evidenceChecksum: "workerd-terminal-projection",
+        operationId,
+        proof,
+        stepId: "conditional",
+      }),
+    ).resolves.toMatchObject({ steps: { conditional: { state: "not_required" } } })
+    await expect(
+      env.DB.prepare(
+        `SELECT "state", "fencing_token" FROM "nozzle_operation_steps"
+         WHERE "operation_id" = ?1 AND "step_id" = 'conditional'`,
+      )
+        .bind(operationId)
+        .first(),
+    ).resolves.toEqual({ fencing_token: null, state: "not_required" })
+  })
+
   it("atomically creates concurrent operations with exact replay and a valid audit chain", async () => {
     const store = new D1OperationStore(env.DB, digest)
     const capabilitySnapshotJson = JSON.stringify({ provider: "cloudflare-d1" })

@@ -8,6 +8,7 @@ import {
   type LeaseProof,
   loadAuditEvent,
   loadOperationRecord,
+  markOperationStepNotRequired,
   markRunningStepNotDispatchedAfterCrash,
   markRunningStepUnknownAfterCrash,
   NozzleError,
@@ -188,6 +189,11 @@ export interface ReconcileStoredOperationStepInput extends TransitionIdentity {
 
 export interface RecoverStoredOperationStepInput extends TransitionIdentity {
   readonly recoveryId: string
+}
+
+export interface MarkStoredOperationStepNotRequiredInput extends TransitionIdentity {
+  readonly decisionId: string
+  readonly evidenceChecksum: string
 }
 
 function configuration(message: string): never {
@@ -930,7 +936,7 @@ export class D1OperationStore {
         .bind(
           afterJson,
           afterRecord.state,
-          afterRecord.fencingToken as number,
+          afterRecord.fencingToken ?? null,
           input.before.operation.plan.operationId,
           input.stepId,
           beforeJson,
@@ -1100,6 +1106,40 @@ export class D1OperationStore {
         return Object.freeze({ disposition: "execute", operation: persisted.operation })
     }
     return intervention("Beginning an operation step exceeded the bounded transition retry budget.")
+  }
+
+  async markStepNotRequired(
+    input: MarkStoredOperationStepNotRequiredInput,
+  ): Promise<OperationRecord> {
+    nonEmpty(input.operationId, "Operation ID")
+    nonEmpty(input.actorChecksum, "Transition actor checksum")
+    nonEmpty(input.decisionId, "Conditional-step decision ID")
+    nonEmpty(input.evidenceChecksum, "Conditional-step decision evidence checksum")
+    const transitionId = operationTransitionIdentity("not-required", [
+      input.operationId,
+      input.stepId,
+      input.decisionId,
+    ])
+    for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt += 1) {
+      const before = await this.get(input.operationId)
+      if (!before) return resume("The operation does not exist.")
+      const afterOperation = markOperationStepNotRequired(before.operation, input)
+      if (afterOperation === before.operation) return before.operation
+      await this.#leases.authorizeAt(input.proof)
+      const after: LoadedOperation = Object.freeze({ ...before, operation: afterOperation })
+      const persisted = await this.#persistTransition({
+        actorChecksum: input.actorChecksum,
+        after,
+        auditEventType: "step.not_required",
+        auditPayloadChecksum: input.evidenceChecksum,
+        before,
+        proof: input.proof,
+        stepId: input.stepId,
+        transitionId,
+      })
+      if (persisted) return persisted.operation
+    }
+    return intervention("Conditional-step decision exceeded the bounded transition retry budget.")
   }
 
   async recoverRunningStep(input: RecoverStoredOperationStepInput): Promise<OperationRecord> {

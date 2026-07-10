@@ -932,6 +932,118 @@ describe("D1OperationStore", () => {
     ).toEqual({ count: 5 })
   })
 
+  it("atomically settles conditional steps as not required with exact evidence", async () => {
+    const input = planInput({ operationId: "conditional-operation" })
+    const plan = await sealTestPlan({
+      ...input,
+      steps: input.steps.map((candidate) =>
+        candidate.stepId === "b" ? { ...candidate, activation: "conditional" } : candidate,
+      ),
+    })
+    await store.create(creationInput(plan))
+    const leases = new D1LeaseStore(database)
+    const acquired = await leases.acquire({
+      acquisitionId: "conditional-acquisition",
+      holderId: "conditional-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Conditional fixture lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+    await expect(
+      store.markStepNotRequired({
+        actorChecksum: "conditional-actor",
+        decisionId: "missing-decision",
+        evidenceChecksum: "missing-projection",
+        operationId: "missing-conditional-operation",
+        proof,
+        stepId: "b",
+      }),
+    ).rejects.toThrow(/operation does not exist/u)
+    const settled = await store.markStepNotRequired({
+      actorChecksum: "conditional-actor",
+      decisionId: "branch-decision",
+      evidenceChecksum: "terminal-saga-projection",
+      operationId: plan.operationId,
+      proof,
+      stepId: "b",
+    })
+    expect(settled.steps.b).toEqual({
+      costCounters: {},
+      progressCounters: {},
+      reconciliationEvidenceChecksum: "terminal-saga-projection",
+      startedAttempts: 0,
+      state: "not_required",
+    })
+    await expect(
+      store.markStepNotRequired({
+        actorChecksum: "conditional-actor",
+        decisionId: "branch-decision",
+        evidenceChecksum: "terminal-saga-projection",
+        operationId: plan.operationId,
+        proof,
+        stepId: "b",
+      }),
+    ).resolves.toEqual(settled)
+    await expect(
+      store.markStepNotRequired({
+        actorChecksum: "conditional-actor",
+        decisionId: "other-decision",
+        evidenceChecksum: "contradictory-projection",
+        operationId: plan.operationId,
+        proof,
+        stepId: "b",
+      }),
+    ).rejects.toThrow(/contradicts durable evidence/u)
+    await expect(
+      store.markStepNotRequired({
+        actorChecksum: "conditional-actor",
+        decisionId: "required-decision",
+        evidenceChecksum: "invalid-decision",
+        operationId: plan.operationId,
+        proof,
+        stepId: "a",
+      }),
+    ).rejects.toThrow(/conditional operation step/u)
+
+    const rows = persistedRows(database.database, plan.operationId)
+    expect(rows.stepRows[1]).toMatchObject({ fencing_token: null, state: "not_required" })
+    expect(
+      database.database
+        .prepare(
+          `SELECT "event_json" FROM "nozzle_audit_log"
+           WHERE "operation_id" = ? AND "step_id" = 'b'`,
+        )
+        .get(plan.operationId),
+    ).toMatchObject({ event_json: expect.stringContaining('"eventType":"step.not_required"') })
+
+    const boundedInput = planInput({
+      idempotencyKey: "bounded-conditional-operation-key",
+      operationId: "bounded-conditional-operation",
+    })
+    const boundedPlan = await sealTestPlan({
+      ...boundedInput,
+      steps: boundedInput.steps.map((candidate) =>
+        candidate.stepId === "b" ? { ...candidate, activation: "conditional" } : candidate,
+      ),
+    })
+    await store.create(creationInput(boundedPlan))
+    const dropped = new D1OperationStore(
+      new FaultInjectingDatabase(database, { dropTransitionBatch: true }),
+      digest,
+    )
+    await expect(
+      dropped.markStepNotRequired({
+        actorChecksum: "conditional-actor",
+        decisionId: "bounded-decision",
+        evidenceChecksum: "bounded-projection",
+        operationId: boundedPlan.operationId,
+        proof,
+        stepId: "b",
+      }),
+    ).rejects.toThrow(/bounded transition retry budget/u)
+  })
+
   it("persists unknown outcomes and reconciles them under a newer active fence", async () => {
     const plan = await sealedPlan({ operationId: "unknown-operation" })
     await store.create(creationInput(plan))

@@ -360,6 +360,8 @@ The control database MUST include versioned equivalents of:
 
 Operations MUST be reconstructible from checksum-verified canonical input, capability snapshot, plan, step, transition, and subordinate receipt records without relying on process memory. Configuration and topology versions MUST be immutable after publication.
 
+Every operation-plan step declares required or conditional activation; required is the default and every plan contains at least one required step. An unused conditional step advances from unattempted `pending` to terminal `not_required` only through an exactly fenced transition carrying immutable branch-decision evidence. It has no fabricated attempt, result, or fencing metadata and does not satisfy a success dependency. An operation is successful when every step is either genuinely `succeeded` or validly `not_required`.
+
 Control schema version 1 persists lease rows instead of deleting them, so fencing tokens can never reset. Lease acquisition, renewal, release, and authorization use D1 server time, the shared pure lease reference model, and exact optimistic compare-and-swap predicates. A takeover advances the token by exactly one and is permitted only after release or authoritative expiry; shard-local triggers independently reject token rollback, token jumps, unfenced identity changes, active-lease takeover, and deletion. Compare-and-swap retries are bounded at 16 before the operation enters an actionable intervention state.
 
 ### 8.9 Shard-local schema
@@ -2100,6 +2102,7 @@ No distributed system is literally failure-proof. For Nozzle, bulletproof means:
 58. Every saga projection is an exactly fenced materialization of a named canonical operation transition; action dispatch requires agreement between the operation step and saga projection, and serial or reverse-compensation eligibility comes only from the sealed saga state machine.
 59. Saga action inputs and outcomes use append-only, domain-separated Control receipts; those receipts prove dispatch history but never substitute for the shard-local atomic mutation receipt required of D1 action adapters.
 60. A saga action operation step declares the `saga_receipt` effect protocol. Dispatch requires its exact accepted Control receipt; under a newer fence, receipt absence proves the attempt was not dispatched, while receipt presence without a terminal outcome remains unknown. An operation outcome may commit only when the exact terminal saga receipt agrees with its attempt, purpose, step, and checksum.
+61. Conditional operation paths are sealed explicitly and settle as evidenced `not_required`, never as fake successful attempts; required steps cannot be skipped, and at least one required step anchors every plan.
 
 ### 29.4 Mechanisms intentionally rejected
 
