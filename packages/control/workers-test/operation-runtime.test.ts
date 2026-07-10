@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers"
-import { type DigestFunction, sealOperationPlan, verifyAuditChain } from "@nozzle/core"
+import { type DigestFunction, leaseProof, sealOperationPlan, verifyAuditChain } from "@nozzle/core"
 import { beforeAll, describe, expect, it } from "vitest"
+import { D1LeaseStore } from "../src/lease-store.js"
 import { D1OperationStore } from "../src/operation-store.js"
 import { CONTROL_SCHEMA_STATEMENTS } from "../src/schema.js"
 
@@ -89,5 +90,50 @@ describe("real workerd operation ledger", () => {
         digest,
       ),
     ).resolves.toBe(true)
+
+    const leases = new D1LeaseStore(env.DB)
+    const acquired = await leases.acquire({
+      acquisitionId: "workerd-operation-acquisition",
+      holderId: "workerd-operation-controller",
+      leaseKey: "workerd:operation",
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Fixture lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+    await expect(
+      store.beginStep({
+        actorChecksum: "workerd-actor",
+        attemptId: "workerd-attempt",
+        idempotencyKey: "workerd-step-key-0",
+        observedPreconditionChecksum: "precondition",
+        operationId: firstPlan.operationId,
+        proof,
+        stepId: "provision",
+      }),
+    ).resolves.toMatchObject({ disposition: "execute" })
+    await expect(
+      store.failStep({
+        actorChecksum: "workerd-actor",
+        attemptId: "workerd-attempt",
+        errorChecksum: "lost-response",
+        operationId: firstPlan.operationId,
+        outcome: "unknown",
+        proof,
+        stepId: "provision",
+      }),
+    ).resolves.toMatchObject({ steps: { provision: { state: "unknown" } } })
+    await expect(
+      store.reconcileStep({
+        actorChecksum: "workerd-actor",
+        evidenceChecksum: "observed-applied",
+        observedPostconditionChecksum: "postcondition",
+        operationId: firstPlan.operationId,
+        outcome: "applied",
+        proof,
+        reconciliationId: "workerd-reconciliation",
+        resultChecksum: "provider-result",
+        stepId: "provision",
+      }),
+    ).resolves.toMatchObject({ steps: { provision: { state: "succeeded" } } })
   })
 })

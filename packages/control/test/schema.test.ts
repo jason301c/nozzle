@@ -145,12 +145,20 @@ describe("control D1 schema", () => {
         .run()
       database
         .prepare(
+          `INSERT INTO "nozzle_leases"
+           ("lease_key", "holder_id", "acquisition_id", "fencing_token", "expires_at_ms",
+            "updated_at_ms")
+           VALUES ('lease-a', 'holder-a', 'acquisition-a', 1, 9000000000000000, 1)`,
+        )
+        .run()
+      database
+        .prepare(
           `INSERT INTO "nozzle_operation_transitions"
            ("transition_id", "operation_id", "step_id", "from_record_json", "to_record_json",
             "from_operation_status", "to_operation_status", "audit_event_hash", "fencing_token",
-            "created_at_ms")
+            "lease_key", "holder_id", "acquisition_id", "created_at_ms")
            VALUES ('transition-a', 'operation-a', 'step-a', '{}', '{}', 'planned', 'running',
-             'transition-audit', 1, 1)`,
+             'transition-audit', 1, 'lease-a', 'holder-a', 'acquisition-a', 1)`,
         )
         .run()
 
@@ -162,6 +170,24 @@ describe("control D1 schema", () => {
           )
           .run(),
       ).not.toThrow()
+      expect(() =>
+        database
+          .prepare(
+            `UPDATE "nozzle_operations" SET "status" = 'paused', "updated_at_ms" = 3
+             WHERE "operation_id" = 'operation-a'`,
+          )
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_OPERATION_TRANSITION_REQUIRED")
+      expect(() =>
+        database
+          .prepare(
+            `UPDATE "nozzle_operation_steps"
+             SET "record_json" = '{"state":"running","startedAttempts":1}',
+                 "state" = 'running', "fencing_token" = 1
+             WHERE "operation_id" = 'operation-a' AND "step_id" = 'step-a'`,
+          )
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_STEP_TRANSITION_REQUIRED")
       expect(() =>
         database
           .prepare(

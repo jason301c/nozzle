@@ -222,6 +222,9 @@ ON CONFLICT ("singleton") DO NOTHING;`,
   "to_operation_status" TEXT NOT NULL,
   "audit_event_hash" TEXT NOT NULL CHECK (length(trim("audit_event_hash")) > 0),
   "fencing_token" INTEGER NOT NULL CHECK ("fencing_token" >= 1),
+  "lease_key" TEXT NOT NULL,
+  "holder_id" TEXT NOT NULL,
+  "acquisition_id" TEXT NOT NULL,
   "created_at_ms" INTEGER NOT NULL CHECK ("created_at_ms" >= 0),
   FOREIGN KEY ("operation_id", "step_id")
     REFERENCES "nozzle_operation_steps" ("operation_id", "step_id"),
@@ -316,6 +319,19 @@ WHEN NEW."operation_id" IS NOT OLD."operation_id"
   OR NEW."required_shards_json" IS NOT OLD."required_shards_json"
   OR NEW."created_at_ms" IS NOT OLD."created_at_ms"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IMMUTABLE_OPERATION_PLAN'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_operation_status_update"
+BEFORE UPDATE ON "nozzle_operations"
+WHEN NEW."status" IS NOT OLD."status" AND NOT EXISTS (
+  SELECT 1 FROM "nozzle_operation_transitions" AS "transition"
+  JOIN "nozzle_operation_steps" AS "step"
+    ON "step"."operation_id" = "transition"."operation_id"
+   AND "step"."step_id" = "transition"."step_id"
+  WHERE "transition"."operation_id" = OLD."operation_id"
+    AND "transition"."from_operation_status" = OLD."status"
+    AND "transition"."to_operation_status" = NEW."status"
+    AND "step"."record_json" = "transition"."to_record_json"
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_OPERATION_TRANSITION_REQUIRED'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_operation_delete" BEFORE DELETE ON "nozzle_operations" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_OPERATION_PERSISTENT'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_step_plan_update"
 BEFORE UPDATE ON "nozzle_operation_steps"
@@ -325,6 +341,20 @@ WHEN NEW."operation_id" IS NOT OLD."operation_id"
   OR NEW."lease_key" IS NOT OLD."lease_key"
   OR NEW."plan_json" IS NOT OLD."plan_json"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IMMUTABLE_STEP_PLAN'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_step_state_update"
+BEFORE UPDATE ON "nozzle_operation_steps"
+WHEN (
+  NEW."record_json" IS NOT OLD."record_json"
+  OR NEW."state" IS NOT OLD."state"
+  OR NEW."fencing_token" IS NOT OLD."fencing_token"
+) AND NOT EXISTS (
+  SELECT 1 FROM "nozzle_operation_transitions"
+  WHERE "operation_id" = OLD."operation_id" AND "step_id" = OLD."step_id"
+    AND "from_record_json" = OLD."record_json" AND "to_record_json" = NEW."record_json"
+    AND json_extract("to_record_json", '$.state') = NEW."state"
+    AND json_extract("to_record_json", '$.fencingToken') IS NEW."fencing_token"
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_STEP_TRANSITION_REQUIRED'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_step_delete" BEFORE DELETE ON "nozzle_operation_steps" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_STEP_PERSISTENT'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_operation_transition_update"
 BEFORE UPDATE ON "nozzle_operation_transitions"
@@ -332,6 +362,23 @@ BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_OPERATION_TRANSITION_IMMUTABLE'); END;
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_operation_transition_delete"
 BEFORE DELETE ON "nozzle_operation_transitions"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_OPERATION_TRANSITION_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_operation_transition_insert"
+BEFORE INSERT ON "nozzle_operation_transitions"
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_operation_steps" AS "step"
+  JOIN "nozzle_operations" AS "operation" USING ("operation_id")
+  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = NEW."lease_key"
+  WHERE "step"."operation_id" = NEW."operation_id" AND "step"."step_id" = NEW."step_id"
+    AND "step"."lease_key" = NEW."lease_key"
+    AND "step"."record_json" = NEW."from_record_json"
+    AND "operation"."status" = NEW."from_operation_status"
+    AND "lease"."holder_id" = NEW."holder_id"
+    AND "lease"."acquisition_id" = NEW."acquisition_id"
+    AND "lease"."fencing_token" = NEW."fencing_token"
+    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_OPERATION_TRANSITION_FENCED'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_idempotency_insert"
 BEFORE INSERT ON "nozzle_idempotency_keys"
 WHEN NOT EXISTS (

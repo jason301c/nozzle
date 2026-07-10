@@ -1,18 +1,31 @@
 import {
   appendAuditEvent,
   assertResumeCompatible,
+  beginOperationStep,
   createOperationRecord,
   type DigestFunction,
+  type IrreversibleAuthorization,
+  type LeaseProof,
   loadAuditEvent,
   loadOperationRecord,
   NozzleError,
   type OperationPlan,
   type OperationRecord,
+  type OperationStepPlan,
+  type OperationStepRecord,
   operationStatus,
+  recordStepFailure,
+  recordStepReconciliation,
+  recordStepSuccess,
+  type StepFailureOutcome,
+  type StepInvocationDecision,
+  type StepReconciliationOutcome,
 } from "@nozzle/core"
 import type { ControlRunResult, TransactionalControlDatabase } from "./database.js"
+import { D1LeaseStore } from "./lease-store.js"
 
 const MAX_CREATE_ATTEMPTS = 16
+const MAX_TRANSITION_ATTEMPTS = 16
 const SERVER_TIME_SQL = `CAST(unixepoch('subsec') * 1000 AS INTEGER)`
 
 interface OperationRow {
@@ -53,6 +66,21 @@ interface AuditSnapshotRow {
   readonly now_ms: number
 }
 
+interface TransitionRow {
+  readonly acquisition_id: string
+  readonly audit_event_hash: string
+  readonly fencing_token: number
+  readonly from_operation_status: string
+  readonly from_record_json: string
+  readonly holder_id: string
+  readonly lease_key: string
+  readonly operation_id: string
+  readonly step_id: string
+  readonly to_operation_status: string
+  readonly to_record_json: string
+  readonly transition_id: string
+}
+
 export interface LoadedOperation {
   readonly environmentId: string
   readonly idempotencyScope: string
@@ -70,6 +98,52 @@ export interface CreateOperationInput {
   readonly idempotencyScope: string
   readonly plan: OperationPlan
   readonly requiredShardIds: readonly string[]
+}
+
+interface TransitionIdentity {
+  readonly actorChecksum: string
+  readonly operationId: string
+  readonly proof: LeaseProof
+  readonly stepId: string
+}
+
+export interface BeginStoredOperationStepInput extends TransitionIdentity {
+  readonly attemptId: string
+  readonly idempotencyKey: string
+  readonly irreversibleAuthorization?: IrreversibleAuthorization
+  readonly observedPreconditionChecksum: string
+}
+
+export interface CompleteStoredOperationStepInput extends TransitionIdentity {
+  readonly attemptId: string
+  readonly counters?: {
+    readonly cost?: Readonly<Record<string, number>>
+    readonly progress?: Readonly<Record<string, number>>
+  }
+  readonly observedPostconditionChecksum: string
+  readonly resultChecksum: string
+}
+
+export interface FailStoredOperationStepInput extends TransitionIdentity {
+  readonly attemptId: string
+  readonly counters?: {
+    readonly cost?: Readonly<Record<string, number>>
+    readonly progress?: Readonly<Record<string, number>>
+  }
+  readonly errorChecksum: string
+  readonly outcome: StepFailureOutcome
+}
+
+export interface ReconcileStoredOperationStepInput extends TransitionIdentity {
+  readonly counters?: {
+    readonly cost?: Readonly<Record<string, number>>
+    readonly progress?: Readonly<Record<string, number>>
+  }
+  readonly evidenceChecksum: string
+  readonly observedPostconditionChecksum?: string
+  readonly outcome: StepReconciliationOutcome
+  readonly reconciliationId: string
+  readonly resultChecksum?: string
 }
 
 function configuration(message: string): never {
@@ -155,9 +229,16 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
+function transitionIdentity(kind: string, parts: readonly string[]): string {
+  let identity = `nozzle.operation-transition.v1:${kind}`
+  for (const part of parts) identity += `:${part.length}:${part}`
+  return identity
+}
+
 export class D1OperationStore {
   readonly #database: TransactionalControlDatabase
   readonly #digest: DigestFunction
+  readonly #leases: D1LeaseStore
 
   constructor(database: TransactionalControlDatabase, digest: DigestFunction) {
     if (
@@ -171,6 +252,7 @@ export class D1OperationStore {
     if (typeof digest !== "function") configuration("An operation digest function is required.")
     this.#database = database
     this.#digest = digest
+    this.#leases = new D1LeaseStore(database)
   }
 
   async #auditSnapshot(environmentId: string): Promise<{
@@ -509,5 +591,413 @@ export class D1OperationStore {
       return Object.freeze({ ...loaded, created: changes[0] === 1 })
     }
     return intervention("Operation creation exceeded the bounded transactional retry budget.")
+  }
+
+  async #transition(transitionId: string): Promise<TransitionRow | undefined> {
+    const row = await this.#database
+      .prepare(
+        `SELECT "transition_id", "operation_id", "step_id", "from_record_json",
+                "to_record_json", "from_operation_status", "to_operation_status",
+                "audit_event_hash", "fencing_token", "lease_key", "holder_id", "acquisition_id"
+         FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1`,
+      )
+      .bind(transitionId)
+      .first<TransitionRow>()
+    if (row === null) return undefined
+    if (
+      row.transition_id !== transitionId ||
+      typeof row.operation_id !== "string" ||
+      row.operation_id.trim() === "" ||
+      typeof row.step_id !== "string" ||
+      row.step_id.trim() === "" ||
+      typeof row.from_record_json !== "string" ||
+      typeof row.to_record_json !== "string" ||
+      typeof row.from_operation_status !== "string" ||
+      typeof row.to_operation_status !== "string" ||
+      typeof row.audit_event_hash !== "string" ||
+      row.audit_event_hash.trim() === "" ||
+      typeof row.lease_key !== "string" ||
+      row.lease_key.trim() === "" ||
+      typeof row.holder_id !== "string" ||
+      row.holder_id.trim() === "" ||
+      typeof row.acquisition_id !== "string" ||
+      row.acquisition_id.trim() === "" ||
+      !Number.isSafeInteger(row.fencing_token) ||
+      row.fencing_token < 1
+    ) {
+      return intervention("Persisted operation transition receipt is malformed.")
+    }
+    return Object.freeze(row)
+  }
+
+  async #persistTransition(input: {
+    readonly actorChecksum: string
+    readonly after: LoadedOperation
+    readonly auditEventType: string
+    readonly auditPayloadChecksum: string
+    readonly before: LoadedOperation
+    readonly proof: LeaseProof
+    readonly stepId: string
+    readonly transitionId: string
+  }): Promise<LoadedOperation | undefined> {
+    nonEmpty(input.actorChecksum, "Transition actor checksum")
+    nonEmpty(input.auditEventType, "Transition audit event type")
+    nonEmpty(input.auditPayloadChecksum, "Transition audit payload checksum")
+    nonEmpty(input.transitionId, "Operation transition ID")
+    const after: LoadedOperation = Object.freeze({
+      ...input.after,
+      operation: await loadOperationRecord(input.after.operation, this.#digest),
+    })
+    const planStep = input.before.operation.plan.steps.find(
+      (step) => step.stepId === input.stepId,
+    ) as OperationStepPlan
+    const beforeRecord = input.before.operation.steps[input.stepId] as OperationStepRecord
+    const afterRecord = after.operation.steps[input.stepId] as OperationStepRecord
+    if (planStep.leaseKey !== input.proof.leaseKey) {
+      return resume("The operation transition was authorized under the wrong lease key.")
+    }
+    const beforeJson = JSON.stringify(beforeRecord)
+    const afterJson = JSON.stringify(afterRecord)
+    const fromStatus = operationStatus(input.before.operation)
+    const toStatus = operationStatus(after.operation)
+    const auditSnapshot = await this.#auditSnapshot(input.before.environmentId)
+    const audit = await appendAuditEvent(
+      auditSnapshot.previous,
+      {
+        actorChecksum: input.actorChecksum,
+        environmentId: input.before.environmentId,
+        eventType: input.auditEventType,
+        fencingToken: input.proof.fencingToken,
+        idempotencyKey: input.transitionId,
+        operationId: input.before.operation.plan.operationId,
+        payloadChecksum: input.auditPayloadChecksum,
+        serverTimeMs: auditSnapshot.nowMs,
+        stepId: input.stepId,
+      },
+      this.#digest,
+    )
+    const statements = [
+      this.#database
+        .prepare(
+          `INSERT INTO "nozzle_operation_transitions"
+           ("transition_id", "operation_id", "step_id", "from_record_json", "to_record_json",
+            "from_operation_status", "to_operation_status", "audit_event_hash", "fencing_token",
+            "lease_key", "holder_id", "acquisition_id", "created_at_ms")
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ${SERVER_TIME_SQL}
+           WHERE EXISTS (
+             SELECT 1 FROM "nozzle_operation_steps"
+             WHERE "operation_id" = ?2 AND "step_id" = ?3 AND "record_json" = ?4
+           ) AND EXISTS (
+             SELECT 1 FROM "nozzle_operations"
+             WHERE "operation_id" = ?2 AND "status" = ?6
+           ) AND EXISTS (
+             SELECT 1 FROM "nozzle_leases"
+             WHERE "lease_key" = ?10 AND "holder_id" = ?11 AND "acquisition_id" = ?12
+               AND "fencing_token" = ?9 AND "expires_at_ms" > ${SERVER_TIME_SQL}
+           )
+           ON CONFLICT ("transition_id") DO NOTHING`,
+        )
+        .bind(
+          input.transitionId,
+          input.before.operation.plan.operationId,
+          input.stepId,
+          beforeJson,
+          afterJson,
+          fromStatus,
+          toStatus,
+          audit.eventHash,
+          input.proof.fencingToken,
+          input.proof.leaseKey,
+          input.proof.holderId,
+          input.proof.acquisitionId,
+        ),
+      this.#database
+        .prepare(
+          `UPDATE "nozzle_operation_steps"
+           SET "record_json" = ?1, "state" = ?2, "fencing_token" = ?3,
+               "updated_at_ms" = ${SERVER_TIME_SQL}
+           WHERE "operation_id" = ?4 AND "step_id" = ?5 AND "record_json" = ?6
+             AND EXISTS (
+               SELECT 1 FROM "nozzle_operation_transitions"
+               WHERE "transition_id" = ?7 AND "operation_id" = ?4 AND "step_id" = ?5
+                 AND "from_record_json" = ?6 AND "to_record_json" = ?1
+                 AND "audit_event_hash" = ?8 AND "fencing_token" = ?9
+             ) AND EXISTS (
+               SELECT 1 FROM "nozzle_leases"
+               WHERE "lease_key" = ?10 AND "holder_id" = ?11 AND "acquisition_id" = ?12
+                 AND "fencing_token" = ?9 AND "expires_at_ms" > ${SERVER_TIME_SQL}
+             )`,
+        )
+        .bind(
+          afterJson,
+          afterRecord.state,
+          afterRecord.fencingToken as number,
+          input.before.operation.plan.operationId,
+          input.stepId,
+          beforeJson,
+          input.transitionId,
+          audit.eventHash,
+          input.proof.fencingToken,
+          input.proof.leaseKey,
+          input.proof.holderId,
+          input.proof.acquisitionId,
+        ),
+      this.#database
+        .prepare(
+          `UPDATE "nozzle_operations"
+           SET "status" = ?1, "updated_at_ms" = ${SERVER_TIME_SQL}
+           WHERE "operation_id" = ?2 AND "status" = ?3
+             AND EXISTS (
+               SELECT 1 FROM "nozzle_operation_transitions"
+               WHERE "transition_id" = ?4 AND "operation_id" = ?2
+                 AND "from_operation_status" = ?3 AND "to_operation_status" = ?1
+                 AND "audit_event_hash" = ?5
+             ) AND EXISTS (
+               SELECT 1 FROM "nozzle_operation_steps"
+               WHERE "operation_id" = ?2 AND "step_id" = ?6 AND "record_json" = ?7
+             )`,
+        )
+        .bind(
+          toStatus,
+          input.before.operation.plan.operationId,
+          fromStatus,
+          input.transitionId,
+          audit.eventHash,
+          input.stepId,
+          afterJson,
+        ),
+      this.#database
+        .prepare(
+          `INSERT INTO "nozzle_audit_log"
+           ("environment_id", "sequence", "previous_hash", "event_hash", "server_time_ms",
+            "operation_id", "step_id", "event_json")
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+           WHERE EXISTS (
+             SELECT 1 FROM "nozzle_operation_transitions"
+             WHERE "transition_id" = ?9 AND "operation_id" = ?6 AND "step_id" = ?7
+               AND "audit_event_hash" = ?4
+           ) AND EXISTS (
+             SELECT 1 FROM "nozzle_operation_steps"
+             WHERE "operation_id" = ?6 AND "step_id" = ?7 AND "record_json" = ?10
+           ) AND EXISTS (
+             SELECT 1 FROM "nozzle_operations"
+             WHERE "operation_id" = ?6 AND "status" = ?11
+           ) AND NOT EXISTS (
+             SELECT 1 FROM "nozzle_audit_log"
+             WHERE "environment_id" = ?1 AND "event_hash" = ?4
+           )`,
+        )
+        .bind(
+          input.before.environmentId,
+          audit.sequence,
+          audit.previousHash,
+          audit.eventHash,
+          audit.serverTimeMs,
+          input.before.operation.plan.operationId,
+          input.stepId,
+          JSON.stringify(audit),
+          input.transitionId,
+          afterJson,
+          toStatus,
+        ),
+    ]
+    let results: readonly ControlRunResult[] | undefined
+    try {
+      results = await this.#database.batch(statements)
+    } catch {
+      // The audit head or step may have advanced. Exact receipt validation below decides replay.
+    }
+    if (results !== undefined) validateMutationResults(results, statements.length)
+    const receipt = await this.#transition(input.transitionId)
+    if (!receipt) return undefined
+    if (
+      receipt.operation_id !== input.before.operation.plan.operationId ||
+      receipt.step_id !== input.stepId ||
+      receipt.from_record_json !== beforeJson ||
+      receipt.to_record_json !== afterJson ||
+      receipt.from_operation_status !== fromStatus ||
+      receipt.to_operation_status !== toStatus ||
+      receipt.audit_event_hash !== audit.eventHash ||
+      receipt.fencing_token !== input.proof.fencingToken ||
+      receipt.lease_key !== input.proof.leaseKey ||
+      receipt.holder_id !== input.proof.holderId ||
+      receipt.acquisition_id !== input.proof.acquisitionId
+    ) {
+      return intervention("An operation transition ID is bound to contradictory durable state.")
+    }
+    const persisted = await this.get(input.before.operation.plan.operationId)
+    if (!persisted) return intervention("A transition receipt references a missing operation.")
+    const current = await this.#database
+      .prepare(
+        `SELECT "nozzle_operation_steps"."record_json" AS "record_json",
+                "nozzle_operations"."status" AS "status"
+         FROM "nozzle_operation_steps"
+         JOIN "nozzle_operations" USING ("operation_id")
+         WHERE "nozzle_operation_steps"."operation_id" = ?1
+           AND "nozzle_operation_steps"."step_id" = ?2`,
+      )
+      .bind(input.before.operation.plan.operationId, input.stepId)
+      .first<{ readonly record_json: string; readonly status: string }>()
+    if (
+      current?.record_json !== afterJson ||
+      current.status !== toStatus ||
+      operationStatus(persisted.operation) !== toStatus
+    ) {
+      return intervention("A transition receipt was committed without its exact operation state.")
+    }
+    const auditRow = await this.#database
+      .prepare(
+        `SELECT 1 AS "present" FROM "nozzle_audit_log"
+         WHERE "environment_id" = ?1 AND "event_hash" = ?2`,
+      )
+      .bind(input.before.environmentId, audit.eventHash)
+      .first<{ readonly present: number }>()
+    if (auditRow?.present !== 1) {
+      return intervention("A transition receipt was committed without its audit event.")
+    }
+    return persisted
+  }
+
+  async beginStep(input: BeginStoredOperationStepInput): Promise<StepInvocationDecision> {
+    nonEmpty(input.operationId, "Operation ID")
+    nonEmpty(input.actorChecksum, "Transition actor checksum")
+    for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt += 1) {
+      const before = await this.get(input.operationId)
+      if (!before) return resume("The operation does not exist.")
+      const authorized = await this.#leases.authorizeAt(input.proof)
+      const decision = beginOperationStep(before.operation, {
+        attemptId: input.attemptId,
+        idempotencyKey: input.idempotencyKey,
+        ...(input.irreversibleAuthorization === undefined
+          ? {}
+          : { irreversibleAuthorization: input.irreversibleAuthorization }),
+        lease: authorized.record,
+        leaseProof: input.proof,
+        observedPreconditionChecksum: input.observedPreconditionChecksum,
+        serverTimeMs: authorized.serverTimeMs,
+        stepId: input.stepId,
+      })
+      if (decision.disposition !== "execute") return decision
+      const after: LoadedOperation = Object.freeze({ ...before, operation: decision.operation })
+      const persisted = await this.#persistTransition({
+        actorChecksum: input.actorChecksum,
+        after,
+        auditEventType: "step.attempt.accepted",
+        auditPayloadChecksum: (
+          before.operation.plan.steps.find(
+            (step) => step.stepId === input.stepId,
+          ) as OperationStepPlan
+        ).inputChecksum,
+        before,
+        proof: input.proof,
+        stepId: input.stepId,
+        transitionId: transitionIdentity("accepted", [
+          input.operationId,
+          input.stepId,
+          input.attemptId,
+        ]),
+      })
+      if (persisted)
+        return Object.freeze({ disposition: "execute", operation: persisted.operation })
+    }
+    return intervention("Beginning an operation step exceeded the bounded transition retry budget.")
+  }
+
+  async completeStep(input: CompleteStoredOperationStepInput): Promise<OperationRecord> {
+    return this.#recordOutcome(
+      input,
+      "step.attempt.succeeded",
+      input.resultChecksum,
+      (operation) =>
+        recordStepSuccess(operation, {
+          attemptId: input.attemptId,
+          ...(input.counters === undefined ? {} : { counters: input.counters }),
+          observedPostconditionChecksum: input.observedPostconditionChecksum,
+          resultChecksum: input.resultChecksum,
+          stepId: input.stepId,
+        }),
+      transitionIdentity("succeeded", [input.operationId, input.stepId, input.attemptId]),
+      true,
+    )
+  }
+
+  async failStep(input: FailStoredOperationStepInput): Promise<OperationRecord> {
+    return this.#recordOutcome(
+      input,
+      `step.attempt.${input.outcome}`,
+      input.errorChecksum,
+      (operation) =>
+        recordStepFailure(operation, {
+          attemptId: input.attemptId,
+          ...(input.counters === undefined ? {} : { counters: input.counters }),
+          errorChecksum: input.errorChecksum,
+          outcome: input.outcome,
+          stepId: input.stepId,
+        }),
+      transitionIdentity("failed", [input.operationId, input.stepId, input.attemptId]),
+      true,
+    )
+  }
+
+  async reconcileStep(input: ReconcileStoredOperationStepInput): Promise<OperationRecord> {
+    nonEmpty(input.reconciliationId, "Reconciliation ID")
+    return this.#recordOutcome(
+      input,
+      `step.reconciled.${input.outcome}`,
+      input.evidenceChecksum,
+      (operation) =>
+        recordStepReconciliation(operation, {
+          ...(input.counters === undefined ? {} : { counters: input.counters }),
+          evidenceChecksum: input.evidenceChecksum,
+          ...(input.observedPostconditionChecksum === undefined
+            ? {}
+            : { observedPostconditionChecksum: input.observedPostconditionChecksum }),
+          outcome: input.outcome,
+          ...(input.resultChecksum === undefined ? {} : { resultChecksum: input.resultChecksum }),
+          stepId: input.stepId,
+        }),
+      transitionIdentity("reconciled", [input.operationId, input.stepId, input.reconciliationId]),
+      false,
+    )
+  }
+
+  async #recordOutcome(
+    input: TransitionIdentity,
+    auditEventType: string,
+    auditPayloadChecksum: string,
+    transition: (operation: OperationRecord) => OperationRecord,
+    transitionId: string,
+    requireAttemptFence: boolean,
+  ): Promise<OperationRecord> {
+    nonEmpty(input.operationId, "Operation ID")
+    nonEmpty(input.actorChecksum, "Transition actor checksum")
+    for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt += 1) {
+      const before = await this.get(input.operationId)
+      if (!before) return resume("The operation does not exist.")
+      const next = transition(before.operation)
+      if (next === before.operation) return before.operation
+      await this.#leases.authorizeAt(input.proof)
+      if (
+        requireAttemptFence &&
+        before.operation.steps[input.stepId]?.fencingToken !== input.proof.fencingToken
+      ) {
+        return resume("The operation attempt result was fenced by a newer lease owner.")
+      }
+      const after: LoadedOperation = Object.freeze({ ...before, operation: next })
+      const persisted = await this.#persistTransition({
+        actorChecksum: input.actorChecksum,
+        after,
+        auditEventType,
+        auditPayloadChecksum,
+        before,
+        proof: input.proof,
+        stepId: input.stepId,
+        transitionId,
+      })
+      if (persisted) return persisted.operation
+    }
+    return intervention(
+      "Recording an operation outcome exceeded the bounded transition retry budget.",
+    )
   }
 }
