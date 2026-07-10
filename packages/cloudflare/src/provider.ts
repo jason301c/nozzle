@@ -130,7 +130,7 @@ function validateObservedDatabase(value: unknown): asserts value is ObservedD1Da
   optionalString(value.version, "Observed D1 version")
 }
 
-function decodeObserved(value: unknown): ObservedD1Database {
+export function decodeObservedD1Database(value: unknown): ObservedD1Database {
   if (!plainRecord(value)) return providerError("Cloudflare returned a malformed D1 database.")
   providerString(value.name, "Observed D1 name")
   providerString(value.uuid, "Observed D1 UUID")
@@ -171,7 +171,7 @@ export function decodeD1ListPage(
   if (!plainRecord(value) || value.success !== true || !Array.isArray(value.result)) {
     return providerError("Cloudflare returned a malformed D1 list envelope.")
   }
-  const databases = value.result.map(decodeObserved)
+  const databases = value.result.map(decodeObservedD1Database)
   if (databases.length > perPage) {
     return providerError("Cloudflare returned more D1 databases than the declared page size.")
   }
