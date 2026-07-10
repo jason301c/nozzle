@@ -66,6 +66,7 @@ export type D1ReconciliationAction =
 
 const TRANSIENT_HTTP_STATUSES = new Set([408, 500, 502, 503, 504, 520, 521, 522, 523, 524])
 const D1_LOCATION_HINTS = new Set<D1LocationHint>(["apac", "eeur", "enam", "oc", "weur", "wnam"])
+const D1_UUID_PATTERN = /^[A-Fa-f0-9]{8}-(?:[A-Fa-f0-9]{4}-){3}[A-Fa-f0-9]{12}$/u
 
 function configuration(message: string): never {
   throw new NozzleError("ConfigurationError", message)
@@ -93,6 +94,11 @@ function providerString(value: unknown, label: string): asserts value is string 
   }
 }
 
+function providerUuid(value: unknown, label: string): asserts value is string {
+  providerString(value, label)
+  if (!D1_UUID_PATTERN.test(value)) providerError(`${label} is malformed.`)
+}
+
 function positiveInteger(value: unknown, label: string): asserts value is number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
     providerError(`${label} is malformed.`)
@@ -116,7 +122,7 @@ function optionalNonNegativeInteger(value: unknown, label: string): number | und
 function validateObservedDatabase(value: unknown): asserts value is ObservedD1Database {
   if (!plainRecord(value)) return providerError("Observed D1 database is malformed.")
   providerString(value.name, "Observed D1 name")
-  providerString(value.uuid, "Observed D1 UUID")
+  providerUuid(value.uuid, "Observed D1 UUID")
   if (
     value.jurisdiction !== undefined &&
     value.jurisdiction !== "eu" &&
@@ -133,9 +139,10 @@ function validateObservedDatabase(value: unknown): asserts value is ObservedD1Da
 export function decodeObservedD1Database(value: unknown): ObservedD1Database {
   if (!plainRecord(value)) return providerError("Cloudflare returned a malformed D1 database.")
   providerString(value.name, "Observed D1 name")
-  providerString(value.uuid, "Observed D1 UUID")
+  providerUuid(value.uuid, "Observed D1 UUID")
   if (
     value.jurisdiction !== undefined &&
+    value.jurisdiction !== null &&
     value.jurisdiction !== "eu" &&
     value.jurisdiction !== "fedramp"
   ) {
@@ -148,7 +155,7 @@ export function decodeObservedD1Database(value: unknown): ObservedD1Database {
   return Object.freeze({
     ...(createdAt === undefined ? {} : { createdAt }),
     ...(fileSize === undefined ? {} : { fileSize }),
-    ...(value.jurisdiction === undefined
+    ...(value.jurisdiction === undefined || value.jurisdiction === null
       ? {}
       : { jurisdiction: value.jurisdiction as D1Jurisdiction }),
     name: value.name,
@@ -299,7 +306,7 @@ export function computeProviderRetryDelay(input: {
     return configuration("Provider retry jitter input must be in the range [0, 1).")
   }
   const exponential = Math.min(maximumDelayMs, baseDelayMs * 2 ** input.attempt)
-  const jittered = Math.ceil(exponential * (0.5 + input.randomUnit))
+  const jittered = Math.min(maximumDelayMs, Math.ceil(exponential * (0.5 + input.randomUnit)))
   return Math.max(minimumDelayMs, jittered)
 }
 
@@ -395,7 +402,7 @@ export function planD1Reconciliation(input: {
   const named = byName[0]
   if (input.recorded) {
     validateDesired(input.recorded)
-    providerString(input.recorded.uuid, "Recorded D1 UUID")
+    providerUuid(input.recorded.uuid, "Recorded D1 UUID")
     const identified = input.inventory.databases.find(
       (database) => database.uuid === input.recorded?.uuid,
     )

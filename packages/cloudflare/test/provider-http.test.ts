@@ -6,7 +6,7 @@ import {
 } from "../src/provider-http.js"
 
 const accountId = "a".repeat(32)
-const databaseId = "b".repeat(32)
+const databaseId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 function jsonResponse(
   body: unknown,
@@ -54,7 +54,7 @@ function database(index: number, jurisdiction?: "eu" | "fedramp") {
     ...(jurisdiction === undefined ? {} : { jurisdiction }),
     name: `database-${index}`,
     num_tables: index,
-    uuid: String(index).padStart(32, "0"),
+    uuid: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
     version: "production",
   }
 }
@@ -444,6 +444,7 @@ describe("Cloudflare D1 mutation transport", () => {
     })
     await expect(provider.deleteDatabase("")).rejects.toThrow()
     await expect(provider.deleteDatabase("../unsafe")).rejects.toThrow()
+    await expect(provider.deleteDatabase("b".repeat(32))).rejects.toThrow()
     await expect(provider.deleteDatabase(databaseId)).resolves.toMatchObject({ kind: "confirmed" })
     expect(calls).toHaveLength(1)
     expect(calls[0]?.method).toBe("DELETE")

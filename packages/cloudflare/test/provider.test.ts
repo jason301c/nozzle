@@ -12,6 +12,15 @@ import {
 
 const request = { expectedPage: 1, perPage: 10 }
 
+function uuid(value: string): string {
+  let hash = 2166136261
+  for (const character of value) {
+    hash ^= character.charCodeAt(0)
+    hash = Math.imul(hash, 16777619)
+  }
+  return `00000000-0000-4000-8000-${(hash >>> 0).toString(16).padStart(12, "0")}`
+}
+
 function envelope(result: readonly unknown[], resultInfo?: unknown): Record<string, unknown> {
   return {
     result,
@@ -21,14 +30,14 @@ function envelope(result: readonly unknown[], resultInfo?: unknown): Record<stri
 }
 
 function observed(
-  uuid: string,
-  name = `database-${uuid}`,
+  id: string,
+  name = `database-${id}`,
   jurisdiction?: "eu" | "fedramp",
 ): ObservedD1Database {
   return {
     ...(jurisdiction === undefined ? {} : { jurisdiction }),
     name,
-    uuid,
+    uuid: uuid(id),
   }
 }
 
@@ -49,7 +58,7 @@ describe("Cloudflare D1 inventory decoding", () => {
       jurisdiction: index === 0 ? "eu" : undefined,
       name: `database-${index}`,
       num_tables: index,
-      uuid: `uuid-${index}`,
+      uuid: uuid(`uuid-${index}`),
       version: "production",
     }))
     const page = decodeD1ListPage(
@@ -77,13 +86,25 @@ describe("Cloudflare D1 inventory decoding", () => {
   })
 
   it("accepts schema-compliant omitted metadata and finishes only on a short page", () => {
-    expect(decodeD1ListPage(envelope([{ name: "one", uuid: "uuid-1" }]), request)).toEqual({
-      databases: [{ name: "one", uuid: "uuid-1" }],
+    expect(decodeD1ListPage(envelope([{ name: "one", uuid: uuid("uuid-1") }]), request)).toEqual({
+      databases: [{ name: "one", uuid: uuid("uuid-1") }],
       page: 1,
       perPage: 10,
     })
-    expect(decodeD1ListPage(envelope([{ name: "one", uuid: "uuid-1" }], {}), request)).toEqual({
-      databases: [{ name: "one", uuid: "uuid-1" }],
+    expect(
+      decodeD1ListPage(envelope([{ name: "one", uuid: uuid("uuid-1") }], {}), request),
+    ).toEqual({
+      databases: [{ name: "one", uuid: uuid("uuid-1") }],
+      page: 1,
+      perPage: 10,
+    })
+    expect(
+      decodeD1ListPage(
+        envelope([{ jurisdiction: null, name: "global", uuid: uuid("global") }]),
+        request,
+      ),
+    ).toEqual({
+      databases: [{ name: "global", uuid: uuid("global") }],
       page: 1,
       perPage: 10,
     })
@@ -119,18 +140,20 @@ describe("Cloudflare D1 inventory decoding", () => {
       { total_count: "1" },
     ]) {
       expect(() =>
-        decodeD1ListPage(envelope([{ name: "one", uuid: "uuid-1" }], resultInfo), request),
+        decodeD1ListPage(envelope([{ name: "one", uuid: uuid("uuid-1") }], resultInfo), request),
       ).toThrow()
     }
   })
 
   it("rejects malformed observed database fields and oversized or duplicate pages", () => {
-    const valid = { name: "one", uuid: "uuid-1" }
+    const valid = { name: "one", uuid: uuid("uuid-1") }
     for (const invalid of [
       null,
       [],
       { ...valid, name: " " },
       { ...valid, uuid: " " },
+      { ...valid, uuid: "a".repeat(32) },
+      { ...valid, uuid: "00000000-0000-0000-0000-00000000000z" },
       { ...valid, jurisdiction: "moon" },
       { ...valid, created_at: "" },
       { ...valid, file_size: -1 },
@@ -310,7 +333,7 @@ describe("provider backoff", () => {
   it("uses bounded exponential full-width jitter and a server floor", () => {
     expect(computeProviderRetryDelay({ attempt: 0, randomUnit: 0 })).toBe(500)
     expect(computeProviderRetryDelay({ attempt: 1, randomUnit: 0.5 })).toBe(2_000)
-    expect(computeProviderRetryDelay({ attempt: 31, randomUnit: 0.999 })).toBe(44_970)
+    expect(computeProviderRetryDelay({ attempt: 31, randomUnit: 0.999 })).toBe(30_000)
     expect(computeProviderRetryDelay({ attempt: 1, minimumDelayMs: 90_000, randomUnit: 0 })).toBe(
       90_000,
     )
@@ -385,7 +408,7 @@ describe("D1 desired-recorded-observed reconciliation", () => {
       planD1Reconciliation({
         desired,
         inventory: inventory([]),
-        recorded: { ...desired, uuid: "missing" },
+        recorded: { ...desired, uuid: uuid("missing") },
       }),
     ).toEqual({ kind: "quarantine_drift", reason: "recorded_resource_missing" })
 
@@ -405,7 +428,7 @@ describe("D1 desired-recorded-observed reconciliation", () => {
       planD1Reconciliation({
         desired,
         inventory: inventory([observed("recorded", desired.name)]),
-        recorded: { name: "old-name", uuid: "recorded" },
+        recorded: { name: "old-name", uuid: uuid("recorded") },
       }),
     ).toEqual({
       kind: "quarantine_drift",

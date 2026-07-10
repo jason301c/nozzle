@@ -343,7 +343,7 @@ function classifyEvidence(
 
 function databaseIdPath(databaseId: string): string {
   nonEmpty(databaseId, "Cloudflare D1 database ID")
-  if (!/^[A-Fa-f0-9-]{32,36}$/u.test(databaseId)) {
+  if (!/^[A-Fa-f0-9]{8}-(?:[A-Fa-f0-9]{4}-){3}[A-Fa-f0-9]{12}$/u.test(databaseId)) {
     return configuration("Cloudflare D1 database ID is malformed.")
   }
   return encodeURIComponent(databaseId)
