@@ -267,7 +267,7 @@ describe("control D1 schema", () => {
   it("requires fenced operation effects and append-only receipts for saga state", () => {
     withDatabase((database) => {
       const descriptorChecksum = "d".repeat(64)
-      const record = (stateVersion: number, status: "planned" | "succeeded") =>
+      const record = (stateVersion: number, status: "planned" | "running" | "succeeded") =>
         JSON.stringify({
           deadlineAtMs: 10_000,
           descriptor: {
@@ -280,6 +280,17 @@ describe("control D1 schema", () => {
           sagaId: "saga-a",
           stateVersion,
           status,
+          steps: {
+            a: {
+              compensation: { state: "pending" },
+              forward:
+                status === "planned"
+                  ? { state: "pending" }
+                  : status === "running"
+                    ? { activeAttemptId: "attempt-a", state: "running" }
+                    : { resultChecksum: "action", state: "succeeded" },
+            },
+          },
           terminationCause: null,
           terminationRequestedAtMs: null,
         })
@@ -360,6 +371,62 @@ describe("control D1 schema", () => {
            ("transition_id", "operation_id", "step_id", "from_record_json", "to_record_json",
             "from_operation_status", "to_operation_status", "audit_event_hash", "fencing_token",
             "lease_key", "holder_id", "acquisition_id", "created_at_ms")
+           VALUES ('transition-action-accepted', 'operation-saga', 'saga:a:forward',
+             '{"activeAttemptId":"attempt-a","state":"running"}',
+             '{"activeAttemptId":"attempt-a","lastAttemptId":"attempt-a","state":"running"}',
+             'running', 'running', 'audit-action-accepted', 1, 'saga:lease', 'controller',
+             'acquisition', 2)`,
+        )
+        .run()
+      database
+        .prepare(
+          `INSERT INTO "nozzle_operation_effects"
+           ("effect_id", "transition_id", "operation_id", "step_id", "resource_kind",
+            "resource_id", "effect_kind", "from_state_version", "to_state_version",
+            "evidence_checksum", "record_checksum", "record_json", "lease_key", "holder_id",
+            "acquisition_id", "fencing_token", "created_at_ms")
+           VALUES ('effect-saga-running', 'transition-action-accepted', 'operation-saga',
+             'saga:a:forward', 'saga', 'saga-a', 'forward:accepted', 0, 1,
+             'accepted-evidence', 'record-running', ?, 'saga:lease', 'controller', 'acquisition',
+             1, 2)`,
+        )
+        .run(record(1, "running"))
+      database
+        .prepare(
+          `UPDATE "nozzle_sagas"
+           SET "status" = 'running', "commitment" = 'possible', "state_version" = 1,
+               "last_evidence_checksum" = 'accepted-evidence',
+               "last_effect_id" = 'effect-saga-running', "record_checksum" = 'record-running',
+               "record_json" = ?, "updated_at_ms" = 2
+           WHERE "saga_id" = 'saga-a'`,
+        )
+        .run(record(1, "running"))
+      database
+        .prepare(
+          `INSERT INTO "nozzle_saga_action_attempts"
+           ("attempt_id", "saga_id", "operation_id", "operation_step_id", "saga_step_id",
+            "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
+            "lease_key", "holder_id", "acquisition_id", "fencing_token", "accepted_at_ms")
+           VALUES ('attempt-a', 'saga-a', 'operation-saga', 'saga:a:forward', 'a', 'forward',
+             'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'saga:lease',
+             'controller', 'acquisition', 1, 2)`,
+        )
+        .run()
+      database
+        .prepare(
+          `INSERT INTO "nozzle_saga_action_attempt_outcomes"
+           ("attempt_id", "state", "evidence_checksum", "evidence_json", "output_checksum",
+            "output_json", "error_checksum", "error_json", "outcome_checksum", "completed_at_ms")
+           VALUES ('attempt-a', 'confirmed', 'evidence', '{}', 'output', '{}', NULL, NULL,
+             'outcome', 2)`,
+        )
+        .run()
+      database
+        .prepare(
+          `INSERT INTO "nozzle_operation_transitions"
+           ("transition_id", "operation_id", "step_id", "from_record_json", "to_record_json",
+            "from_operation_status", "to_operation_status", "audit_event_hash", "fencing_token",
+            "lease_key", "holder_id", "acquisition_id", "created_at_ms")
            VALUES ('transition-action', 'operation-saga', 'saga:a:forward',
              '{"activeAttemptId":"attempt-a","state":"running"}',
              '{"resultChecksum":"action","state":"succeeded"}', 'running', 'running',
@@ -374,28 +441,28 @@ describe("control D1 schema", () => {
             "evidence_checksum", "record_checksum", "record_json", "lease_key", "holder_id",
             "acquisition_id", "fencing_token", "created_at_ms")
            VALUES ('effect-saga-1', 'transition-action', 'operation-saga', 'saga:a:forward', 'saga',
-             'saga-a', 'forward:succeeded', 0, 1, 'evidence-1', 'record-1', ?, 'saga:lease',
+             'saga-a', 'forward:succeeded', 1, 2, 'evidence-1', 'record-1', ?, 'saga:lease',
              'controller', 'acquisition', 1, 2)`,
         )
-        .run(record(1, "succeeded"))
+        .run(record(2, "succeeded"))
       database
         .prepare(
           `UPDATE "nozzle_sagas"
-           SET "status" = 'succeeded', "commitment" = 'complete', "state_version" = 1,
+           SET "status" = 'succeeded', "commitment" = 'complete', "state_version" = 2,
                "last_evidence_checksum" = 'evidence-1', "last_effect_id" = 'effect-saga-1',
                "record_checksum" = 'record-1', "record_json" = ?, "updated_at_ms" = 2
            WHERE "saga_id" = 'saga-a'`,
         )
-        .run(record(1, "succeeded"))
+        .run(record(2, "succeeded"))
       expect(
         database
           .prepare(
             `SELECT "status", "state_version" FROM "nozzle_sagas" WHERE "saga_id" = 'saga-a'`,
           )
           .get(),
-      ).toEqual({ state_version: 1, status: "succeeded" })
+      ).toEqual({ state_version: 2, status: "succeeded" })
       const identityRecord = JSON.stringify({
-        ...(JSON.parse(record(2, "succeeded")) as Record<string, unknown>),
+        ...(JSON.parse(record(3, "succeeded")) as Record<string, unknown>),
         descriptor: {
           descriptorChecksum,
           descriptorId: "other",
@@ -410,7 +477,7 @@ describe("control D1 schema", () => {
             "evidence_checksum", "record_checksum", "record_json", "lease_key", "holder_id",
             "acquisition_id", "fencing_token", "created_at_ms")
            VALUES ('effect-identity', 'transition-init', 'operation-saga', 'saga:init', 'saga',
-             'saga-a', 'rewrite', 1, 2, 'identity-evidence', 'identity-record', ?, 'saga:lease',
+             'saga-a', 'rewrite', 2, 3, 'identity-evidence', 'identity-record', ?, 'saga:lease',
              'controller', 'acquisition', 1, 1)`,
         )
         .run(identityRecord)
@@ -418,7 +485,7 @@ describe("control D1 schema", () => {
         database
           .prepare(
             `UPDATE "nozzle_sagas"
-             SET "descriptor_id" = 'other', "state_version" = 2,
+             SET "descriptor_id" = 'other', "state_version" = 3,
                  "last_evidence_checksum" = 'identity-evidence',
                  "last_effect_id" = 'effect-identity', "record_checksum" = 'identity-record',
                  "record_json" = ?, "updated_at_ms" = 2`,
@@ -443,26 +510,6 @@ describe("control D1 schema", () => {
           .run(record(0, "planned")),
       ).toThrow("NOZZLE_CONTROL_OPERATION_EFFECT_SOURCE_MISMATCH")
 
-      database
-        .prepare(
-          `INSERT INTO "nozzle_saga_action_attempts"
-           ("attempt_id", "saga_id", "operation_id", "operation_step_id", "saga_step_id",
-            "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
-            "lease_key", "holder_id", "acquisition_id", "fencing_token", "accepted_at_ms")
-           VALUES ('attempt-a', 'saga-a', 'operation-saga', 'saga:a:forward', 'a', 'forward',
-             'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'saga:lease',
-             'controller', 'acquisition', 1, 1)`,
-        )
-        .run()
-      database
-        .prepare(
-          `INSERT INTO "nozzle_saga_action_attempt_outcomes"
-           ("attempt_id", "state", "evidence_checksum", "evidence_json", "output_checksum",
-            "output_json", "error_checksum", "error_json", "outcome_checksum", "completed_at_ms")
-           VALUES ('attempt-a', 'confirmed', 'evidence', '{}', 'output', '{}', NULL, NULL,
-             'outcome', 2)`,
-        )
-        .run()
       expect(() =>
         database
           .prepare(`UPDATE "nozzle_saga_action_attempts" SET "action_key" = 'rewritten'`)

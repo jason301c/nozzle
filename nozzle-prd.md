@@ -940,6 +940,8 @@ Saga version 1 is deliberately serial. It executes forward actions in sealed ord
 
 Every D1 saga action writes its shard-local idempotency and result receipt atomically with the application mutation. External actions require an adapter that proves idempotency or provides an observation oracle. A noncompensable mutation is rejected unless it is marked irreversible, ordered last, and protected by sealed authorization. Sagas use the canonical operation envelope rather than an independent orchestration authority.
 
+Each saga projection version and its operation-effect receipt commit in one Control D1 batch and reference one exact immutable operation-transition ID under the active fence. Canonical operation step IDs are `saga:init`, `saga:termination`, and `saga:<phase>:<descriptor-step-id>`. The projection store rejects a transition whose step, state, or attempt identity does not match the requested saga transition. Action receipt acceptance additionally requires both the matching canonical operation-step state and the matching saga action state, so an operation transition alone cannot authorize dispatch. Saga action operation steps are declared independently in the generic plan because a failed forward must not make compensation ineligible through ordinary success-only dependency edges; the sealed serial saga state machine remains the eligibility oracle.
+
 ## 18. Backup, restore, and deletion
 
 ### 18.1 Recovery objectives
@@ -2093,6 +2095,7 @@ No distributed system is literally failure-proof. For Nozzle, bulletproof means:
 55. Fan-out continuation state is confidential as well as authenticated: version 1 uses bounded AES-256-GCM tokens and never falls back to hidden server-side cursor state.
 56. Fan-out execution preflights every sealed budget, uses bounded per-shard buffer shares, cancels unnecessary work, ignores late responses, and treats actual usage drift above budget as failure.
 57. Fan-out reducers run in canonical shard order; exact integer aggregation and deterministic compensated floating aggregation are distinct public contracts.
+58. Every saga projection is an exactly fenced materialization of a named canonical operation transition; action dispatch requires agreement between the operation step and saga projection, and serial or reverse-compensation eligibility comes only from the sealed saga state machine.
 
 ### 29.4 Mechanisms intentionally rejected
 

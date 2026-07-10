@@ -294,7 +294,7 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
-function transitionIdentity(kind: string, parts: readonly string[]): string {
+export function operationTransitionIdentity(kind: string, parts: readonly string[]): string {
   let identity = `nozzle.operation-transition.v1:${kind}`
   for (const part of parts) identity += `:${part.length}:${part}`
   return identity
@@ -1034,7 +1034,7 @@ export class D1OperationStore {
         before,
         proof: input.proof,
         stepId: input.stepId,
-        transitionId: transitionIdentity("accepted", [
+        transitionId: operationTransitionIdentity("accepted", [
           input.operationId,
           input.stepId,
           input.attemptId,
@@ -1050,7 +1050,7 @@ export class D1OperationStore {
     nonEmpty(input.operationId, "Operation ID")
     nonEmpty(input.actorChecksum, "Transition actor checksum")
     nonEmpty(input.recoveryId, "Crash recovery ID")
-    const transitionId = transitionIdentity("crash-recovered", [
+    const transitionId = operationTransitionIdentity("crash-recovered", [
       input.operationId,
       input.stepId,
       input.recoveryId,
@@ -1103,7 +1103,7 @@ export class D1OperationStore {
       if (notDispatched) {
         const absenceEvidenceChecksum = await this.#digest(
           new TextEncoder().encode(
-            transitionIdentity("provider-not-dispatched-evidence", [
+            operationTransitionIdentity("provider-not-dispatched-evidence", [
               input.operationId,
               input.stepId,
               activeAttemptId,
@@ -1147,7 +1147,7 @@ export class D1OperationStore {
           resultChecksum: input.resultChecksum,
           stepId: input.stepId,
         }),
-      transitionIdentity("succeeded", [input.operationId, input.stepId, input.attemptId]),
+      operationTransitionIdentity("succeeded", [input.operationId, input.stepId, input.attemptId]),
       true,
       {
         attemptId: input.attemptId,
@@ -1171,7 +1171,7 @@ export class D1OperationStore {
           outcome: input.outcome,
           stepId: input.stepId,
         }),
-      transitionIdentity("failed", [input.operationId, input.stepId, input.attemptId]),
+      operationTransitionIdentity("failed", [input.operationId, input.stepId, input.attemptId]),
       true,
       {
         attemptId: input.attemptId,
@@ -1199,7 +1199,11 @@ export class D1OperationStore {
           ...(input.resultChecksum === undefined ? {} : { resultChecksum: input.resultChecksum }),
           stepId: input.stepId,
         }),
-      transitionIdentity("reconciled", [input.operationId, input.stepId, input.reconciliationId]),
+      operationTransitionIdentity("reconciled", [
+        input.operationId,
+        input.stepId,
+        input.reconciliationId,
+      ]),
       false,
       input.observationAttemptId === undefined
         ? undefined

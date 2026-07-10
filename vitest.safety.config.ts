@@ -20,6 +20,7 @@ export default defineConfig({
         "packages/control/src/operation-store.ts",
         "packages/control/src/provider-attempt-store.ts",
         "packages/control/src/resource-store.ts",
+        "packages/control/src/saga-store.ts",
         "packages/core/src/hash.ts",
         "packages/core/src/migration.ts",
         "packages/core/src/movement.ts",

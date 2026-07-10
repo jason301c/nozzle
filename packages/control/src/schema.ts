@@ -665,6 +665,18 @@ WHEN NOT EXISTS (
   JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = NEW."lease_key"
   WHERE "saga"."saga_id" = NEW."saga_id"
     AND "saga"."operation_id" = NEW."operation_id"
+    AND EXISTS (
+      SELECT 1 FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "saga_step"
+      WHERE "saga_step"."key" = NEW."saga_step_id"
+        AND (
+          (NEW."purpose" = 'effect'
+           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.state') = 'running'
+           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.activeAttemptId') = NEW."attempt_id")
+          OR
+          (NEW."purpose" = 'observation'
+           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.state') = 'unknown')
+        )
+    )
     AND "step"."lease_key" = NEW."lease_key"
     AND (
       (NEW."purpose" = 'effect'
