@@ -355,6 +355,7 @@ ON CONFLICT ("singleton") DO NOTHING;`,
 );`,
   `CREATE TABLE IF NOT EXISTS "nozzle_saga_action_attempts" (
   "attempt_id" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("attempt_id")) BETWEEN 1 AND 512),
+  "causal_attempt_id" TEXT,
   "saga_id" TEXT NOT NULL REFERENCES "nozzle_sagas" ("saga_id"),
   "operation_id" TEXT NOT NULL,
   "operation_step_id" TEXT NOT NULL,
@@ -371,6 +372,11 @@ ON CONFLICT ("singleton") DO NOTHING;`,
   "acquisition_id" TEXT NOT NULL,
   "fencing_token" INTEGER NOT NULL CHECK ("fencing_token" >= 1),
   "accepted_at_ms" INTEGER NOT NULL CHECK ("accepted_at_ms" >= 0),
+  CHECK (("purpose" = 'effect' AND "phase" = 'forward' AND "causal_attempt_id" IS NULL)
+    OR (("purpose" = 'observation' OR "phase" = 'compensation')
+      AND length(trim("causal_attempt_id")) BETWEEN 1 AND 512)),
+  CHECK ("causal_attempt_id" IS NULL OR "causal_attempt_id" <> "attempt_id"),
+  FOREIGN KEY ("causal_attempt_id") REFERENCES "nozzle_saga_action_attempts" ("attempt_id"),
   FOREIGN KEY ("operation_id", "operation_step_id")
     REFERENCES "nozzle_operation_steps" ("operation_id", "step_id")
 );`,
@@ -666,6 +672,48 @@ WHEN NOT EXISTS (
   JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = NEW."lease_key"
   WHERE "saga"."saga_id" = NEW."saga_id"
     AND "saga"."operation_id" = NEW."operation_id"
+    AND (
+      (NEW."purpose" = 'effect' AND NEW."phase" = 'forward'
+       AND NEW."causal_attempt_id" IS NULL)
+      OR
+      (NEW."purpose" = 'observation' AND EXISTS (
+        SELECT 1
+        FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "causal_step"
+        JOIN "nozzle_saga_action_attempts" AS "cause"
+          ON "cause"."attempt_id" = NEW."causal_attempt_id"
+        LEFT JOIN "nozzle_saga_action_attempt_outcomes" AS "cause_outcome"
+          ON "cause_outcome"."attempt_id" = "cause"."attempt_id"
+        WHERE "causal_step"."key" = NEW."saga_step_id"
+          AND NEW."causal_attempt_id" = json_extract(
+            "causal_step"."value", '$.' || NEW."phase" || '.lastAttemptId'
+          )
+          AND "cause"."saga_id" = NEW."saga_id"
+          AND "cause"."operation_id" = NEW."operation_id"
+          AND "cause"."operation_step_id" = NEW."operation_step_id"
+          AND "cause"."saga_step_id" = NEW."saga_step_id"
+          AND "cause"."phase" = NEW."phase"
+          AND "cause"."purpose" = 'effect'
+          AND ("cause_outcome"."state" = 'unknown' OR "cause_outcome"."state" IS NULL)
+      ))
+      OR
+      (NEW."purpose" = 'effect' AND NEW."phase" = 'compensation' AND EXISTS (
+        SELECT 1
+        FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "causal_step"
+        JOIN "nozzle_saga_action_attempts" AS "cause"
+          ON "cause"."attempt_id" = NEW."causal_attempt_id"
+        WHERE "causal_step"."key" = NEW."saga_step_id"
+          AND NEW."causal_attempt_id" = json_extract(
+            "causal_step"."value", '$.forward.lastAttemptId'
+          )
+          AND json_extract("causal_step"."value", '$.forward.state') = 'succeeded'
+          AND json_extract("causal_step"."value", '$.forward.resultChecksum') IS NOT NULL
+          AND "cause"."saga_id" = NEW."saga_id"
+          AND "cause"."operation_id" = NEW."operation_id"
+          AND "cause"."saga_step_id" = NEW."saga_step_id"
+          AND "cause"."phase" = 'forward'
+          AND "cause"."purpose" = 'effect'
+      ))
+    )
     AND EXISTS (
       SELECT 1 FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "saga_step"
       WHERE "saga_step"."key" = NEW."saga_step_id"

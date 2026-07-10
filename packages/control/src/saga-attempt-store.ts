@@ -18,7 +18,7 @@ const INPUT_DOMAIN = "nozzle.saga-action-input.v1"
 const EVIDENCE_DOMAIN = "nozzle.saga-action-evidence.v1"
 const OUTPUT_DOMAIN = "nozzle.saga-action-output.v1"
 const ERROR_DOMAIN = "nozzle.saga-action-error.v1"
-const ACCEPTANCE_DOMAIN = "nozzle.saga-action-acceptance.v1"
+const ACCEPTANCE_DOMAIN = "nozzle.saga-action-acceptance.v2"
 const OUTCOME_DOMAIN = "nozzle.saga-action-outcome.v1"
 const SERVER_TIME_SQL = `CAST(unixepoch('subsec') * 1000 AS INTEGER)`
 
@@ -36,6 +36,7 @@ export interface SagaAttemptIdentity {
   readonly acquisitionId: string
   readonly actionKey: string
   readonly attemptId: string
+  readonly causalAttemptId: string | null
   readonly fencingToken: number
   readonly holderId: string
   readonly idempotencyKey: string
@@ -108,6 +109,7 @@ interface SagaAttemptRow {
   readonly acquisition_id: string
   readonly action_key: string
   readonly attempt_id: string
+  readonly causal_attempt_id: string | null
   readonly completed_at_ms: number | null
   readonly error_checksum: string | null
   readonly error_json: string | null
@@ -133,6 +135,7 @@ interface SagaAttemptRow {
 
 interface ActionBinding {
   readonly actionKey: string
+  readonly causalAttemptId: string | null
   readonly idempotencyKey: string
   readonly operationId: string
   readonly operationStepId: string
@@ -253,6 +256,8 @@ function acceptanceParts(
 ) {
   return [
     identity.attemptId,
+    identity.causalAttemptId === null ? "0" : "1",
+    identity.causalAttemptId ?? "",
     identity.sagaId,
     identity.operationId,
     identity.operationStepId,
@@ -388,8 +393,16 @@ export class D1SagaAttemptStore {
       return resume("The saga action is not eligible for this durable attempt.")
     }
     const actionKey = sagaActionKey(reference(saga, sagaStepId, actionPhase, attemptPurpose))
+    let causalAttemptId: string | null = null
+    if (attemptPurpose === "observation") {
+      causalAttemptId = current.lastAttemptId as string
+    } else if (actionPhase === "compensation") {
+      const forward = actionRecord(saga, sagaStepId, "forward")
+      causalAttemptId = forward.lastAttemptId as string
+    }
     return Object.freeze({
       actionKey,
+      causalAttemptId,
       idempotencyKey:
         attemptPurpose === "effect"
           ? current.idempotencyKey
@@ -418,6 +431,8 @@ export class D1SagaAttemptStore {
     if (row === null) return undefined
     if (
       row.attempt_id !== attemptId ||
+      (row.causal_attempt_id !== null &&
+        (typeof row.causal_attempt_id !== "string" || row.causal_attempt_id.trim() === "")) ||
       typeof row.saga_id !== "string" ||
       typeof row.operation_id !== "string" ||
       typeof row.operation_step_id !== "string" ||
@@ -438,11 +453,19 @@ export class D1SagaAttemptStore {
     ) {
       return intervention("Persisted saga-attempt identity is malformed.")
     }
+    const causalRequired = row.purpose === "observation" || row.phase === "compensation"
+    if (
+      causalRequired !== (row.causal_attempt_id !== null) ||
+      row.causal_attempt_id === row.attempt_id
+    ) {
+      return intervention("Persisted saga-attempt causal identity is malformed.")
+    }
     const canonicalInput = inputJson(row.input_json, "Persisted saga action input", true)
     const identityWithoutReceipt = Object.freeze({
       acquisitionId: row.acquisition_id,
       actionKey: row.action_key,
       attemptId: row.attempt_id,
+      causalAttemptId: row.causal_attempt_id,
       fencingToken: row.fencing_token,
       holderId: row.holder_id,
       idempotencyKey: row.idempotency_key,
@@ -584,6 +607,7 @@ export class D1SagaAttemptStore {
       acquisitionId: input.proof.acquisitionId,
       actionKey: binding.actionKey,
       attemptId,
+      causalAttemptId: binding.causalAttemptId,
       fencingToken: input.proof.fencingToken,
       holderId: input.proof.holderId,
       idempotencyKey: binding.idempotencyKey,
@@ -601,21 +625,22 @@ export class D1SagaAttemptStore {
     const result = await this.#database
       .prepare(
         `INSERT INTO "nozzle_saga_action_attempts"
-         ("attempt_id", "saga_id", "operation_id", "operation_step_id", "saga_step_id",
+         ("attempt_id", "causal_attempt_id", "saga_id", "operation_id", "operation_step_id", "saga_step_id",
           "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
           "acceptance_checksum", "lease_key", "holder_id", "acquisition_id", "fencing_token",
           "accepted_at_ms")
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                ?16, ${SERVER_TIME_SQL}
+                ?16, ?17, ${SERVER_TIME_SQL}
          WHERE EXISTS (
            SELECT 1 FROM "nozzle_leases"
-           WHERE "lease_key" = ?13 AND "holder_id" = ?14 AND "acquisition_id" = ?15
-             AND "fencing_token" = ?16 AND "expires_at_ms" > ${SERVER_TIME_SQL}
+           WHERE "lease_key" = ?14 AND "holder_id" = ?15 AND "acquisition_id" = ?16
+             AND "fencing_token" = ?17 AND "expires_at_ms" > ${SERVER_TIME_SQL}
          )
          ON CONFLICT ("attempt_id") DO NOTHING`,
       )
       .bind(
         attemptId,
+        binding.causalAttemptId,
         sagaId,
         binding.operationId,
         binding.operationStepId,
@@ -640,6 +665,7 @@ export class D1SagaAttemptStore {
     }
     if (
       accepted.sagaId !== sagaId ||
+      accepted.causalAttemptId !== binding.causalAttemptId ||
       accepted.operationId !== binding.operationId ||
       accepted.operationStepId !== binding.operationStepId ||
       accepted.sagaStepId !== sagaStepId ||

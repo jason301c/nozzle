@@ -23,6 +23,7 @@ import {
 import {
   D1SagaStore,
   SAGA_INIT_OPERATION_STEP_ID,
+  SAGA_TERMINATION_OPERATION_STEP_ID,
   type SagaEffectContext,
   sagaActionOperationStepId,
 } from "../src/saga-store.js"
@@ -205,27 +206,26 @@ async function framedChecksum(domain: string, parts: readonly string[]): Promise
 }
 
 async function acceptanceForRow(row: Record<string, unknown>): Promise<string> {
-  return framedChecksum(
-    "nozzle.saga-action-acceptance.v1",
-    [
-      "attempt_id",
-      "saga_id",
-      "operation_id",
-      "operation_step_id",
-      "saga_step_id",
-      "phase",
-      "purpose",
-      "action_key",
-      "idempotency_key",
-      "input_checksum",
-      "input_json",
-      "lease_key",
-      "holder_id",
-      "acquisition_id",
-    ]
-      .map((key) => row[key] as string)
-      .concat(String(row.fencing_token)),
-  )
+  const causalAttemptId = row.causal_attempt_id
+  return framedChecksum("nozzle.saga-action-acceptance.v2", [
+    row.attempt_id as string,
+    causalAttemptId === null ? "0" : "1",
+    causalAttemptId === null ? "" : (causalAttemptId as string),
+    row.saga_id as string,
+    row.operation_id as string,
+    row.operation_step_id as string,
+    row.saga_step_id as string,
+    row.phase as string,
+    row.purpose as string,
+    row.action_key as string,
+    row.idempotency_key as string,
+    row.input_checksum as string,
+    row.input_json as string,
+    row.lease_key as string,
+    row.holder_id as string,
+    row.acquisition_id as string,
+    String(row.fencing_token),
+  ])
 }
 
 describe("D1SagaAttemptStore", () => {
@@ -249,6 +249,8 @@ describe("D1SagaAttemptStore", () => {
     const sagaId = `attempt-saga-${suffix}`
     const leaseKey = `saga:${sagaId}`
     const actionStepId = sagaActionOperationStepId("a", "forward")
+    const compensationStepId = sagaActionOperationStepId("a", "compensation")
+    const finalStepId = sagaActionOperationStepId("b", "forward")
     const capabilitySnapshotJson = JSON.stringify({ runtime: "saga-attempt-v1" })
     const operationInputJson = JSON.stringify({ sagaId })
     const plan = await sealOperationPlan(
@@ -258,10 +260,19 @@ describe("D1SagaAttemptStore", () => {
         inputChecksum: await digest(new TextEncoder().encode(operationInputJson)),
         operationId,
         operationType: "saga",
-        steps: [SAGA_INIT_OPERATION_STEP_ID, actionStepId].map((stepId) => ({
-          checkpoint: "reversible" as const,
+        steps: [
+          SAGA_INIT_OPERATION_STEP_ID,
+          SAGA_TERMINATION_OPERATION_STEP_ID,
+          actionStepId,
+          compensationStepId,
+          finalStepId,
+        ].map((stepId) => ({
+          checkpoint: stepId === finalStepId ? ("irreversible" as const) : ("reversible" as const),
           dependsOn: [],
-          effectProtocol: stepId === actionStepId ? ("saga_receipt" as const) : ("opaque" as const),
+          effectProtocol:
+            stepId === actionStepId || stepId === compensationStepId || stepId === finalStepId
+              ? ("saga_receipt" as const)
+              : ("opaque" as const),
           idempotencyKey: `${operationId}:${stepId}:key`,
           inputChecksum: `${operationId}:${stepId}:input`,
           leaseKey,
@@ -354,6 +365,29 @@ describe("D1SagaAttemptStore", () => {
             stepId: "a",
             timeoutMs: 1_000,
           },
+          {
+            authorizationPolicyChecksum: "ee".repeat(32),
+            baseRetryDelayMs: 10,
+            compensationAction: null,
+            compensationObservation: null,
+            forwardAction: {
+              actionId: "b.forward",
+              artifactChecksum: "ef".repeat(32),
+              version: 1,
+            },
+            forwardObservation: {
+              actionId: "b.observe-forward",
+              artifactChecksum: "fe".repeat(32),
+              version: 1,
+            },
+            inputSchemaChecksum: "33".repeat(32),
+            irreversible: true,
+            maxAttempts: 1,
+            maxRetryDelayMs: 100,
+            outputSchemaChecksum: "44".repeat(32),
+            stepId: "b",
+            timeoutMs: 1_000,
+          },
         ],
         version: 1,
       },
@@ -376,7 +410,10 @@ describe("D1SagaAttemptStore", () => {
       inputChecksum: `${sagaId}:input`,
       sagaId,
       serverTimeMs: 1_000,
-      stepInputChecksums: { a: await sagaActionInputChecksum(actionInputJson, digest) },
+      stepInputChecksums: {
+        a: await sagaActionInputChecksum(actionInputJson, digest),
+        b: await sagaActionInputChecksum("{}", digest),
+      },
     })
 
     const actionAttemptId = `${sagaId}:a:forward:1`
@@ -438,6 +475,7 @@ describe("D1SagaAttemptStore", () => {
       actionAttemptId,
       actionInputJson,
       actionStepId,
+      compensationStepId,
       context,
       makeUnknown,
       operationId,
@@ -460,6 +498,7 @@ describe("D1SagaAttemptStore", () => {
     })
     expect(accepted).toMatchObject({
       actionKey: `a.forward@1:${"aa".repeat(32)}`,
+      causalAttemptId: null,
       inputJson: '{"a":1,"b":2}',
       operationId: run.operationId,
       operationStepId: run.actionStepId,
@@ -582,6 +621,7 @@ describe("D1SagaAttemptStore", () => {
     })
     expect(observation).toMatchObject({
       actionKey: `a.observe-forward@1:${"bb".repeat(32)}`,
+      causalAttemptId: effect.attemptId,
       idempotencyKey: sagaObservationIdempotencyKey(effect.idempotencyKey),
       purpose: "observation",
       state: "accepted",
@@ -634,6 +674,137 @@ describe("D1SagaAttemptStore", () => {
         state: "unknown",
       }),
     ).rejects.toThrow(/incompatible/u)
+  })
+
+  it("binds compensation acceptance to the exact confirmed forward attempt", async () => {
+    const run = await fixture("compensation-cause")
+    const forward = await attempts.accept({
+      attemptId: run.actionAttemptId,
+      inputJson: run.actionInputJson,
+      phase: "forward",
+      proof: run.proof(),
+      purpose: "effect",
+      sagaId: run.sagaId,
+      sagaStepId: "a",
+    })
+    const forwardOutcome = await attempts.complete({
+      attemptId: run.actionAttemptId,
+      evidenceJson: '{"dispatch":"confirmed"}',
+      outputJson: '{"created":true}',
+      proof: run.proof(),
+      state: "confirmed",
+    })
+    if (forwardOutcome.state !== "confirmed") throw new Error("Expected confirmed forward.")
+    await operations.completeStep({
+      actorChecksum: "saga-attempt-actor",
+      attemptId: run.actionAttemptId,
+      observedPostconditionChecksum: `${run.operationId}:${run.actionStepId}:postcondition`,
+      operationId: run.operationId,
+      proof: run.proof(),
+      resultChecksum: forwardOutcome.outcomeChecksum,
+      stepId: run.actionStepId,
+    })
+    let saga = await sagaStore.recordActionSuccess({
+      attemptId: run.actionAttemptId,
+      effect: run.context(
+        `${run.actionAttemptId}:success`,
+        run.actionStepId,
+        operationTransitionIdentity("succeeded", [
+          run.operationId,
+          run.actionStepId,
+          run.actionAttemptId,
+        ]),
+      ),
+      evidenceChecksum: forwardOutcome.outcomeChecksum,
+      phase: "forward",
+      resultChecksum: forwardOutcome.outputChecksum,
+      sagaId: run.sagaId,
+      serverTimeMs: 1_002,
+      stepId: "a",
+    })
+
+    const terminationAttemptId = `${run.sagaId}:termination:1`
+    await operations.beginStep({
+      actorChecksum: "saga-attempt-actor",
+      attemptId: terminationAttemptId,
+      idempotencyKey: `${run.operationId}:${SAGA_TERMINATION_OPERATION_STEP_ID}:key`,
+      observedPreconditionChecksum: `${run.operationId}:${SAGA_TERMINATION_OPERATION_STEP_ID}:precondition`,
+      operationId: run.operationId,
+      proof: run.proof(),
+      stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
+    })
+    await operations.completeStep({
+      actorChecksum: "saga-attempt-actor",
+      attemptId: terminationAttemptId,
+      observedPostconditionChecksum: `${run.operationId}:${SAGA_TERMINATION_OPERATION_STEP_ID}:postcondition`,
+      operationId: run.operationId,
+      proof: run.proof(),
+      resultChecksum: `${terminationAttemptId}:result`,
+      stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
+    })
+    saga = await sagaStore.requestTermination({
+      cause: "cancellation",
+      effect: run.context(
+        `${terminationAttemptId}:effect`,
+        SAGA_TERMINATION_OPERATION_STEP_ID,
+        operationTransitionIdentity("succeeded", [
+          run.operationId,
+          SAGA_TERMINATION_OPERATION_STEP_ID,
+          terminationAttemptId,
+        ]),
+      ),
+      evidenceChecksum: `${terminationAttemptId}:result`,
+      sagaId: run.sagaId,
+      serverTimeMs: 1_003,
+    })
+
+    const compensationAttemptId = `${run.sagaId}:a:compensation:1`
+    await operations.beginStep({
+      actorChecksum: "saga-attempt-actor",
+      attemptId: compensationAttemptId,
+      idempotencyKey: `${run.operationId}:${run.compensationStepId}:key`,
+      observedPreconditionChecksum: `${run.operationId}:${run.compensationStepId}:precondition`,
+      operationId: run.operationId,
+      proof: run.proof(),
+      stepId: run.compensationStepId,
+    })
+    saga = (
+      await sagaStore.beginAction({
+        attemptId: compensationAttemptId,
+        effect: run.context(
+          `${compensationAttemptId}:begin`,
+          run.compensationStepId,
+          operationTransitionIdentity("accepted", [
+            run.operationId,
+            run.compensationStepId,
+            compensationAttemptId,
+          ]),
+        ),
+        evidenceChecksum: `${compensationAttemptId}:accepted`,
+        idempotencyKey: saga.steps.a?.compensation.idempotencyKey as string,
+        phase: "compensation",
+        sagaId: run.sagaId,
+        serverTimeMs: 1_004,
+        stepId: "a",
+      })
+    ).saga
+    const compensation = await attempts.accept({
+      attemptId: compensationAttemptId,
+      inputJson: JSON.stringify({
+        causalAttemptId: forward.attemptId,
+        forwardResultChecksum: forwardOutcome.outputChecksum,
+      }),
+      phase: "compensation",
+      proof: run.proof(),
+      purpose: "effect",
+      sagaId: run.sagaId,
+      sagaStepId: "a",
+    })
+    expect(compensation).toMatchObject({
+      causalAttemptId: forward.attemptId,
+      phase: "compensation",
+      state: "accepted",
+    })
   })
 
   it("validates receipt inputs and fails closed before an ineligible dispatch", async () => {
@@ -731,6 +902,8 @@ describe("D1SagaAttemptStore", () => {
     const acceptedRow = rawAttempt(database.database, run.actionAttemptId)
     for (const [change, message] of [
       [{ attempt_id: "other" }, /identity is malformed/u],
+      [{ causal_attempt_id: run.actionAttemptId }, /causal identity is malformed/u],
+      [{ causal_attempt_id: "unexpected" }, /causal identity is malformed/u],
       [{ phase: "other" }, /identity is malformed/u],
       [{ input_json: null }, /action input is malformed/u],
       [{ input_json: "{" }, /action input is not valid JSON/u],
