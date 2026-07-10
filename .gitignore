@@ -1,0 +1,42 @@
+# Dependencies and package-manager state
+node_modules/
+.pnpm-store/
+
+# Cloudflare and Wrangler local state
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Nozzle local operational state
+.nozzle/
+
+# Build and test output
+dist/
+build/
+coverage/
+.nyc_output/
+.vitest/
+playwright-report/
+test-results/
+*.tsbuildinfo
+
+# Local databases and transient files
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.log
+*.tmp
+.cache/
+.tmp/
+tmp/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
