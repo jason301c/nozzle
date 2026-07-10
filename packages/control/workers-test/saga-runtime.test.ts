@@ -9,6 +9,7 @@ import { beforeAll, describe, expect, it } from "vitest"
 import { D1LeaseStore } from "../src/lease-store.js"
 import { D1OperationStore, operationTransitionIdentity } from "../src/operation-store.js"
 import { D1SagaAttemptStore, sagaActionInputChecksum } from "../src/saga-attempt-store.js"
+import { invokeSagaEffectHandler } from "../src/saga-handler.js"
 import { sealSagaOperationPlan } from "../src/saga-plan.js"
 import { sealSagaHandlerRegistry } from "../src/saga-registry.js"
 import {
@@ -117,6 +118,25 @@ describe("real workerd D1 saga projection", () => {
     expect(plan.steps).toHaveLength(4)
     expect(plan.steps.filter((step) => step.activation === "required")).toHaveLength(1)
     expect(plan.steps.filter((step) => step.effectProtocol === "saga_receipt")).toHaveLength(2)
+    await expect(
+      invokeSagaEffectHandler(registry.effect(forwardAction), {
+        action: forwardAction,
+        attemptId: "workerd-registry-attempt",
+        idempotencyKey: "workerd-registry-action-key",
+        inputJson: "{}",
+        operationId: plan.operationId,
+        phase: "forward",
+        proof: {
+          acquisitionId: "workerd-registry-acquisition",
+          fencingToken: 1,
+          holderId: "workerd-registry-controller",
+          leaseKey: "saga:workerd-registry",
+        },
+        sagaId: "workerd-registry",
+        stepId: "write",
+        timeoutMs: 1_000,
+      }),
+    ).resolves.toEqual({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" })
   })
 
   it("atomically advances a saga only through exact fenced operation transitions", async () => {

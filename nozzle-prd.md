@@ -950,6 +950,8 @@ The saga plan compiler emits required `saga:init`, conditional `saga:termination
 
 Control-plane saga attempt receipts are append-only dispatch and observation evidence; they do not replace the shard-local receipt that a D1 application mutation commits atomically with its data change. Attempt inputs, evidence, outputs, and errors are canonical JSON capped at one MiB, with domain-separated payload, acceptance, and outcome checksums. The acceptance receipt binds the exact descriptor action key, saga and operation identity, phase, purpose, idempotency key, payload, and lease fence. An accepted attempt without a terminal outcome remains accepted evidence of possible dispatch and is recovered as unknown; absence of an acceptance receipt is the only Control-plane proof that dispatch did not occur.
 
+The handler invocation boundary accepts only exact, canonicalizable result envelopes and caps every JSON value at one MiB before persistence. Effect exceptions and timeouts are redacted and classified `unknown`; observation exceptions and timeouts are redacted and classified `indeterminate`. The boundary abort signal is advisory only: a timeout never proves that an external effect stopped or was not applied, and late handler completion cannot change the chosen durable outcome.
+
 ## 18. Backup, restore, and deletion
 
 ### 18.1 Recovery objectives
@@ -2108,6 +2110,7 @@ No distributed system is literally failure-proof. For Nozzle, bulletproof means:
 60. A saga action operation step declares the `saga_receipt` effect protocol. Dispatch requires its exact accepted Control receipt; under a newer fence, receipt absence proves the attempt was not dispatched, while receipt presence without a terminal outcome remains unknown. An operation outcome may commit only when the exact terminal saga receipt agrees with its attempt, purpose, step, and checksum.
 61. Conditional operation paths are sealed explicitly and settle as evidenced `not_required`, never as fake successful attempts; required steps cannot be skipped, and at least one required step anchors every plan.
 62. Saga handlers are deploy-time, kind-checked, artifact-checksummed registrations; the deterministic compiler seals all possible paths while the descriptor—not unrelated registry membership—binds the exact executable versions.
+63. Handler exceptions, timeouts, malformed returns, and late completion cross one strict boundary: effect ambiguity becomes `unknown`, observation ambiguity becomes `indeterminate`, durable JSON is canonical and bounded, and private exception text is never persisted.
 
 ### 29.4 Mechanisms intentionally rejected
 
