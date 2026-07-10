@@ -22,6 +22,7 @@ interface ProviderAttemptIdentity {
   readonly leaseKey: string
   readonly mutating: boolean
   readonly operationId: string
+  readonly purpose: "effect" | "reconciliation"
   readonly requestChecksum: string
   readonly stepId: string
   readonly targetChecksum: string
@@ -50,6 +51,7 @@ export interface AcceptProviderAttemptInput {
   readonly endpoint: string
   readonly mutating: boolean
   readonly operationId: string
+  readonly purpose: "effect" | "reconciliation"
   readonly proof: LeaseProof
   readonly requestChecksum: string
   readonly stepId: string
@@ -88,6 +90,7 @@ interface ProviderAttemptRow {
   readonly mutating: number
   readonly operation_id: string
   readonly outcome_checksum: string | null
+  readonly purpose: string
   readonly request_checksum: string
   readonly result_json: string | null
   readonly state: string | null
@@ -190,6 +193,7 @@ function acceptanceParts(input: {
   readonly leaseKey: string
   readonly mutating: boolean
   readonly operationId: string
+  readonly purpose: "effect" | "reconciliation"
   readonly requestChecksum: string
   readonly stepId: string
   readonly targetChecksum: string
@@ -198,6 +202,7 @@ function acceptanceParts(input: {
     input.targetChecksum,
     input.actorChecksum,
     input.operationId,
+    input.purpose,
     input.stepId,
     input.attemptId,
     input.endpoint,
@@ -241,6 +246,7 @@ function identityFromRow(row: ProviderAttemptRow): ProviderAttemptIdentity {
     row.actor_checksum.trim() === "" ||
     typeof row.endpoint !== "string" ||
     row.endpoint.trim() === "" ||
+    (row.purpose !== "effect" && row.purpose !== "reconciliation") ||
     (row.mutating !== 0 && row.mutating !== 1) ||
     typeof row.request_checksum !== "string" ||
     row.request_checksum.trim() === "" ||
@@ -271,6 +277,7 @@ function identityFromRow(row: ProviderAttemptRow): ProviderAttemptIdentity {
     leaseKey: row.lease_key,
     mutating: row.mutating === 1,
     operationId: row.operation_id,
+    purpose: row.purpose,
     requestChecksum: row.request_checksum,
     stepId: row.step_id,
     targetChecksum: row.target_checksum,
@@ -299,7 +306,8 @@ export class D1ProviderAttemptStore {
     const row = await this.#database
       .prepare(
         `SELECT "attempt"."attempt_id", "attempt"."operation_id", "attempt"."step_id",
-                "attempt"."target_checksum", "attempt"."actor_checksum", "attempt"."endpoint",
+                "attempt"."target_checksum", "attempt"."actor_checksum", "attempt"."purpose",
+                "attempt"."endpoint",
                 "attempt"."mutating", "attempt"."request_checksum",
                 "attempt"."acceptance_checksum", "attempt"."lease_key",
                 "attempt"."holder_id", "attempt"."acquisition_id",
@@ -384,6 +392,12 @@ export class D1ProviderAttemptStore {
     const attemptId = boundedText(input.attemptId, "Provider attempt ID")
     const endpoint = boundedText(input.endpoint, "Provider endpoint", MAX_ENDPOINT_BYTES)
     const operationId = boundedText(input.operationId, "Operation ID")
+    if (input.purpose !== "effect" && input.purpose !== "reconciliation") {
+      configuration("Provider attempt purpose is invalid.")
+    }
+    if (input.purpose === "reconciliation" && input.mutating) {
+      configuration("Provider reconciliation attempts must be non-mutating.")
+    }
     const requestChecksum = boundedText(input.requestChecksum, "Provider request checksum")
     const stepId = boundedText(input.stepId, "Operation step ID")
     const targetChecksum = boundedText(input.targetChecksum, "Provider target checksum")
@@ -399,6 +413,7 @@ export class D1ProviderAttemptStore {
       leaseKey: input.proof.leaseKey,
       mutating: input.mutating,
       operationId,
+      purpose: input.purpose,
       requestChecksum,
       stepId,
       targetChecksum,
@@ -406,19 +421,25 @@ export class D1ProviderAttemptStore {
     const result = await this.#database
       .prepare(
         `INSERT INTO "nozzle_provider_attempts"
-         ("attempt_id", "operation_id", "step_id", "target_checksum", "actor_checksum",
+         ("attempt_id", "operation_id", "step_id", "target_checksum", "actor_checksum", "purpose",
           "endpoint", "mutating", "request_checksum", "acceptance_checksum", "lease_key",
           "holder_id", "acquisition_id", "fencing_token", "accepted_at_ms")
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ${SERVER_TIME_SQL}
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ${SERVER_TIME_SQL}
          WHERE EXISTS (
            SELECT 1 FROM "nozzle_operation_steps"
-           WHERE "operation_id" = ?2 AND "step_id" = ?3 AND "state" = 'running'
-             AND json_extract("record_json", '$.activeAttemptId') = ?1
-             AND "fencing_token" = ?13
+           WHERE "operation_id" = ?2 AND "step_id" = ?3
+             AND ((
+               ?6 = 'effect' AND "state" = 'running'
+               AND json_extract("record_json", '$.activeAttemptId') = ?1
+               AND "fencing_token" = ?14
+             ) OR (
+               ?6 = 'reconciliation' AND "state" = 'unknown'
+               AND "fencing_token" < ?14
+             ))
          ) AND EXISTS (
            SELECT 1 FROM "nozzle_leases"
-           WHERE "lease_key" = ?10 AND "holder_id" = ?11 AND "acquisition_id" = ?12
-             AND "fencing_token" = ?13 AND "expires_at_ms" > ${SERVER_TIME_SQL}
+           WHERE "lease_key" = ?11 AND "holder_id" = ?12 AND "acquisition_id" = ?13
+             AND "fencing_token" = ?14 AND "expires_at_ms" > ${SERVER_TIME_SQL}
          )
          ON CONFLICT ("attempt_id") DO NOTHING`,
       )
@@ -428,6 +449,7 @@ export class D1ProviderAttemptStore {
         stepId,
         targetChecksum,
         actorChecksum,
+        input.purpose,
         endpoint,
         input.mutating,
         requestChecksum,
@@ -446,6 +468,7 @@ export class D1ProviderAttemptStore {
       record.stepId !== stepId ||
       record.targetChecksum !== targetChecksum ||
       record.actorChecksum !== actorChecksum ||
+      record.purpose !== input.purpose ||
       record.endpoint !== endpoint ||
       record.mutating !== input.mutating ||
       record.requestChecksum !== requestChecksum ||

@@ -259,6 +259,7 @@ ON CONFLICT ("singleton") DO NOTHING;`,
   "step_id" TEXT NOT NULL,
   "target_checksum" TEXT NOT NULL CHECK (length(trim("target_checksum")) > 0),
   "actor_checksum" TEXT NOT NULL CHECK (length(trim("actor_checksum")) > 0),
+  "purpose" TEXT NOT NULL CHECK ("purpose" IN ('effect', 'reconciliation')),
   "endpoint" TEXT NOT NULL CHECK (length(trim("endpoint")) > 0),
   "mutating" INTEGER NOT NULL CHECK ("mutating" IN (0, 1)),
   "request_checksum" TEXT NOT NULL CHECK (length(trim("request_checksum")) > 0),
@@ -268,6 +269,7 @@ ON CONFLICT ("singleton") DO NOTHING;`,
   "acquisition_id" TEXT NOT NULL,
   "fencing_token" INTEGER NOT NULL CHECK ("fencing_token" >= 1),
   "accepted_at_ms" INTEGER NOT NULL CHECK ("accepted_at_ms" >= 0),
+  CHECK ("purpose" = 'effect' OR "mutating" = 0),
   FOREIGN KEY ("operation_id", "step_id")
     REFERENCES "nozzle_operation_steps" ("operation_id", "step_id")
 );`,
@@ -440,9 +442,16 @@ WHEN NOT EXISTS (
   JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = NEW."lease_key"
   WHERE "step"."operation_id" = NEW."operation_id" AND "step"."step_id" = NEW."step_id"
     AND "step"."lease_key" = NEW."lease_key"
-    AND "step"."state" = 'running'
-    AND json_extract("step"."record_json", '$.activeAttemptId') = NEW."attempt_id"
-    AND "step"."fencing_token" = NEW."fencing_token"
+    AND (
+      (NEW."purpose" = 'effect'
+       AND "step"."state" = 'running'
+       AND json_extract("step"."record_json", '$.activeAttemptId') = NEW."attempt_id"
+       AND "step"."fencing_token" = NEW."fencing_token")
+      OR
+      (NEW."purpose" = 'reconciliation'
+       AND "step"."state" = 'unknown'
+       AND "step"."fencing_token" < NEW."fencing_token")
+    )
     AND "lease"."holder_id" = NEW."holder_id"
     AND "lease"."acquisition_id" = NEW."acquisition_id"
     AND "lease"."fencing_token" = NEW."fencing_token"

@@ -44,7 +44,7 @@ describe("real workerd operation ledger", () => {
               {
                 checkpoint: "reversible",
                 dependsOn: [],
-                effectProtocol: "provider_receipt",
+                effectProtocol: index === 1 ? "provider_receipt" : "opaque",
                 idempotencyKey: `workerd-step-key-${index}`,
                 inputChecksum: `workerd-step-input-${index}`,
                 leaseKey: "workerd:operation",

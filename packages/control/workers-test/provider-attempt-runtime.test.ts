@@ -89,6 +89,7 @@ describe("real workerd provider receipts", () => {
       endpoint: "POST /accounts/{account_id}/d1/database",
       mutating: true,
       operationId: plan.operationId,
+      purpose: "effect",
       proof,
       requestChecksum: "workerd-provider-request",
       stepId: "provider-call",
@@ -129,5 +130,40 @@ describe("real workerd provider receipts", () => {
         stepId: "provider-call",
       }),
     ).resolves.toMatchObject({ steps: { "provider-call": { state: "unknown" } } })
+    const recoveryProof = leaseProof(recoveryLease.record)
+    const observation = await receipts.accept({
+      actorChecksum: "workerd-provider-recovery-actor",
+      attemptId: "workerd-provider-observation",
+      endpoint: "GET /accounts/{account_id}/d1/database",
+      mutating: false,
+      operationId: plan.operationId,
+      purpose: "reconciliation",
+      proof: recoveryProof,
+      requestChecksum: "workerd-provider-observation-request",
+      stepId: "provider-call",
+      targetChecksum: "workerd-provider-target",
+    })
+    const observed = await receipts.complete({
+      attemptId: observation.attemptId,
+      evidenceJson: '{"matches":[{"uuid":"00000000-0000-4000-8000-000000000002"}]}',
+      proof: recoveryProof,
+      resultJson: '{"uuid":"00000000-0000-4000-8000-000000000002"}',
+      state: "confirmed",
+    })
+    if (observed.state !== "confirmed") throw new Error("Observation was not confirmed.")
+    await expect(
+      operations.reconcileStep({
+        actorChecksum: "workerd-provider-recovery-actor",
+        evidenceChecksum: observed.outcomeChecksum,
+        observationAttemptId: observation.attemptId,
+        observedPostconditionChecksum: "workerd-provider-postcondition",
+        operationId: plan.operationId,
+        outcome: "applied",
+        proof: recoveryProof,
+        reconciliationId: "workerd-provider-reconciliation",
+        resultChecksum: "workerd-provider-result",
+        stepId: "provider-call",
+      }),
+    ).resolves.toMatchObject({ steps: { "provider-call": { state: "succeeded" } } })
   })
 })

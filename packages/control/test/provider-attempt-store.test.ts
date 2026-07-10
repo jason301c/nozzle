@@ -145,7 +145,8 @@ function rawAttempt(database: DatabaseSync, attemptId: string): Record<string, u
   return database
     .prepare(
       `SELECT "attempt"."attempt_id", "attempt"."operation_id", "attempt"."step_id",
-              "attempt"."target_checksum", "attempt"."actor_checksum", "attempt"."endpoint",
+              "attempt"."target_checksum", "attempt"."actor_checksum", "attempt"."purpose",
+              "attempt"."endpoint",
               "attempt"."mutating", "attempt"."request_checksum",
               "attempt"."acceptance_checksum", "attempt"."lease_key",
               "attempt"."holder_id", "attempt"."acquisition_id",
@@ -236,6 +237,7 @@ describe("D1ProviderAttemptStore", () => {
       endpoint: "POST /accounts/{account_id}/d1/database",
       mutating: true,
       operationId: plan.operationId,
+      purpose: "effect",
       proof,
       requestChecksum: `request-${suffix}`,
       stepId: "provider-call",
@@ -271,6 +273,28 @@ describe("D1ProviderAttemptStore", () => {
     })
     if (completed.state !== "confirmed") throw new Error("Fixture outcome was not confirmed.")
     expect(completed.outcomeChecksum).toHaveLength(64)
+    await expect(
+      operations.completeStep({
+        actorChecksum: "attempt-actor",
+        attemptId: fixture.attemptId,
+        observedPostconditionChecksum: "postcondition-confirmed",
+        operationId: fixture.plan.operationId,
+        proof: fixture.proof,
+        resultChecksum: "wrong-provider-outcome",
+        stepId: "provider-call",
+      }),
+    ).rejects.toThrow(/provider outcome receipt contradicts/u)
+    await expect(
+      operations.completeStep({
+        actorChecksum: "attempt-actor",
+        attemptId: fixture.attemptId,
+        observedPostconditionChecksum: "postcondition-confirmed",
+        operationId: fixture.plan.operationId,
+        proof: fixture.proof,
+        resultChecksum: completed.outcomeChecksum,
+        stepId: "provider-call",
+      }),
+    ).resolves.toMatchObject({ steps: { "provider-call": { state: "succeeded" } } })
     await leases.release({ proof: fixture.proof })
     await expect(
       store.complete({
@@ -315,32 +339,128 @@ describe("D1ProviderAttemptStore", () => {
   it("records definite rejection and ambiguous outcome as distinct terminal receipts", async () => {
     const rejectedFixture = await startAttempt("rejected")
     await store.accept(rejectedFixture.acceptance)
+    const rejected = await store.complete({
+      attemptId: rejectedFixture.attemptId,
+      errorJson: '{"codes":[10000],"kind":"permission_denied"}',
+      evidenceJson: '{"status":403}',
+      proof: rejectedFixture.proof,
+      state: "rejected",
+    })
+    if (rejected.state !== "rejected") throw new Error("Fixture outcome was not rejected.")
     await expect(
-      store.complete({
+      operations.failStep({
+        actorChecksum: "attempt-actor",
         attemptId: rejectedFixture.attemptId,
-        errorJson: '{"codes":[10000],"kind":"permission_denied"}',
-        evidenceJson: '{"status":403}',
+        errorChecksum: rejected.outcomeChecksum,
+        operationId: rejectedFixture.plan.operationId,
+        outcome: "definitely_not_applied",
         proof: rejectedFixture.proof,
-        state: "rejected",
+        stepId: "provider-call",
       }),
-    ).resolves.toMatchObject({ state: "rejected" })
+    ).resolves.toMatchObject({ steps: { "provider-call": { state: "retryable_failed" } } })
 
     const unknownFixture = await startAttempt("unknown")
     await store.accept(unknownFixture.acceptance)
+    const unknown = await store.complete({
+      attemptId: unknownFixture.attemptId,
+      errorJson: '{"kind":"transport_after_dispatch"}',
+      evidenceJson: '{"responseChecksum":null}',
+      proof: unknownFixture.proof,
+      state: "unknown",
+    })
+    if (unknown.state !== "unknown") throw new Error("Fixture outcome was not unknown.")
     await expect(
-      store.complete({
+      operations.failStep({
+        actorChecksum: "attempt-actor",
         attemptId: unknownFixture.attemptId,
-        errorJson: '{"kind":"transport_after_dispatch"}',
-        evidenceJson: '{"responseChecksum":null}',
+        errorChecksum: unknown.outcomeChecksum,
+        operationId: unknownFixture.plan.operationId,
+        outcome: "unknown",
         proof: unknownFixture.proof,
-        state: "unknown",
+        stepId: "provider-call",
       }),
-    ).resolves.toMatchObject({ state: "unknown" })
+    ).resolves.toMatchObject({ steps: { "provider-call": { state: "unknown" } } })
+
+    await expect(
+      operations.reconcileStep({
+        actorChecksum: "reconciliation-actor",
+        evidenceChecksum: "unreceipted-observation",
+        observedPostconditionChecksum: "postcondition-unknown",
+        operationId: unknownFixture.plan.operationId,
+        outcome: "applied",
+        proof: unknownFixture.proof,
+        reconciliationId: "unreceipted-reconciliation",
+        resultChecksum: "unreceipted-result",
+        stepId: "provider-call",
+      }),
+    ).rejects.toThrow(/lacks receipt requirements/u)
+    await expect(
+      store.accept({
+        ...unknownFixture.acceptance,
+        attemptId: "premature-observation",
+        endpoint: "GET /accounts/{account_id}/d1/database",
+        mutating: false,
+        purpose: "reconciliation",
+        requestChecksum: "premature-observation-request",
+      }),
+    ).rejects.toThrow(/not accepted under the active lease/u)
+    await leases.release({ proof: unknownFixture.proof })
+    const observationLease = await leases.acquire({
+      acquisitionId: "observation-acquisition",
+      holderId: "observation-controller",
+      leaseKey: unknownFixture.proof.leaseKey,
+      ttlMs: 60_000,
+    })
+    if (!observationLease.acquired) throw new Error("Observation lease acquisition failed.")
+    const observationProof = leaseProof(observationLease.record)
+    const observationAttemptId = "observation-unknown"
+    const observation = await store.accept({
+      ...unknownFixture.acceptance,
+      attemptId: observationAttemptId,
+      endpoint: "GET /accounts/{account_id}/d1/database",
+      mutating: false,
+      purpose: "reconciliation",
+      proof: observationProof,
+      requestChecksum: "observation-request",
+    })
+    const observed = await store.complete({
+      attemptId: observation.attemptId,
+      evidenceJson: '{"matches":[{"uuid":"00000000-0000-4000-8000-000000000003"}]}',
+      proof: observationProof,
+      resultJson: '{"uuid":"00000000-0000-4000-8000-000000000003"}',
+      state: "confirmed",
+    })
+    if (observed.state !== "confirmed") throw new Error("Observation was not confirmed.")
+    await expect(
+      operations.reconcileStep({
+        actorChecksum: "reconciliation-actor",
+        evidenceChecksum: observed.outcomeChecksum,
+        observationAttemptId,
+        observedPostconditionChecksum: "postcondition-unknown",
+        operationId: unknownFixture.plan.operationId,
+        outcome: "applied",
+        proof: observationProof,
+        reconciliationId: "received-reconciliation",
+        resultChecksum: "reconciled-provider-result",
+        stepId: "provider-call",
+      }),
+    ).resolves.toMatchObject({ steps: { "provider-call": { state: "succeeded" } } })
   })
 
   it("rejects contradictory receipt replay and outcomes under stale or different fences", async () => {
     const fixture = await startAttempt("fenced")
     await store.accept(fixture.acceptance)
+    await expect(
+      operations.completeStep({
+        actorChecksum: "attempt-actor",
+        attemptId: fixture.attemptId,
+        observedPostconditionChecksum: "postcondition-fenced",
+        operationId: fixture.plan.operationId,
+        proof: fixture.proof,
+        resultChecksum: "missing-outcome",
+        stepId: "provider-call",
+      }),
+    ).rejects.toThrow(/no terminal outcome receipt/u)
     await expect(
       store.accept({ ...fixture.acceptance, targetChecksum: "other-target" }),
     ).rejects.toThrow(/contradictory immutable input/u)
@@ -391,6 +511,7 @@ describe("D1ProviderAttemptStore", () => {
         endpoint: "POST /resource",
         mutating: true,
         operationId: "missing-operation",
+        purpose: "effect",
         proof: {
           acquisitionId: "missing-acquisition",
           fencingToken: 1,
@@ -449,6 +570,16 @@ describe("D1ProviderAttemptStore", () => {
     await expect(store.accept({ ...fixture.acceptance, mutating: "yes" as never })).rejects.toThrow(
       /mutating flag/u,
     )
+    await expect(
+      store.accept({ ...fixture.acceptance, purpose: "side_effect" as never }),
+    ).rejects.toThrow(/purpose is invalid/u)
+    await expect(
+      store.accept({
+        ...fixture.acceptance,
+        attemptId: "mutating-observation",
+        purpose: "reconciliation",
+      }),
+    ).rejects.toThrow(/reconciliation attempts must be non-mutating/u)
     await expect(
       store.accept({
         ...fixture.acceptance,
@@ -517,6 +648,8 @@ describe("D1ProviderAttemptStore", () => {
       ["target_checksum", ""],
       ["actor_checksum", null],
       ["actor_checksum", ""],
+      ["purpose", null],
+      ["purpose", "future-purpose"],
       ["endpoint", null],
       ["endpoint", ""],
       ["mutating", 2],

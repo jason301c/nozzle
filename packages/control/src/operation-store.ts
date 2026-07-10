@@ -91,6 +91,8 @@ interface ProviderAttemptPresenceRow {
   readonly acceptance_checksum: string
   readonly attempt_id: string
   readonly operation_id: string
+  readonly outcome_checksum: string | null
+  readonly purpose: string
   readonly state: string | null
   readonly step_id: string
 }
@@ -160,6 +162,7 @@ export interface ReconcileStoredOperationStepInput extends TransitionIdentity {
   readonly evidenceChecksum: string
   readonly observedPostconditionChecksum?: string
   readonly outcome: StepReconciliationOutcome
+  readonly observationAttemptId?: string
   readonly reconciliationId: string
   readonly resultChecksum?: string
 }
@@ -371,7 +374,8 @@ export class D1OperationStore {
     const row = await this.#database
       .prepare(
         `SELECT "attempt"."attempt_id", "attempt"."operation_id", "attempt"."step_id",
-                "attempt"."acceptance_checksum", "outcome"."state"
+                "attempt"."acceptance_checksum", "attempt"."purpose", "outcome"."state",
+                "outcome"."outcome_checksum"
          FROM "nozzle_provider_attempts" AS "attempt"
          LEFT JOIN "nozzle_provider_attempt_outcomes" AS "outcome" USING ("attempt_id")
          WHERE "attempt"."attempt_id" = ?1`,
@@ -387,7 +391,11 @@ export class D1OperationStore {
       row.step_id.trim() === "" ||
       typeof row.acceptance_checksum !== "string" ||
       row.acceptance_checksum.trim() === "" ||
-      !PROVIDER_ATTEMPT_OUTCOME_STATES.has(row.state)
+      (row.purpose !== "effect" && row.purpose !== "reconciliation") ||
+      !PROVIDER_ATTEMPT_OUTCOME_STATES.has(row.state) ||
+      (row.state === null
+        ? row.outcome_checksum !== null
+        : typeof row.outcome_checksum !== "string" || row.outcome_checksum.trim() === "")
     ) {
       return intervention("Persisted provider-attempt recovery evidence is malformed.")
     }
@@ -1141,6 +1149,12 @@ export class D1OperationStore {
         }),
       transitionIdentity("succeeded", [input.operationId, input.stepId, input.attemptId]),
       true,
+      {
+        attemptId: input.attemptId,
+        checksum: input.resultChecksum,
+        purpose: "effect",
+        state: "confirmed",
+      },
     )
   }
 
@@ -1159,6 +1173,12 @@ export class D1OperationStore {
         }),
       transitionIdentity("failed", [input.operationId, input.stepId, input.attemptId]),
       true,
+      {
+        attemptId: input.attemptId,
+        checksum: input.errorChecksum,
+        purpose: "effect",
+        state: input.outcome === "unknown" ? "unknown" : "rejected",
+      },
     )
   }
 
@@ -1181,6 +1201,14 @@ export class D1OperationStore {
         }),
       transitionIdentity("reconciled", [input.operationId, input.stepId, input.reconciliationId]),
       false,
+      input.observationAttemptId === undefined
+        ? undefined
+        : {
+            attemptId: input.observationAttemptId,
+            checksum: input.evidenceChecksum,
+            purpose: "reconciliation",
+            state: "confirmed",
+          },
     )
   }
 
@@ -1191,12 +1219,39 @@ export class D1OperationStore {
     transition: (operation: OperationRecord) => OperationRecord,
     transitionId: string,
     requireAttemptFence: boolean,
+    providerOutcome?: {
+      readonly attemptId: string
+      readonly checksum: string
+      readonly purpose: "effect" | "reconciliation"
+      readonly state: "confirmed" | "rejected" | "unknown"
+    },
   ): Promise<OperationRecord> {
     nonEmpty(input.operationId, "Operation ID")
     nonEmpty(input.actorChecksum, "Transition actor checksum")
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt += 1) {
       const before = await this.get(input.operationId)
       if (!before) return resume("The operation does not exist.")
+      const planStep = before.operation.plan.steps.find(
+        (candidate) => candidate.stepId === input.stepId,
+      ) as OperationStepPlan | undefined
+      if (planStep?.effectProtocol === "provider_receipt") {
+        if (providerOutcome === undefined) {
+          return intervention("A provider-receipt step outcome lacks receipt requirements.")
+        }
+        const receipt = await this.#providerAttempt(providerOutcome.attemptId)
+        if (receipt === undefined || receipt.state === null) {
+          return resume("The provider attempt has no terminal outcome receipt.")
+        }
+        if (
+          receipt.operation_id !== input.operationId ||
+          receipt.step_id !== input.stepId ||
+          receipt.purpose !== providerOutcome.purpose ||
+          receipt.state !== providerOutcome.state ||
+          receipt.outcome_checksum !== providerOutcome.checksum
+        ) {
+          return intervention("The provider outcome receipt contradicts the operation transition.")
+        }
+      }
       const next = transition(before.operation)
       if (next === before.operation) return before.operation
       await this.#leases.authorizeAt(input.proof)
