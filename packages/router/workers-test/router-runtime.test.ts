@@ -11,6 +11,7 @@ import { blob, integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { beforeEach, describe, expect, it } from "vitest"
 import { createFanoutContinuation, mergeFanoutPage } from "../src/fanout.js"
 import { executeFanoutPage } from "../src/fanout-executor.js"
+import { countFanout, sumFanoutNumbers } from "../src/fanout-reducer.js"
 import { createFanoutToken, decodeFanoutToken } from "../src/fanout-token.js"
 import { RouterLeaf } from "../src/leaf.js"
 import { createSessionToken, resolveRouteAwareSession } from "../src/session.js"
@@ -218,6 +219,30 @@ describe("real workerd router-to-D1 transport", () => {
     })
     expect(result.rows[0]?.value).toBe("a")
     expect(result.complete).toBe(true)
+  })
+
+  it("reduces exact counts and compensated sums in workerd", () => {
+    expect(
+      countFanout({
+        partialPolicy: "fail",
+        shardIds: ["a", "b"],
+        shards: [
+          { kind: "success", shardId: "a", value: "9007199254740993" },
+          { kind: "success", shardId: "b", value: 2n },
+        ],
+      }).value,
+    ).toBe(9_007_199_254_740_995n)
+    expect(
+      sumFanoutNumbers({
+        partialPolicy: "fail",
+        shardIds: ["a", "b", "c"],
+        shards: [
+          { kind: "success", shardId: "a", value: 1e16 },
+          { kind: "success", shardId: "b", value: 1 },
+          { kind: "success", shardId: "c", value: -1e16 },
+        ],
+      }).value,
+    ).toBe(1)
   })
 
   it("preserves Drizzle result types through the explicit wire codec", async () => {

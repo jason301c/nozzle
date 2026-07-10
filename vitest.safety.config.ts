@@ -32,6 +32,7 @@ export default defineConfig({
         "packages/router/src/leaf.ts",
         "packages/router/src/fanout.ts",
         "packages/router/src/fanout-executor.ts",
+        "packages/router/src/fanout-reducer.ts",
         "packages/router/src/fanout-token.ts",
         "packages/router/src/session.ts",
         "packages/router/src/transport.ts",

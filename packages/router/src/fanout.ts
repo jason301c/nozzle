@@ -195,7 +195,7 @@ function utf8Compare(left: string, right: string): number {
   return leftBytes.length === rightBytes.length ? 0 : leftBytes.length < rightBytes.length ? -1 : 1
 }
 
-function compareValue(
+export function compareFanoutOrderValues(
   left: FanoutOrderValue,
   right: FanoutOrderValue,
   column: FanoutOrderColumn,
@@ -232,7 +232,7 @@ function comparePosition(
   order: readonly FanoutOrderColumn[],
 ): number {
   for (let index = 0; index < order.length; index += 1) {
-    const difference = compareValue(
+    const difference = compareFanoutOrderValues(
       left.orderValues[index] as FanoutOrderValue,
       right.orderValues[index] as FanoutOrderValue,
       order[index] as FanoutOrderColumn,
@@ -250,7 +250,7 @@ function compareRows<T>(
   order: readonly FanoutOrderColumn[],
 ): number {
   for (let index = 0; index < order.length; index += 1) {
-    const difference = compareValue(
+    const difference = compareFanoutOrderValues(
       left.orderValues[index] as FanoutOrderValue,
       right.orderValues[index] as FanoutOrderValue,
       order[index] as FanoutOrderColumn,
