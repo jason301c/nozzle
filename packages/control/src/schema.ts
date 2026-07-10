@@ -168,6 +168,20 @@ ON CONFLICT ("schema_version") DO NOTHING;`,
 );`,
   `INSERT INTO "nozzle_control_sequence" ("singleton", "sequence") VALUES (1, 0)
 ON CONFLICT ("singleton") DO NOTHING;`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_movement_operations" (
+  "operation_id" TEXT PRIMARY KEY NOT NULL,
+  "fleet_id" TEXT NOT NULL REFERENCES "nozzle_fleets" ("fleet_id"),
+  "partition_digest" TEXT NOT NULL,
+  "source_shard_id" TEXT NOT NULL,
+  "destination_shard_id" TEXT NOT NULL,
+  "source_route_epoch" INTEGER NOT NULL CHECK ("source_route_epoch" >= 0),
+  "target_route_epoch" INTEGER NOT NULL CHECK ("target_route_epoch" = "source_route_epoch" + 1),
+  "required_tables_json" TEXT NOT NULL CHECK (json_valid("required_tables_json")),
+  "phase" TEXT NOT NULL CHECK ("phase" IN ('planned', 'capturing', 'copying', 'replaying', 'source_read_only', 'tail_drained', 'destination_writable', 'route_published', 'verified', 'quarantined', 'cleanup_authorized', 'completed', 'rollback_pending', 'rolled_back')),
+  "state_json" TEXT NOT NULL CHECK (json_valid("state_json")),
+  "created_at_ms" INTEGER NOT NULL CHECK ("created_at_ms" >= 0),
+  "updated_at_ms" INTEGER NOT NULL CHECK ("updated_at_ms" >= "created_at_ms")
+);`,
   `CREATE TABLE IF NOT EXISTS "nozzle_operations" (
   "operation_id" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("operation_id")) > 0),
   "operation_type" TEXT NOT NULL CHECK (length(trim("operation_type")) > 0),
@@ -333,6 +347,21 @@ WHEN NEW."state" = 'succeeded' AND OLD."state" <> 'succeeded'
 BEGIN
   UPDATE "nozzle_fleets" SET "state" = 'active' WHERE "fleet_id" = NEW."fleet_id";
 END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_movement_plan_update"
+BEFORE UPDATE ON "nozzle_movement_operations"
+WHEN NEW."operation_id" IS NOT OLD."operation_id"
+  OR NEW."fleet_id" IS NOT OLD."fleet_id"
+  OR NEW."partition_digest" IS NOT OLD."partition_digest"
+  OR NEW."source_shard_id" IS NOT OLD."source_shard_id"
+  OR NEW."destination_shard_id" IS NOT OLD."destination_shard_id"
+  OR NEW."source_route_epoch" IS NOT OLD."source_route_epoch"
+  OR NEW."target_route_epoch" IS NOT OLD."target_route_epoch"
+  OR NEW."required_tables_json" IS NOT OLD."required_tables_json"
+  OR NEW."created_at_ms" IS NOT OLD."created_at_ms"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IMMUTABLE_MOVEMENT_PLAN'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_movement_delete"
+BEFORE DELETE ON "nozzle_movement_operations"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_MOVEMENT_PERSISTENT'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_lease_update"
 BEFORE UPDATE ON "nozzle_leases"
 BEGIN

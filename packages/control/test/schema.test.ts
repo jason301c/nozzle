@@ -52,6 +52,7 @@ describe("control D1 schema", () => {
           "nozzle_control_meta",
           "nozzle_control_sequence",
           "nozzle_migration_operations",
+          "nozzle_movement_operations",
           ...CONTROL_TABLE_NAMES,
         ].sort(),
       )
