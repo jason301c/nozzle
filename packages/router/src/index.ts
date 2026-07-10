@@ -1,4 +1,5 @@
 export * from "./fanout.js"
+export * from "./fanout-executor.js"
 export * from "./fanout-token.js"
 export * from "./leaf.js"
 export * from "./session.js"

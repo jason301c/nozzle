@@ -2,6 +2,8 @@ import { NozzleError } from "@nozzle/core"
 
 export type FanoutOrderValue = null | number | string
 
+export const MAX_FANOUT_PAGE_ROWS = 1_000_000
+
 export interface FanoutOrderColumn {
   readonly direction: "asc" | "desc"
   readonly immutable: true
@@ -129,7 +131,7 @@ interface HeapItem<T> {
 
 const MAX_ORDER_COLUMNS = 16
 const MAX_SHARDS = 10_000
-const MAX_ROWS = 1_000_000
+const MAX_ROWS = MAX_FANOUT_PAGE_ROWS
 const MAX_BYTES = 128 * 1024 * 1024
 const MAX_PAGES = 10_000
 const MAX_CPU_MS = 60_000
@@ -595,7 +597,7 @@ function validateUsage(usage: FanoutShardUsage): void {
   }
   integer(usage.costMicros, "Fan-out shard cost", 0, MAX_COST_MICROS)
   integer(usage.cpuMs, "Fan-out shard CPU", 0, MAX_CPU_MS)
-  integer(usage.subrequests, "Fan-out shard subrequests", 1, MAX_SUBREQUESTS)
+  integer(usage.subrequests, "Fan-out shard subrequests", 0, MAX_SUBREQUESTS)
 }
 
 function validatePages<T>(

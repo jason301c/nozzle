@@ -10,6 +10,7 @@ import {
 import { blob, integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { beforeEach, describe, expect, it } from "vitest"
 import { createFanoutContinuation, mergeFanoutPage } from "../src/fanout.js"
+import { executeFanoutPage } from "../src/fanout-executor.js"
 import { createFanoutToken, decodeFanoutToken } from "../src/fanout-token.js"
 import { RouterLeaf } from "../src/leaf.js"
 import { createSessionToken, resolveRouteAwareSession } from "../src/session.js"
@@ -170,6 +171,53 @@ describe("real workerd router-to-D1 transport", () => {
         token,
       }),
     ).resolves.toEqual(state)
+  })
+
+  it("executes a budgeted fan-out with native workerd timers and abort signals", async () => {
+    const nowMs = Date.now()
+    const checksums = {
+      manifestChecksum: "11".repeat(32),
+      queryChecksum: "22".repeat(32),
+      schemaChecksum: "33".repeat(32),
+    }
+    const state = createFanoutContinuation({
+      budget: {
+        maxBufferedBytes: 10,
+        maxBufferedRows: 10,
+        maxBytes: 10,
+        maxConcurrency: 1,
+        maxCostMicros: 10,
+        maxCpuMs: 10,
+        maxPages: 2,
+        maxRows: 10,
+        maxShards: 1,
+        maxSubrequests: 10,
+        timeoutMs: 100,
+      },
+      deadlineAtMs: nowMs + 10_000,
+      expiresAtMs: nowMs + 9_000,
+      ...checksums,
+      nowMs,
+      order: [{ direction: "asc", immutable: true, kind: "number", nulls: "last" }],
+      partialPolicy: "fail",
+      shardIds: ["a"],
+    })
+    const result = await executeFanoutPage({
+      current: { ...checksums, shardIds: state.shardIds },
+      estimateUsage: () => ({ costMicros: 1, cpuMs: 1, subrequests: 1 }),
+      fetchShard: async ({ signal }) => {
+        expect(signal).toBeInstanceOf(AbortSignal)
+        return {
+          exhausted: true,
+          rows: [{ byteSize: 1, orderValues: [1], primaryKey: "a", value: "a" }],
+          usage: { costMicros: 1, cpuMs: 1, subrequests: 1 },
+        }
+      },
+      pageSize: 1,
+      state,
+    })
+    expect(result.rows[0]?.value).toBe("a")
+    expect(result.complete).toBe(true)
   })
 
   it("preserves Drizzle result types through the explicit wire codec", async () => {
