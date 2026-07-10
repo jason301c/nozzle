@@ -76,6 +76,46 @@ export type D1ResourceLifecycleAction =
   | { readonly kind: "retire" }
 
 const D1_UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u
+const RESOURCE_RECORD_KEYS = new Set([
+  "binding",
+  "creationOperationId",
+  "databaseName",
+  "desiredJurisdiction",
+  "environmentId",
+  "fleetId",
+  "generationId",
+  "intentChecksum",
+  "lastEvidenceChecksum",
+  "lastObservation",
+  "lifecycle",
+  "resourceId",
+  "shardId",
+  "stateVersion",
+  "targetChecksum",
+])
+const RESOURCE_BINDING_KEYS = new Set([
+  "attributionEvidenceChecksum",
+  "databaseId",
+  "databaseName",
+  "jurisdiction",
+  "providerResultChecksum",
+])
+const PRESENT_OBSERVATION_KEYS = new Set([
+  "databaseId",
+  "databaseName",
+  "evidenceChecksum",
+  "jurisdiction",
+  "observationOperationId",
+  "observedAtStateVersion",
+  "presence",
+])
+const ABSENT_OBSERVATION_KEYS = new Set([
+  "databaseId",
+  "evidenceChecksum",
+  "observationOperationId",
+  "observedAtStateVersion",
+  "presence",
+])
 
 function configuration(message: string): never {
   throw new NozzleError("ConfigurationError", message)
@@ -87,6 +127,18 @@ function intervention(message: string): never {
 
 function resume(message: string): never {
   throw new NozzleError("OperationResumeRequiredError", message)
+}
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function persisted(condition: boolean, message: string): asserts condition {
+  if (!condition) intervention(message)
+}
+
+function exactKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+  return Object.keys(value).every((key) => allowed.has(key))
 }
 
 function text(value: unknown, label: string): asserts value is string {
@@ -204,6 +256,12 @@ function validateRecord(record: D1ResourceRecord): void {
     intervention("An unmaterialized D1 resource cannot retain provider state.")
   }
   if (
+    record.lifecycle === "planned" &&
+    (record.stateVersion !== 0 || record.lastEvidenceChecksum !== record.intentChecksum)
+  ) {
+    intervention("A planned D1 resource does not match its original materialization intent.")
+  }
+  if (
     record.lastObservation?.presence === "absent" &&
     record.lifecycle !== "retired" &&
     record.lifecycle !== "deleted"
@@ -267,6 +325,86 @@ export function createD1ResourceRecord(input: D1ResourceIdentity): D1ResourceRec
     lifecycle: "planned",
     stateVersion: 0,
   })
+}
+
+export function loadD1ResourceRecord(candidate: unknown): D1ResourceRecord {
+  persisted(plainRecord(candidate), "The persisted D1 resource record is malformed.")
+  persisted(
+    exactKeys(candidate, RESOURCE_RECORD_KEYS),
+    "The persisted D1 resource record contains unknown fields.",
+  )
+  let binding: D1ResourceBinding | undefined
+  if (candidate.binding !== undefined) {
+    persisted(plainRecord(candidate.binding), "The persisted D1 resource binding is malformed.")
+    persisted(
+      exactKeys(candidate.binding, RESOURCE_BINDING_KEYS),
+      "The persisted D1 resource binding contains unknown fields.",
+    )
+    binding = Object.freeze({
+      attributionEvidenceChecksum: candidate.binding.attributionEvidenceChecksum as string,
+      databaseId: candidate.binding.databaseId as string,
+      databaseName: candidate.binding.databaseName as string,
+      jurisdiction: candidate.binding.jurisdiction as D1ResourceJurisdiction,
+      providerResultChecksum: candidate.binding.providerResultChecksum as string,
+    })
+  }
+  let lastObservation: D1ResourceObservation | undefined
+  if (candidate.lastObservation !== undefined) {
+    persisted(
+      plainRecord(candidate.lastObservation),
+      "The persisted D1 resource observation is malformed.",
+    )
+    if (candidate.lastObservation.presence === "present") {
+      persisted(
+        exactKeys(candidate.lastObservation, PRESENT_OBSERVATION_KEYS),
+        "The persisted present D1 resource observation contains unknown fields.",
+      )
+      lastObservation = Object.freeze({
+        databaseId: candidate.lastObservation.databaseId as string,
+        databaseName: candidate.lastObservation.databaseName as string,
+        evidenceChecksum: candidate.lastObservation.evidenceChecksum as string,
+        jurisdiction: candidate.lastObservation.jurisdiction as D1ResourceJurisdiction,
+        observationOperationId: candidate.lastObservation.observationOperationId as string,
+        observedAtStateVersion: candidate.lastObservation.observedAtStateVersion as number,
+        presence: "present",
+      })
+    } else {
+      persisted(
+        exactKeys(candidate.lastObservation, ABSENT_OBSERVATION_KEYS),
+        "The persisted absent D1 resource observation contains unknown fields.",
+      )
+      lastObservation = Object.freeze({
+        databaseId: candidate.lastObservation.databaseId as string,
+        evidenceChecksum: candidate.lastObservation.evidenceChecksum as string,
+        observationOperationId: candidate.lastObservation.observationOperationId as string,
+        observedAtStateVersion: candidate.lastObservation.observedAtStateVersion as number,
+        presence: candidate.lastObservation.presence as "absent",
+      })
+    }
+  }
+  const record: D1ResourceRecord = Object.freeze({
+    ...(binding === undefined ? {} : { binding }),
+    creationOperationId: candidate.creationOperationId as string,
+    databaseName: candidate.databaseName as string,
+    desiredJurisdiction: candidate.desiredJurisdiction as D1ResourceJurisdiction,
+    environmentId: candidate.environmentId as string,
+    fleetId: candidate.fleetId as string,
+    generationId: candidate.generationId as string,
+    intentChecksum: candidate.intentChecksum as string,
+    lastEvidenceChecksum: candidate.lastEvidenceChecksum as string,
+    ...(lastObservation === undefined ? {} : { lastObservation }),
+    lifecycle: candidate.lifecycle as D1ResourceLifecycle,
+    resourceId: candidate.resourceId as string,
+    shardId: candidate.shardId as string,
+    stateVersion: candidate.stateVersion as number,
+    targetChecksum: candidate.targetChecksum as string,
+  })
+  try {
+    validateRecord(record)
+  } catch {
+    return intervention("Persisted D1 resource state is invalid.")
+  }
+  return record
 }
 
 export function registerD1Resource(

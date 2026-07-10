@@ -5,6 +5,7 @@ import {
   type D1ResourceLifecycleAction,
   type D1ResourceObservation,
   type D1ResourceRecord,
+  loadD1ResourceRecord,
   observeD1Resource,
   registerD1Resource,
   transitionD1Resource,
@@ -359,13 +360,21 @@ describe("D1 resource lifecycle", () => {
     ]) {
       expect(() => advance(corrupt as never, { kind: "mark_ready" })).toThrow()
     }
+    for (const corrupt of [
+      { ...createD1ResourceRecord(identity()), stateVersion: 1 },
+      { ...createD1ResourceRecord(identity()), lastEvidenceChecksum: "other" },
+    ]) {
+      expect(() => advance(corrupt as D1ResourceRecord, { kind: "quarantine" })).toThrow(
+        /original materialization intent/u,
+      )
+    }
     expect(() =>
       advance(
         {
-          ...createD1ResourceRecord(identity()),
+          ...advance(registered(), { kind: "quarantine" }),
           stateVersion: Number.MAX_SAFE_INTEGER,
         } as D1ResourceRecord,
-        { kind: "quarantine" },
+        { kind: "recover_registered" },
       ),
     ).toThrow(/version overflowed/u)
     expect(() =>
@@ -400,5 +409,41 @@ describe("D1 resource lifecycle", () => {
         { kind: "mark_ready" },
       ),
     ).toThrow(/invalid resource lifecycle/u)
+  })
+
+  it("loads only exact persisted resource shapes and freezes nested provider evidence", () => {
+    const planned = createD1ResourceRecord(identity())
+    expect(loadD1ResourceRecord(JSON.parse(JSON.stringify(planned)))).toEqual(planned)
+    const present = ready()
+    const loaded = loadD1ResourceRecord(JSON.parse(JSON.stringify(present)))
+    expect(loaded).toEqual(present)
+    expect(Object.isFrozen(loaded)).toBe(true)
+    expect(Object.isFrozen(loaded.binding)).toBe(true)
+    expect(Object.isFrozen(loaded.lastObservation)).toBe(true)
+
+    for (const malformed of [
+      null,
+      [],
+      { ...present, future: true },
+      { ...present, binding: null },
+      { ...present, binding: { ...present.binding, future: true } },
+      { ...present, lastObservation: null },
+      { ...present, lastObservation: { ...present.lastObservation, future: true } },
+      { ...present, lastObservation: { presence: "absent", future: true } },
+      { ...present, lastObservation: { ...present.lastObservation, presence: "future" } },
+      { ...present, resourceId: "" },
+    ]) {
+      expect(() => loadD1ResourceRecord(malformed)).toThrow(/persisted|Persisted/u)
+    }
+
+    const retired = advance(advance(ready(), { kind: "quarantine" }), { kind: "retire" })
+    const absent = observeD1Resource(retired, {
+      databaseId,
+      evidenceChecksum: "loader-absence",
+      expectedStateVersion: retired.stateVersion,
+      observationOperationId: "loader-observation",
+      presence: "absent",
+    })
+    expect(loadD1ResourceRecord(JSON.parse(JSON.stringify(absent)))).toEqual(absent)
   })
 })
