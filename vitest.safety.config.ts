@@ -7,6 +7,7 @@ export default defineConfig({
       include: [
         "packages/cloudflare/src/drizzle-shard-guards.ts",
         "packages/cloudflare/src/shard-guards.ts",
+        "packages/control/src/lease-store.ts",
         "packages/core/src/hash.ts",
         "packages/core/src/migration.ts",
         "packages/core/src/operation.ts",
@@ -29,6 +30,7 @@ export default defineConfig({
     },
     include: [
       "packages/cloudflare/test/**/*.test.ts",
+      "packages/control/test/**/*.test.ts",
       "packages/core/test/**/*.test.ts",
       "packages/drizzle/test/**/*.test.ts",
       "packages/router/test/**/*.test.ts",

@@ -351,6 +351,8 @@ The control database MUST include versioned equivalents of:
 
 Operations MUST be reconstructible from step-level records. Configuration and topology versions MUST be immutable after publication.
 
+Control schema version 1 persists lease rows instead of deleting them, so fencing tokens can never reset. Lease acquisition, renewal, release, and authorization use D1 server time, the shared pure lease reference model, and exact optimistic compare-and-swap predicates. A takeover advances the token by exactly one and is permitted only after release or authoritative expiry; shard-local triggers independently reject token rollback, token jumps, unfenced identity changes, active-lease takeover, and deletion. Compare-and-swap retries are bounded at 16 before the operation enters an actionable intervention state.
+
 ### 8.9 Shard-local schema
 
 Every physical shard MUST contain versioned equivalents of:

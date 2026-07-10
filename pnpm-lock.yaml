@@ -58,6 +58,12 @@ importers:
         specifier: 'catalog:'
         version: 0.45.2(@cloudflare/workers-types@5.20260710.1)
 
+  packages/control:
+    dependencies:
+      '@nozzle/core':
+        specifier: workspace:*
+        version: link:../core
+
   packages/core: {}
 
   packages/drizzle:
