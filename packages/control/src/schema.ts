@@ -15,6 +15,8 @@ export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_operation_transitions",
   "nozzle_operations",
   "nozzle_placement_constraints",
+  "nozzle_provider_attempt_outcomes",
+  "nozzle_provider_attempts",
   "nozzle_route_overrides",
   "nozzle_route_versions",
   "nozzle_schema_artifacts",
@@ -249,6 +251,36 @@ ON CONFLICT ("singleton") DO NOTHING;`,
   "created_at_ms" INTEGER NOT NULL CHECK ("created_at_ms" >= 0),
   PRIMARY KEY ("environment_id", "scope", "idempotency_key")
 );`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_provider_attempts" (
+  "attempt_id" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("attempt_id")) > 0),
+  "operation_id" TEXT NOT NULL,
+  "step_id" TEXT NOT NULL,
+  "target_checksum" TEXT NOT NULL CHECK (length(trim("target_checksum")) > 0),
+  "actor_checksum" TEXT NOT NULL CHECK (length(trim("actor_checksum")) > 0),
+  "endpoint" TEXT NOT NULL CHECK (length(trim("endpoint")) > 0),
+  "mutating" INTEGER NOT NULL CHECK ("mutating" IN (0, 1)),
+  "request_checksum" TEXT NOT NULL CHECK (length(trim("request_checksum")) > 0),
+  "acceptance_checksum" TEXT NOT NULL CHECK (length(trim("acceptance_checksum")) > 0),
+  "lease_key" TEXT NOT NULL,
+  "holder_id" TEXT NOT NULL,
+  "acquisition_id" TEXT NOT NULL,
+  "fencing_token" INTEGER NOT NULL CHECK ("fencing_token" >= 1),
+  "accepted_at_ms" INTEGER NOT NULL CHECK ("accepted_at_ms" >= 0),
+  FOREIGN KEY ("operation_id", "step_id")
+    REFERENCES "nozzle_operation_steps" ("operation_id", "step_id")
+);`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_provider_attempt_outcomes" (
+  "attempt_id" TEXT PRIMARY KEY NOT NULL REFERENCES "nozzle_provider_attempts" ("attempt_id"),
+  "state" TEXT NOT NULL CHECK ("state" IN ('confirmed', 'rejected', 'unknown')),
+  "evidence_json" TEXT NOT NULL CHECK (json_valid("evidence_json")),
+  "result_json" TEXT CHECK ("result_json" IS NULL OR json_valid("result_json")),
+  "error_json" TEXT CHECK ("error_json" IS NULL OR json_valid("error_json")),
+  "outcome_checksum" TEXT NOT NULL CHECK (length(trim("outcome_checksum")) > 0),
+  "completed_at_ms" INTEGER NOT NULL CHECK ("completed_at_ms" >= 0),
+  CHECK (("state" = 'confirmed') = ("result_json" IS NOT NULL)),
+  CHECK (("state" IN ('rejected', 'unknown')) = ("error_json" IS NOT NULL)),
+  CHECK ("result_json" IS NULL OR "error_json" IS NULL)
+);`,
   `CREATE TABLE IF NOT EXISTS "nozzle_capacity_samples" (
   "fleet_id" TEXT NOT NULL,
   "shard_id" TEXT NOT NULL,
@@ -396,6 +428,48 @@ BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IDEMPOTENCY_IMMUTABLE'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_idempotency_delete"
 BEFORE DELETE ON "nozzle_idempotency_keys"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IDEMPOTENCY_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_provider_attempt_insert"
+BEFORE INSERT ON "nozzle_provider_attempts"
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_operation_steps" AS "step"
+  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = NEW."lease_key"
+  WHERE "step"."operation_id" = NEW."operation_id" AND "step"."step_id" = NEW."step_id"
+    AND "step"."lease_key" = NEW."lease_key"
+    AND "step"."state" = 'running'
+    AND json_extract("step"."record_json", '$.activeAttemptId') = NEW."attempt_id"
+    AND "step"."fencing_token" = NEW."fencing_token"
+    AND "lease"."holder_id" = NEW."holder_id"
+    AND "lease"."acquisition_id" = NEW."acquisition_id"
+    AND "lease"."fencing_token" = NEW."fencing_token"
+    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_PROVIDER_ATTEMPT_FENCED'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_provider_attempt_update"
+BEFORE UPDATE ON "nozzle_provider_attempts"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_PROVIDER_ATTEMPT_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_provider_attempt_delete"
+BEFORE DELETE ON "nozzle_provider_attempts"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_PROVIDER_ATTEMPT_PERSISTENT'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_provider_outcome_insert"
+BEFORE INSERT ON "nozzle_provider_attempt_outcomes"
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_provider_attempts" AS "attempt"
+  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = "attempt"."lease_key"
+  WHERE "attempt"."attempt_id" = NEW."attempt_id"
+    AND "lease"."holder_id" = "attempt"."holder_id"
+    AND "lease"."acquisition_id" = "attempt"."acquisition_id"
+    AND "lease"."fencing_token" = "attempt"."fencing_token"
+    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_PROVIDER_OUTCOME_FENCED'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_provider_outcome_update"
+BEFORE UPDATE ON "nozzle_provider_attempt_outcomes"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_PROVIDER_OUTCOME_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_provider_outcome_delete"
+BEFORE DELETE ON "nozzle_provider_attempt_outcomes"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_PROVIDER_OUTCOME_PERSISTENT'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_migration_operation_update"
 BEFORE UPDATE ON "nozzle_migration_operations"
 WHEN NEW."operation_id" IS NOT OLD."operation_id"
