@@ -9,6 +9,7 @@ import {
 } from "@nozzle/drizzle"
 import { blob, integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { beforeEach, describe, expect, it } from "vitest"
+import { createFanoutContinuation, mergeFanoutPage } from "../src/fanout.js"
 import { RouterLeaf } from "../src/leaf.js"
 import { createSessionToken, resolveRouteAwareSession } from "../src/session.js"
 import { createRouterTransport } from "../src/transport.js"
@@ -104,6 +105,61 @@ async function reset(): Promise<void> {
 beforeEach(reset)
 
 describe("real workerd router-to-D1 transport", () => {
+  it("runs the bounded fan-out heap and continuation model in workerd", () => {
+    const checksums = {
+      manifestChecksum: "11".repeat(32),
+      queryChecksum: "22".repeat(32),
+      schemaChecksum: "33".repeat(32),
+    }
+    const state = createFanoutContinuation({
+      budget: {
+        maxBufferedBytes: 100,
+        maxBufferedRows: 10,
+        maxBytes: 100,
+        maxConcurrency: 2,
+        maxCostMicros: 100,
+        maxCpuMs: 100,
+        maxPages: 2,
+        maxRows: 10,
+        maxShards: 2,
+        maxSubrequests: 10,
+        timeoutMs: 100,
+      },
+      deadlineAtMs: 10_000,
+      expiresAtMs: 9_000,
+      ...checksums,
+      nowMs: 1_000,
+      order: [{ direction: "asc", immutable: true, kind: "number", nulls: "last" }],
+      partialPolicy: "fail",
+      shardIds: ["a", "b"],
+    })
+    const result = mergeFanoutPage({
+      current: { ...checksums, shardIds: state.shardIds },
+      nowMs: 2_000,
+      pageSize: 2,
+      pages: [
+        {
+          exhausted: true,
+          kind: "success",
+          rows: [{ byteSize: 1, orderValues: [2], primaryKey: "a", value: "second" }],
+          shardId: "a",
+          usage: { costMicros: 1, cpuMs: 1, subrequests: 1 },
+        },
+        {
+          exhausted: true,
+          kind: "success",
+          rows: [{ byteSize: 1, orderValues: [1], primaryKey: "b", value: "first" }],
+          shardId: "b",
+          usage: { costMicros: 1, cpuMs: 1, subrequests: 1 },
+        },
+      ],
+      state,
+    })
+
+    expect(result.rows.map((row) => row.value)).toEqual(["first", "second"])
+    expect(result.complete).toBe(true)
+  })
+
   it("preserves Drizzle result types through the explicit wire codec", async () => {
     const db = routerDatabase()
     const createdAt = new Date("2026-01-02T03:04:05.678Z")
