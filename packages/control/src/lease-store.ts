@@ -21,6 +21,11 @@ interface LeaseSnapshot {
   readonly serverTimeMs: number
 }
 
+export interface AuthorizedLeaseSnapshot {
+  readonly record: FencedLeaseRecord
+  readonly serverTimeMs: number
+}
+
 interface LeaseSnapshotRow {
   readonly acquisition_id: string | null
   readonly expires_at_ms: number | null
@@ -214,9 +219,13 @@ export class D1LeaseStore {
   }
 
   async authorize(proof: LeaseProof): Promise<FencedLeaseRecord> {
+    return (await this.authorizeAt(proof)).record
+  }
+
+  async authorizeAt(proof: LeaseProof): Promise<AuthorizedLeaseSnapshot> {
     const snapshot = await this.#snapshot(proof.leaseKey)
     assertLeaseAuthorized(snapshot.record, proof, snapshot.serverTimeMs)
-    return snapshot.record
+    return Object.freeze({ record: snapshot.record, serverTimeMs: snapshot.serverTimeMs })
   }
 
   async get(leaseKey: string): Promise<FencedLeaseRecord | undefined> {

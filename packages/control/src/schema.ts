@@ -12,6 +12,7 @@ export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_leases",
   "nozzle_migrations",
   "nozzle_operation_steps",
+  "nozzle_operation_transitions",
   "nozzle_operations",
   "nozzle_placement_constraints",
   "nozzle_route_overrides",
@@ -211,6 +212,21 @@ ON CONFLICT ("singleton") DO NOTHING;`,
   PRIMARY KEY ("operation_id", "step_id"),
   UNIQUE ("operation_id", "idempotency_key")
 );`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_operation_transitions" (
+  "transition_id" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("transition_id")) > 0),
+  "operation_id" TEXT NOT NULL,
+  "step_id" TEXT NOT NULL,
+  "from_record_json" TEXT NOT NULL CHECK (json_valid("from_record_json")),
+  "to_record_json" TEXT NOT NULL CHECK (json_valid("to_record_json")),
+  "from_operation_status" TEXT NOT NULL,
+  "to_operation_status" TEXT NOT NULL,
+  "audit_event_hash" TEXT NOT NULL CHECK (length(trim("audit_event_hash")) > 0),
+  "fencing_token" INTEGER NOT NULL CHECK ("fencing_token" >= 1),
+  "created_at_ms" INTEGER NOT NULL CHECK ("created_at_ms" >= 0),
+  FOREIGN KEY ("operation_id", "step_id")
+    REFERENCES "nozzle_operation_steps" ("operation_id", "step_id"),
+  UNIQUE ("operation_id", "step_id", "audit_event_hash")
+);`,
   `CREATE TABLE IF NOT EXISTS "nozzle_leases" (
   "lease_key" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("lease_key")) BETWEEN 1 AND 512),
   "holder_id" TEXT CHECK ("holder_id" IS NULL OR length(trim("holder_id")) BETWEEN 1 AND 512),
@@ -310,6 +326,12 @@ WHEN NEW."operation_id" IS NOT OLD."operation_id"
   OR NEW."plan_json" IS NOT OLD."plan_json"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IMMUTABLE_STEP_PLAN'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_step_delete" BEFORE DELETE ON "nozzle_operation_steps" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_STEP_PERSISTENT'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_operation_transition_update"
+BEFORE UPDATE ON "nozzle_operation_transitions"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_OPERATION_TRANSITION_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_operation_transition_delete"
+BEFORE DELETE ON "nozzle_operation_transitions"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_OPERATION_TRANSITION_IMMUTABLE'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_idempotency_insert"
 BEFORE INSERT ON "nozzle_idempotency_keys"
 WHEN NOT EXISTS (

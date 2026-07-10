@@ -138,6 +138,10 @@ describe("D1LeaseStore", () => {
     if (!first.acquired) throw new Error("fixture acquisition failed")
     const proof = leaseProof(first.record)
     await expect(store.authorize(proof)).resolves.toEqual(first.record)
+    await expect(store.authorizeAt(proof)).resolves.toMatchObject({
+      record: first.record,
+      serverTimeMs: expect.any(Number),
+    })
 
     await expect(
       store.acquire({

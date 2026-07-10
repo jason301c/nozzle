@@ -143,6 +143,16 @@ describe("control D1 schema", () => {
              'pending', NULL, 1)`,
         )
         .run()
+      database
+        .prepare(
+          `INSERT INTO "nozzle_operation_transitions"
+           ("transition_id", "operation_id", "step_id", "from_record_json", "to_record_json",
+            "from_operation_status", "to_operation_status", "audit_event_hash", "fencing_token",
+            "created_at_ms")
+           VALUES ('transition-a', 'operation-a', 'step-a', '{}', '{}', 'planned', 'running',
+             'transition-audit', 1, 1)`,
+        )
+        .run()
 
       expect(() =>
         database
@@ -176,6 +186,14 @@ describe("control D1 schema", () => {
           )
           .run(),
       ).toThrow("NOZZLE_CONTROL_STEP_PERSISTENT")
+      expect(() =>
+        database
+          .prepare(`UPDATE "nozzle_operation_transitions" SET "audit_event_hash" = 'rewritten'`)
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_OPERATION_TRANSITION_IMMUTABLE")
+      expect(() => database.prepare(`DELETE FROM "nozzle_operation_transitions"`).run()).toThrow(
+        "NOZZLE_CONTROL_OPERATION_TRANSITION_IMMUTABLE",
+      )
       expect(() =>
         database
           .prepare(`DELETE FROM "nozzle_operations" WHERE "operation_id" = 'operation-a'`)
