@@ -133,10 +133,41 @@ ON CONFLICT ("schema_version") DO NOTHING;`,
   "apply_state" TEXT NOT NULL CHECK ("apply_state" IN ('pending', 'running', 'applied', 'retryable_failed', 'blocked_failed', 'unknown')),
   "verification_state" TEXT NOT NULL CHECK ("verification_state" IN ('pending', 'verified', 'failed', 'unknown')),
   "attempts" INTEGER NOT NULL CHECK ("attempts" >= 0),
+  "ledger_checksum" TEXT,
+  "canonical_schema_checksum" TEXT,
   "error_checksum" TEXT,
+  "failure_fencing_token" INTEGER,
   "updated_at_ms" INTEGER NOT NULL CHECK ("updated_at_ms" >= 0),
+  CHECK ("failure_fencing_token" IS NULL OR "failure_fencing_token" >= 1),
   PRIMARY KEY ("operation_id", "shard_id")
 );`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_migration_operations" (
+  "operation_id" TEXT PRIMARY KEY NOT NULL,
+  "fleet_id" TEXT NOT NULL REFERENCES "nozzle_fleets" ("fleet_id"),
+  "artifact_checksum" TEXT NOT NULL,
+  "target_schema_checksum" TEXT NOT NULL,
+  "required_shards_json" TEXT NOT NULL CHECK (json_valid("required_shards_json")),
+  "halt_control_sequence" INTEGER,
+  "halt_fencing_token" INTEGER,
+  "halt_failed_shard_id" TEXT,
+  "resume_decision_checksum" TEXT,
+  "resume_fencing_token" INTEGER,
+  "state" TEXT NOT NULL CHECK ("state" IN ('running', 'mixed_blocked', 'succeeded')),
+  "created_at_ms" INTEGER NOT NULL CHECK ("created_at_ms" >= 0),
+  "updated_at_ms" INTEGER NOT NULL CHECK ("updated_at_ms" >= 0),
+  CHECK (("halt_control_sequence" IS NULL) = ("halt_fencing_token" IS NULL)),
+  CHECK (("halt_control_sequence" IS NULL) = ("halt_failed_shard_id" IS NULL)),
+  CHECK (("resume_decision_checksum" IS NULL) = ("resume_fencing_token" IS NULL)),
+  CHECK ("halt_control_sequence" IS NULL OR "halt_control_sequence" >= 1),
+  CHECK ("halt_fencing_token" IS NULL OR "halt_fencing_token" >= 1),
+  CHECK ("resume_fencing_token" IS NULL OR "resume_fencing_token" > "halt_fencing_token")
+);`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_control_sequence" (
+  "singleton" INTEGER PRIMARY KEY NOT NULL CHECK ("singleton" = 1),
+  "sequence" INTEGER NOT NULL CHECK ("sequence" >= 0)
+);`,
+  `INSERT INTO "nozzle_control_sequence" ("singleton", "sequence") VALUES (1, 0)
+ON CONFLICT ("singleton") DO NOTHING;`,
   `CREATE TABLE IF NOT EXISTS "nozzle_operations" (
   "operation_id" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("operation_id")) > 0),
   "operation_type" TEXT NOT NULL CHECK (length(trim("operation_type")) > 0),
@@ -248,6 +279,60 @@ WHEN NEW."operation_id" IS NOT OLD."operation_id"
   OR NEW."plan_json" IS NOT OLD."plan_json"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IMMUTABLE_STEP_PLAN'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_step_delete" BEFORE DELETE ON "nozzle_operation_steps" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_STEP_PERSISTENT'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_migration_operation_update"
+BEFORE UPDATE ON "nozzle_migration_operations"
+WHEN NEW."operation_id" IS NOT OLD."operation_id"
+  OR NEW."fleet_id" IS NOT OLD."fleet_id"
+  OR NEW."artifact_checksum" IS NOT OLD."artifact_checksum"
+  OR NEW."target_schema_checksum" IS NOT OLD."target_schema_checksum"
+  OR NEW."required_shards_json" IS NOT OLD."required_shards_json"
+  OR NEW."created_at_ms" IS NOT OLD."created_at_ms"
+  OR (OLD."halt_control_sequence" IS NOT NULL AND (
+    NEW."halt_control_sequence" IS NOT OLD."halt_control_sequence"
+    OR NEW."halt_fencing_token" IS NOT OLD."halt_fencing_token"
+    OR NEW."halt_failed_shard_id" IS NOT OLD."halt_failed_shard_id"
+  ))
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IMMUTABLE_MIGRATION_OPERATION'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_migration_operation_delete" BEFORE DELETE ON "nozzle_migration_operations" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_MIGRATION_PERSISTENT'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_migration_delete" BEFORE DELETE ON "nozzle_migrations" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_MIGRATION_PERSISTENT'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_migration_halt"
+AFTER UPDATE OF "apply_state" ON "nozzle_migrations"
+WHEN NEW."apply_state" IN ('retryable_failed', 'blocked_failed', 'unknown')
+  AND OLD."apply_state" NOT IN ('retryable_failed', 'blocked_failed', 'unknown')
+  AND EXISTS (SELECT 1 FROM "nozzle_migration_operations" WHERE "operation_id" = NEW."operation_id" AND "halt_control_sequence" IS NULL)
+BEGIN
+  UPDATE "nozzle_control_sequence" SET "sequence" = "sequence" + 1 WHERE "singleton" = 1;
+  UPDATE "nozzle_migration_operations"
+  SET "halt_control_sequence" = (SELECT "sequence" FROM "nozzle_control_sequence" WHERE "singleton" = 1),
+      "halt_fencing_token" = NEW."failure_fencing_token",
+      "halt_failed_shard_id" = NEW."shard_id",
+      "resume_decision_checksum" = NULL,
+      "resume_fencing_token" = NULL,
+      "state" = 'mixed_blocked',
+      "updated_at_ms" = NEW."updated_at_ms"
+  WHERE "operation_id" = NEW."operation_id" AND "halt_control_sequence" IS NULL;
+  UPDATE "nozzle_fleets"
+  SET "state" = 'mixed_blocked'
+  WHERE "fleet_id" = (SELECT "fleet_id" FROM "nozzle_migration_operations" WHERE "operation_id" = NEW."operation_id");
+END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_migration_rehalt"
+AFTER UPDATE OF "apply_state" ON "nozzle_migrations"
+WHEN NEW."apply_state" IN ('retryable_failed', 'blocked_failed', 'unknown')
+  AND EXISTS (SELECT 1 FROM "nozzle_migration_operations" WHERE "operation_id" = NEW."operation_id" AND "resume_decision_checksum" IS NOT NULL)
+BEGIN
+  UPDATE "nozzle_migration_operations"
+  SET "resume_decision_checksum" = NULL,
+      "resume_fencing_token" = NULL,
+      "state" = 'mixed_blocked',
+      "updated_at_ms" = NEW."updated_at_ms"
+  WHERE "operation_id" = NEW."operation_id";
+END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_migration_succeeded"
+AFTER UPDATE OF "state" ON "nozzle_migration_operations"
+WHEN NEW."state" = 'succeeded' AND OLD."state" <> 'succeeded'
+BEGIN
+  UPDATE "nozzle_fleets" SET "state" = 'active' WHERE "fleet_id" = NEW."fleet_id";
+END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_lease_update"
 BEFORE UPDATE ON "nozzle_leases"
 BEGIN

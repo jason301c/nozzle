@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   acceptMigrationShard,
+  authorizeMigrationResume,
   createMigrationOperation,
   migrationSucceeded,
   recordMigrationApplied,
@@ -88,6 +89,67 @@ describe("fleet migration oracle", () => {
     })
     expect(secondFailure.halt).toBe(failed.halt)
     expect(secondFailure.shards["shard-b"]?.verification).toBe("unknown")
+  })
+
+  it("requires an explicit newer fenced decision before scheduling resumes", () => {
+    const failed = recordMigrationFailure(acceptMigrationShard(fresh(), "shard-a"), {
+      apply: "retryable_failed",
+      controlSequence: 10,
+      fencingToken: 4,
+      shardId: "shard-a",
+    })
+    expect(() =>
+      authorizeMigrationResume(failed, { decisionChecksum: "decision-a", fencingToken: 4 }),
+    ).toThrow("newer controller fencing token")
+    const resumed = authorizeMigrationResume(failed, {
+      decisionChecksum: "decision-a",
+      fencingToken: 5,
+    })
+    expect(resumed.resume).toEqual({ decisionChecksum: "decision-a", fencingToken: 5 })
+    expect(
+      authorizeMigrationResume(resumed, {
+        decisionChecksum: "decision-a",
+        fencingToken: 5,
+      }),
+    ).toBe(resumed)
+    expect(() =>
+      authorizeMigrationResume(resumed, {
+        decisionChecksum: "decision-b",
+        fencingToken: 5,
+      }),
+    ).toThrow("resume decision is immutable")
+    expect(acceptMigrationShard(resumed, "shard-b").shards["shard-b"]?.apply).toBe("running")
+
+    const failedAgain = recordMigrationFailure(acceptMigrationShard(resumed, "shard-a"), {
+      apply: "blocked_failed",
+      controlSequence: 11,
+      fencingToken: 5,
+      shardId: "shard-a",
+    })
+    expect(failedAgain.resume).toBeUndefined()
+    expect(() => acceptMigrationShard(failedAgain, "shard-b")).toThrow("No new shard work")
+  })
+
+  it("rejects premature or malformed resume authorization", () => {
+    expect(() =>
+      authorizeMigrationResume(fresh(), { decisionChecksum: "decision", fencingToken: 2 }),
+    ).toThrow("without a halt")
+    const running = acceptMigrationShard(fresh(), "shard-a")
+    const failedOther = recordMigrationFailure(running, {
+      apply: "retryable_failed",
+      controlSequence: 1,
+      fencingToken: 1,
+      shardId: "shard-b",
+    })
+    expect(() =>
+      authorizeMigrationResume(failedOther, { decisionChecksum: "decision", fencingToken: 2 }),
+    ).toThrow("must settle")
+    expect(() =>
+      authorizeMigrationResume(failedOther, { decisionChecksum: "", fencingToken: 2 }),
+    ).toThrow("Resume decision checksum")
+    expect(() =>
+      authorizeMigrationResume(failedOther, { decisionChecksum: "decision", fencingToken: 0 }),
+    ).toThrow("positive integer")
   })
 
   it("reconciles an unknown outcome through observed immutable evidence", () => {

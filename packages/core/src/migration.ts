@@ -23,11 +23,17 @@ export interface MigrationHaltEvent {
   readonly fencingToken: number
 }
 
+export interface MigrationResumeAuthorization {
+  readonly decisionChecksum: string
+  readonly fencingToken: number
+}
+
 export interface MigrationOperation {
   readonly artifactChecksum: string
   readonly halt?: MigrationHaltEvent
   readonly operationId: string
   readonly requiredShardIds: readonly string[]
+  readonly resume?: MigrationResumeAuthorization
   readonly shards: Readonly<Record<string, MigrationShardState>>
   readonly targetSchemaChecksum: string
 }
@@ -93,7 +99,7 @@ export function acceptMigrationShard(
   operation: MigrationOperation,
   shardId: string,
 ): MigrationOperation {
-  if (operation.halt) {
+  if (operation.halt && !operation.resume) {
     throw new NozzleError(
       "MigrationFailedError",
       "No new shard work may start after the halt event.",
@@ -105,6 +111,47 @@ export function acceptMigrationShard(
     }
     return { apply: "running", verification: "pending" }
   })
+}
+
+export function authorizeMigrationResume(
+  operation: MigrationOperation,
+  input: { readonly decisionChecksum: string; readonly fencingToken: number },
+): MigrationOperation {
+  nonEmpty(input.decisionChecksum, "Resume decision checksum")
+  if (!Number.isSafeInteger(input.fencingToken) || input.fencingToken < 1) {
+    throw new NozzleError("ConfigurationError", "Resume fencing token must be a positive integer.")
+  }
+  if (!operation.halt) {
+    throw new NozzleError(
+      "OperationResumeRequiredError",
+      "A migration without a halt cannot resume.",
+    )
+  }
+  if (input.fencingToken <= operation.halt.fencingToken) {
+    throw new NozzleError(
+      "OperationResumeRequiredError",
+      "Migration resume requires a newer controller fencing token.",
+    )
+  }
+  if (operation.resume) {
+    if (
+      operation.resume.decisionChecksum === input.decisionChecksum &&
+      operation.resume.fencingToken === input.fencingToken
+    ) {
+      return operation
+    }
+    throw new NozzleError(
+      "OperationResumeRequiredError",
+      "The active migration resume decision is immutable until another shard failure.",
+    )
+  }
+  if (Object.values(operation.shards).some((state) => state.apply === "running")) {
+    throw new NozzleError(
+      "OperationResumeRequiredError",
+      "Accepted migration work must settle before scheduling resumes.",
+    )
+  }
+  return Object.freeze({ ...operation, resume: Object.freeze({ ...input }) })
 }
 
 export function recordMigrationApplied(
@@ -159,6 +206,10 @@ export function recordMigrationFailure(
     apply: input.apply,
     verification: input.verification ?? (input.apply === "unknown" ? "unknown" : "failed"),
   }))
+  if (next.resume) {
+    const { resume: _resume, ...withoutResume } = next
+    next = Object.freeze(withoutResume)
+  }
   if (!next.halt) {
     next = Object.freeze({
       ...next,

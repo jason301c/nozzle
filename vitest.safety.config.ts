@@ -8,6 +8,7 @@ export default defineConfig({
         "packages/cloudflare/src/drizzle-shard-guards.ts",
         "packages/cloudflare/src/shard-guards.ts",
         "packages/control/src/lease-store.ts",
+        "packages/control/src/migration-store.ts",
         "packages/core/src/hash.ts",
         "packages/core/src/migration.ts",
         "packages/core/src/operation.ts",

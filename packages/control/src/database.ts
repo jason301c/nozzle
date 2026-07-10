@@ -5,8 +5,13 @@ export interface ControlRunResult {
   readonly success: boolean
 }
 
+export interface ControlQueryResult<T = Record<string, unknown>> extends ControlRunResult {
+  readonly results: readonly T[]
+}
+
 export interface ControlStatement {
   bind(...values: readonly ControlBindingValue[]): ControlStatement
+  all<T = Record<string, unknown>>(): Promise<ControlQueryResult<T>>
   first<T = Record<string, unknown>>(): Promise<T | null>
   run(): Promise<ControlRunResult>
 }

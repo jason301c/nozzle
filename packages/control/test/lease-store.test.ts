@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest"
 import type {
   ControlBindingValue,
   ControlDatabase,
+  ControlQueryResult,
   ControlRunResult,
   ControlStatement,
 } from "../src/database.js"
@@ -12,7 +13,7 @@ import { controlSchemaSql } from "../src/schema.js"
 
 class StatementAdapter implements ControlStatement {
   readonly #statement: StatementSync
-  #values: readonly SQLInputValue[] = []
+  #values: Record<string, SQLInputValue> = {}
 
   constructor(statement: StatementSync) {
     this.#statement = statement
@@ -21,20 +22,32 @@ class StatementAdapter implements ControlStatement {
   bind(...values: readonly ControlBindingValue[]): ControlStatement {
     this.#statement.setAllowBareNamedParameters(false)
     this.#statement.setReadBigInts(false)
-    this.#values = values.map((value) => {
-      if (typeof value === "boolean") return value ? 1 : 0
-      if (value instanceof ArrayBuffer) return new Uint8Array(value)
-      return value
-    })
+    this.#values = {}
+    for (let index = 0; index < values.length; index += 1) {
+      const value = values[index] as ControlBindingValue
+      if (typeof value === "boolean") {
+        this.#values[`?${index + 1}`] = value ? 1 : 0
+        continue
+      }
+      this.#values[`?${index + 1}`] = value instanceof ArrayBuffer ? new Uint8Array(value) : value
+    }
     return this
   }
 
   async first<T>(): Promise<T | null> {
-    return (this.#statement.get(...this.#values) as T | undefined) ?? null
+    return (this.#statement.get(this.#values) as T | undefined) ?? null
+  }
+
+  async all<T>(): Promise<ControlQueryResult<T>> {
+    return {
+      meta: {},
+      results: this.#statement.all(this.#values) as T[],
+      success: true,
+    }
   }
 
   async run(): Promise<ControlRunResult> {
-    const result = this.#statement.run(...this.#values)
+    const result = this.#statement.run(this.#values)
     return { meta: { changes: Number(result.changes) }, success: true }
   }
 }
@@ -51,7 +64,7 @@ class DatabaseAdapter implements ControlDatabase {
   }
 
   prepare(sql: string): ControlStatement {
-    return new StatementAdapter(this.database.prepare(sql.replace(/\?\d+/gu, "?")))
+    return new StatementAdapter(this.database.prepare(sql))
   }
 }
 
@@ -70,6 +83,10 @@ class ScriptedStatement implements ControlStatement {
 
   async first<T>(): Promise<T | null> {
     return this.#row as T | null
+  }
+
+  async all<T>(): Promise<ControlQueryResult<T>> {
+    return { meta: {}, results: [], success: true }
   }
 
   async run(): Promise<ControlRunResult> {
@@ -250,7 +267,7 @@ describe("D1LeaseStore", () => {
       holder_id: null,
       lease_key: null,
     })
-    for (const changes of [undefined, -1, 1.5]) {
+    for (const changes of [undefined, -1, 1.5, 2]) {
       await expect(
         new D1LeaseStore(new ScriptedDatabase(absent, changes)).acquire({
           acquisitionId: "acquisition-a",

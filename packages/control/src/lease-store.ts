@@ -36,7 +36,7 @@ function databaseError(message: string): never {
 
 function changed(result: ControlRunResult): boolean {
   const changes = result.meta.changes
-  if (!Number.isSafeInteger(changes) || (changes as number) < 0) {
+  if (!Number.isSafeInteger(changes) || (changes as number) < 0 || (changes as number) > 1) {
     return databaseError("Control D1 returned invalid mutation metadata.")
   }
   return changes === 1

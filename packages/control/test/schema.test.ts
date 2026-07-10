@@ -47,7 +47,14 @@ describe("control D1 schema", () => {
         )
         .all()
         .map((row) => (row as { name: string }).name)
-      expect(tables).toEqual(["nozzle_control_meta", ...CONTROL_TABLE_NAMES].sort())
+      expect(tables).toEqual(
+        [
+          "nozzle_control_meta",
+          "nozzle_control_sequence",
+          "nozzle_migration_operations",
+          ...CONTROL_TABLE_NAMES,
+        ].sort(),
+      )
       expect(database.prepare('SELECT "schema_version" FROM "nozzle_control_meta"').get()).toEqual({
         schema_version: 1,
       })
