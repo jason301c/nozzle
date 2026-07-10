@@ -137,6 +137,13 @@ export class SchemaRegistry<TSchema extends Record<string, unknown> = Record<str
           },
         )
       }
+      if (classification === "sharded" && primaryColumns.some((column) => !column.notNull)) {
+        throw new NozzleError(
+          "ConfigurationError",
+          "Every sharded primary-key column must be explicitly non-null.",
+          { details: { tableName } },
+        )
+      }
       const partitionColumn = columns.find((column) => column.propertyName === options.partitionKey)
       if (classification === "sharded" && !partitionColumn) {
         throw new NozzleError(

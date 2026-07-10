@@ -6,6 +6,8 @@ export default defineConfig({
       exclude: ["**/*.test.ts", "**/dist/**"],
       include: [
         "packages/cloudflare/src/drizzle-shard-guards.ts",
+        "packages/cloudflare/src/drizzle-movement-capture.ts",
+        "packages/cloudflare/src/movement-capture.ts",
         "packages/cloudflare/src/shard-guards.ts",
         "packages/control/src/lease-store.ts",
         "packages/control/src/migration-store.ts",

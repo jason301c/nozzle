@@ -144,6 +144,15 @@ describe("Drizzle schema registry", () => {
       () => new SchemaRegistry({ schema: { missingPrimary }, partitionKey: "workspaceId" }),
     ).toThrow("explicit primary key")
 
+    const nullablePrimary = sqliteTable(
+      "nullable_primary",
+      { id: text(), workspaceId: text("workspace_id").notNull() },
+      (table) => [primaryKey({ columns: [table.id] })],
+    )
+    expect(
+      () => new SchemaRegistry({ schema: { nullablePrimary }, partitionKey: "workspaceId" }),
+    ).toThrow("primary-key column must be explicitly non-null")
+
     const nozzleTable = sqliteTable("Nozzle_Application", {
       id: text().primaryKey(),
       workspaceId: text().notNull(),
