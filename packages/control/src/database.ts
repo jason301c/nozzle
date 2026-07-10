@@ -19,3 +19,7 @@ export interface ControlStatement {
 export interface ControlDatabase {
   prepare(sql: string): ControlStatement
 }
+
+export interface TransactionalControlDatabase extends ControlDatabase {
+  batch(statements: readonly ControlStatement[]): Promise<readonly ControlRunResult[]>
+}

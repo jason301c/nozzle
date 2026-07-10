@@ -258,7 +258,15 @@ ON CONFLICT ("singleton") DO NOTHING;`,
   "server_time_ms" INTEGER NOT NULL CHECK ("server_time_ms" >= 0),
   "operation_id" TEXT NOT NULL,
   "step_id" TEXT,
-  "event_json" TEXT NOT NULL CHECK (json_valid("event_json")),
+  "event_json" TEXT NOT NULL CHECK (json_valid("event_json"))
+    CHECK (json_extract("event_json", '$.schemaVersion') = 1)
+    CHECK (json_extract("event_json", '$.sequence') = "sequence")
+    CHECK (json_extract("event_json", '$.previousHash') IS "previous_hash")
+    CHECK (json_extract("event_json", '$.eventHash') = "event_hash")
+    CHECK (json_extract("event_json", '$.serverTimeMs') = "server_time_ms")
+    CHECK (json_extract("event_json", '$.environmentId') = "environment_id")
+    CHECK (json_extract("event_json", '$.operationId') = "operation_id")
+    CHECK (json_extract("event_json", '$.stepId') IS "step_id"),
   PRIMARY KEY ("environment_id", "sequence"),
   UNIQUE ("environment_id", "event_hash")
 );`,
@@ -383,6 +391,27 @@ BEGIN
   END;
 END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_lease_delete" BEFORE DELETE ON "nozzle_leases" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_LEASE_PERSISTENT'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_audit_append_guard"
+BEFORE INSERT ON "nozzle_audit_log"
+BEGIN
+  SELECT CASE
+    WHEN NEW."sequence" IS NOT COALESCE((
+      SELECT "sequence" + 1 FROM "nozzle_audit_log"
+      WHERE "environment_id" = NEW."environment_id"
+      ORDER BY "sequence" DESC LIMIT 1
+    ), 1) THEN RAISE(ABORT, 'NOZZLE_CONTROL_AUDIT_SEQUENCE')
+    WHEN NEW."previous_hash" IS NOT (
+      SELECT "event_hash" FROM "nozzle_audit_log"
+      WHERE "environment_id" = NEW."environment_id"
+      ORDER BY "sequence" DESC LIMIT 1
+    ) THEN RAISE(ABORT, 'NOZZLE_CONTROL_AUDIT_PREVIOUS_HASH')
+    WHEN NEW."server_time_ms" < COALESCE((
+      SELECT "server_time_ms" FROM "nozzle_audit_log"
+      WHERE "environment_id" = NEW."environment_id"
+      ORDER BY "sequence" DESC LIMIT 1
+    ), 0) THEN RAISE(ABORT, 'NOZZLE_CONTROL_AUDIT_TIME_ROLLBACK')
+  END;
+END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_audit_update" BEFORE UPDATE ON "nozzle_audit_log" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_AUDIT_APPEND_ONLY'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_audit_delete" BEFORE DELETE ON "nozzle_audit_log" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_AUDIT_APPEND_ONLY'); END;`,
 ])
