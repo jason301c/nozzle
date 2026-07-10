@@ -1,6 +1,6 @@
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
-import { OwnershipModel, assertWriteAuthorized, type OwnershipRecord } from "../src/ownership.js"
+import { assertWriteAuthorized, OwnershipModel, type OwnershipRecord } from "../src/ownership.js"
 
 function makeWritable(
   model: OwnershipModel,
@@ -206,6 +206,18 @@ describe("OwnershipModel", () => {
     makeWritable(model, 10, "z", 1)
     makeWritable(model, 2, "a", 1)
     expect(model.records().map((record) => record.bucketId)).toEqual([2, 10])
+
+    const sameBucket = new OwnershipModel(
+      ["aa", "b", "a"].map((shardId) => ({
+        bucketId: 3,
+        movementRole: "none" as const,
+        operationId: "sorting",
+        routeEpoch: 1,
+        shardId,
+        state: "read_only" as const,
+      })),
+    )
+    expect(sameBucket.records().map((record) => record.shardId)).toEqual(["a", "aa", "b"])
     expect(() =>
       model.transition({
         bucketId: 2,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { NozzleError, isNozzleError, redact, serializeError } from "../src/errors.js"
+import { isNozzleError, NozzleError, redact, serializeError } from "../src/errors.js"
 
 describe("NozzleError", () => {
   it("provides stable identity, defaults, and serialization", () => {

@@ -31,6 +31,12 @@ function identifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`
 }
 
+function compareCodeUnits(left: string, right: string): number {
+  if (left < right) return -1
+  if (left > right) return 1
+  return 0
+}
+
 class Parameters {
   readonly values: D1BindingValue[] = []
 
@@ -100,7 +106,7 @@ function compileData(plan: ExecutionPlan): CompiledStatement {
     }
     case "insert": {
       const entries = Object.entries(plan.values).sort(([left], [right]) =>
-        left.localeCompare(right),
+        compareCodeUnits(left, right),
       )
       const columns = entries.map(([column]) => identifier(column)).join(", ")
       const values = entries.map(([, value]) => parameters.bind(value)).join(", ")
@@ -109,7 +115,7 @@ function compileData(plan: ExecutionPlan): CompiledStatement {
     }
     case "update": {
       const assignments = Object.entries(plan.values)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => compareCodeUnits(left, right))
         .map(([column, value]) => `${identifier(column)} = ${parameters.bind(value)}`)
         .join(", ")
       sql = `UPDATE ${identifier(plan.table)} SET ${assignments} WHERE ${whereClause(plan, parameters)}`

@@ -1,4 +1,8 @@
 {
   "files": [],
-  "references": [{ "path": "./packages/core" }, { "path": "./packages/drizzle" }]
+  "references": [
+    { "path": "./packages/core" },
+    { "path": "./packages/drizzle" },
+    { "path": "./packages/cloudflare" }
+  ]
 }

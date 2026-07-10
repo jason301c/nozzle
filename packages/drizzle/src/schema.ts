@@ -37,6 +37,12 @@ function reservedIdentifier(identifier: string): boolean {
   return key.startsWith("__nozzle_") || key.startsWith("nozzle_")
 }
 
+function compareCodeUnits(left: string, right: string): number {
+  if (left < right) return -1
+  if (left > right) return 1
+  return 0
+}
+
 export class SchemaRegistry<TSchema extends Record<string, unknown> = Record<string, unknown>> {
   readonly #columns = new WeakMap<object, ColumnMetadata>()
   readonly #tables = new WeakMap<object, TableMetadata>()
@@ -177,6 +183,14 @@ export class SchemaRegistry<TSchema extends Record<string, unknown> = Record<str
       throw new NozzleError("UnsafeQueryRequiredError", "The plan uses an unregistered table name.")
     }
     return metadata
+  }
+
+  tables(): readonly TableMetadata[] {
+    return Object.freeze(
+      [...this.#tablesByName.values()].sort((left, right) =>
+        compareCodeUnits(left.tableName, right.tableName),
+      ),
+    )
   }
 
   column(column: AnyColumn): ColumnMetadata {

@@ -50,6 +50,15 @@ function recordKey(bucketId: number, shardId: string): string {
   return `${bucketId}:${shardId.length}:${shardId}`
 }
 
+function compareCodeUnits(left: string, right: string): number {
+  const length = Math.min(left.length, right.length)
+  for (let index = 0; index < length; index += 1) {
+    const difference = left.charCodeAt(index) - right.charCodeAt(index)
+    if (difference !== 0) return difference
+  }
+  return left.length - right.length
+}
+
 function assertIdentity(bucketId: number, shardId: string, operationId: string): void {
   if (!Number.isSafeInteger(bucketId) || bucketId < 0) {
     throw new NozzleError("ConfigurationError", "Bucket IDs must be non-negative safe integers.")
@@ -77,7 +86,8 @@ export class OwnershipModel {
 
   records(): readonly OwnershipRecord[] {
     return [...this.#records.values()].sort(
-      (left, right) => left.bucketId - right.bucketId || left.shardId.localeCompare(right.shardId),
+      (left, right) =>
+        left.bucketId - right.bucketId || compareCodeUnits(left.shardId, right.shardId),
     )
   }
 

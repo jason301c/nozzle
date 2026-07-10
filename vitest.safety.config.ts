@@ -5,6 +5,8 @@ export default defineConfig({
     coverage: {
       exclude: ["**/*.test.ts", "**/dist/**"],
       include: [
+        "packages/cloudflare/src/drizzle-shard-guards.ts",
+        "packages/cloudflare/src/shard-guards.ts",
         "packages/core/src/hash.ts",
         "packages/core/src/migration.ts",
         "packages/core/src/operation.ts",
@@ -20,7 +22,7 @@ export default defineConfig({
         statements: 100,
       },
     },
-    include: ["packages/core/test/**/*.test.ts"],
+    include: ["packages/cloudflare/test/**/*.test.ts", "packages/core/test/**/*.test.ts"],
     passWithNoTests: false,
     restoreMocks: true,
   },

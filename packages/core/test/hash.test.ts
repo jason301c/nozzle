@@ -8,8 +8,8 @@ import {
   encodeHashPreimage,
   generateFleetSeed,
   hashPartitionKey,
-  selectBucket,
   type PartitionKey,
+  selectBucket,
 } from "../src/hash.js"
 
 const seed = Uint8Array.from({ length: 32 }, (_, index) => index)

@@ -288,9 +288,11 @@ function normalizePlan(input: OperationPlanInput): Omit<OperationPlan, "planChec
   assertWellFormedString(input.capabilitySnapshotChecksum, "Capability snapshot checksum")
   if (input.steps.length === 0) configurationError("An operation requires at least one step.")
 
-  const steps = input.steps
-    .map(normalizeStep)
-    .sort((left, right) => left.stepId.localeCompare(right.stepId))
+  const steps = input.steps.map(normalizeStep).sort((left, right) => {
+    if (left.stepId < right.stepId) return -1
+    if (left.stepId > right.stepId) return 1
+    return 0
+  })
   const stepIds = new Set<string>()
   const idempotencyKeys = new Set<string>()
   for (const step of steps) {

@@ -6,16 +6,17 @@
   "type": "module",
   "scripts": {
     "build": "tsc -b",
-    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:safety && pnpm test:coverage",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:safety && pnpm test:coverage && pnpm test:workers",
     "cf:whoami": "wrangler whoami",
     "format": "biome format --write .",
     "format:check": "biome format .",
-    "lint": "biome lint .",
+    "lint": "biome check .",
     "test": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:run": "vitest run",
     "test:safety": "vitest run --config vitest.safety.config.ts --coverage",
-    "typecheck": "tsc -b && tsc -p tsconfig.test.json"
+    "test:workers": "vitest run --config vitest.workers.config.ts",
+    "typecheck": "tsc -b && tsc -p tsconfig.test.json && tsc -p tsconfig.workers-test.json"
   },
   "license": "UNLICENSED",
   "engines": {

@@ -280,12 +280,13 @@ Each local ownership record MUST include:
 - canonical persisted state `unassigned`, `preparing`, `copying`, `catching_up`, `read_only`, `writable`, `quarantined`, `retired`, or `intervention_required`;
 - movement role `none`, `source`, or `destination`, which describes the operation role without creating a second writable state vocabulary;
 - operation ID responsible for a transition;
+- controller fencing token that authorized the transition;
 - schema version;
 - last verified checkpoint.
 
-Generated write guards MUST reject a write before mutation when the local shard is not the writable owner. This is the final protection against stale application or router deployments.
+Local ownership metadata MUST reject bucket-ID mutation, route-epoch rollback, fencing-token rollback, operation-ID replacement without a higher token, illegal state transitions, deletion, and any transition from a non-writable state into `writable` without a strictly newer route epoch. Controller statements MUST additionally use compare-and-swap predicates over the prior operation ID and fencing token. Generated write guards MUST reject a write before mutation when the local shard is not the writable owner. This is the final protection against stale application or router deployments.
 
-Each shard also stores an active schema-identity row and persistent `nozzle_partition_fences` rows containing the full hash-versioned partition digest plus the canonical typed partition value. Every safe statement performs an atomic local ownership, schema-identity, and digest-fence guard. Generated insert, update, and delete triggers independently enforce ownership, schema compatibility, and the typed partition fence from `NEW` or `OLD` row values, so an older client that lacks the current statement guard still fails before mutation. A digest lookup is an optimization and collision-resistant identity check; it does not replace the trigger's type-preserving value comparison.
+Each shard also stores an active schema-identity row and persistent `nozzle_partition_fences` rows containing the full hash-versioned partition digest plus the canonical typed partition value. Every safe statement performs an atomic local ownership, schema-identity, and digest-fence guard. Generated insert, update, and delete triggers independently enforce ownership and the typed partition fence from `NEW` or `OLD` row values, so an older client that lacks the current statement guard still fails before mutation. Schema compatibility remains a statement, deployment-barrier, and migration-ledger check because a D1 trigger cannot identify the calling Worker version. A digest lookup is an optimization and collision-resistant identity check; it does not replace the trigger's type-preserving value comparison.
 
 No valid state may contain two writable owners for one bucket.
 

@@ -1,5 +1,5 @@
-import { DEFAULT_BUCKET_BITS, HIGH_SCALE_BUCKET_BITS, type BucketBits } from "./hash.js"
 import { NozzleError } from "./errors.js"
+import { type BucketBits, DEFAULT_BUCKET_BITS, HIGH_SCALE_BUCKET_BITS } from "./hash.js"
 
 export type PlacementMode = "auto" | "custom" | "dedicated" | "directory" | "hash" | "time"
 export type TopologyMode = "auto" | "direct" | "router"
