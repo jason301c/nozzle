@@ -37,6 +37,12 @@ export interface CompleteD1Inventory {
   readonly totalCount: number
 }
 
+export interface CompleteD1NameInventory extends CompleteD1Inventory {
+  readonly exactName: string
+}
+
+export type D1CreateAttemptState = "definitely_not_applied" | "not_attempted" | "unknown"
+
 export type ProviderAttemptDecision =
   | { readonly disposition: "success" }
   | { readonly disposition: "permanent_failure"; readonly status: number }
@@ -59,6 +65,7 @@ export interface RecordedD1Database extends DesiredD1Database {
 }
 
 export type D1ReconciliationAction =
+  | { readonly desired: DesiredD1Database; readonly kind: "await_create_visibility" }
   | { readonly kind: "create"; readonly desired: DesiredD1Database }
   | {
       readonly candidate: ObservedD1Database
@@ -436,11 +443,20 @@ function validateInventory(inventory: CompleteD1Inventory): void {
 }
 
 export function planD1Reconciliation(input: {
+  readonly createAttemptState?: D1CreateAttemptState
   readonly desired: DesiredD1Database
   readonly inventory: CompleteD1Inventory
   readonly recorded?: RecordedD1Database
 }): D1ReconciliationAction {
   validateDesired(input.desired)
+  const createAttemptState = input.createAttemptState ?? "not_attempted"
+  if (
+    createAttemptState !== "not_attempted" &&
+    createAttemptState !== "definitely_not_applied" &&
+    createAttemptState !== "unknown"
+  ) {
+    configuration("D1 create-attempt state is unsupported.")
+  }
   validateInventory(input.inventory)
   const byName = input.inventory.databases.filter(
     (database) => database.name === input.desired.name,
@@ -499,7 +515,13 @@ export function planD1Reconciliation(input: {
     }
     return Object.freeze({ kind: "none", observed: identified })
   }
-  if (!named) return Object.freeze({ desired: input.desired, kind: "create" })
+  if (!named) {
+    return Object.freeze(
+      createAttemptState === "unknown"
+        ? { desired: input.desired, kind: "await_create_visibility" }
+        : { desired: input.desired, kind: "create" },
+    )
+  }
   if (input.desired.jurisdiction !== named.jurisdiction) {
     return Object.freeze({
       kind: "quarantine_drift",
@@ -508,4 +530,27 @@ export function planD1Reconciliation(input: {
     })
   }
   return Object.freeze({ candidate: named, desired: input.desired, kind: "inspect_for_adoption" })
+}
+
+export function planD1Provisioning(input: {
+  readonly createAttemptState?: D1CreateAttemptState
+  readonly desired: DesiredD1Database
+  readonly inventory: CompleteD1NameInventory
+}): D1ReconciliationAction {
+  configurationString(input.inventory?.exactName, "Exact D1 inventory name")
+  if (input.inventory.exactName !== input.desired.name) {
+    configuration("Exact D1 inventory name does not match the desired resource.")
+  }
+  for (const database of input.inventory.databases) {
+    if (database.name !== input.inventory.exactName) {
+      return providerError("Exact D1 inventory contains an unrelated database name.")
+    }
+  }
+  return planD1Reconciliation({
+    ...(input.createAttemptState === undefined
+      ? {}
+      : { createAttemptState: input.createAttemptState }),
+    desired: input.desired,
+    inventory: input.inventory,
+  })
 }

@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest"
 import {
   type CompleteD1Inventory,
+  type CompleteD1NameInventory,
   classifyProviderAttempt,
   computeProviderRetryDelay,
   type D1ListPage,
   decodeD1ListPage,
   mergeD1ListPages,
   type ObservedD1Database,
+  planD1Provisioning,
   planD1Reconciliation,
 } from "../src/provider.js"
 
@@ -379,6 +381,85 @@ describe("D1 desired-recorded-observed reconciliation", () => {
       desired,
       kind: "create",
     })
+  })
+
+  it("never turns an ambiguous create into an automatic second create", () => {
+    const desired = { name: "nozzle-production-001" }
+    expect(
+      planD1Reconciliation({
+        createAttemptState: "unknown",
+        desired,
+        inventory: inventory([]),
+      }),
+    ).toEqual({ desired, kind: "await_create_visibility" })
+    expect(
+      planD1Reconciliation({
+        createAttemptState: "definitely_not_applied",
+        desired,
+        inventory: inventory([]),
+      }),
+    ).toEqual({ desired, kind: "create" })
+    const candidate = observed("late-create", desired.name)
+    expect(
+      planD1Reconciliation({
+        createAttemptState: "unknown",
+        desired,
+        inventory: inventory([candidate]),
+      }),
+    ).toEqual({ candidate, desired, kind: "inspect_for_adoption" })
+    expect(() =>
+      planD1Reconciliation({
+        createAttemptState: "future" as never,
+        desired,
+        inventory: inventory([]),
+      }),
+    ).toThrow(/create-attempt state is unsupported/u)
+  })
+
+  it("plans provisioning only from an exact name-scoped inventory", () => {
+    const desired = { name: "nozzle-production-001" }
+    const exactInventory: CompleteD1NameInventory = {
+      ...inventory([]),
+      exactName: desired.name,
+    }
+    expect(planD1Provisioning({ desired, inventory: exactInventory })).toEqual({
+      desired,
+      kind: "create",
+    })
+    expect(
+      planD1Provisioning({
+        createAttemptState: "unknown",
+        desired,
+        inventory: exactInventory,
+      }),
+    ).toEqual({ desired, kind: "await_create_visibility" })
+    const candidate = observed("exact", desired.name)
+    expect(
+      planD1Provisioning({
+        desired,
+        inventory: {
+          ...exactInventory,
+          databases: [candidate],
+          totalCount: 1,
+        },
+      }),
+    ).toEqual({ candidate, desired, kind: "inspect_for_adoption" })
+    expect(() =>
+      planD1Provisioning({ desired, inventory: { ...exactInventory, exactName: "other" } }),
+    ).toThrow(/does not match/u)
+    expect(() =>
+      planD1Provisioning({
+        desired,
+        inventory: {
+          ...exactInventory,
+          databases: [observed("other", "other")],
+          totalCount: 1,
+        },
+      }),
+    ).toThrow(/unrelated database name/u)
+    expect(() =>
+      planD1Provisioning({ desired, inventory: { ...exactInventory, exactName: "" } }),
+    ).toThrow(/must be non-empty/u)
   })
 
   it("requires inspection before adopting an unrecorded deterministic-name candidate", () => {

@@ -277,6 +277,57 @@ describe("Cloudflare D1 inventory transport", () => {
     })
     expect(calls).toBe(2)
   })
+
+  it("uses the documented name search but exact-filters locally and ignores global totals", async () => {
+    const calls: string[] = []
+    const provider = client((url) => {
+      calls.push(url)
+      return jsonResponse({
+        result: [
+          { ...database(1), name: "target-database" },
+          { ...database(2), name: "target-database-copy" },
+        ],
+        result_info: { count: 2, page: 1, per_page: 10, total_count: 50_000 },
+        success: true,
+      })
+    })
+    await expect(provider.listByName("target-database")).resolves.toMatchObject({
+      inventory: {
+        databases: [{ name: "target-database" }],
+        exactName: "target-database",
+        pageCount: 1,
+        totalCount: 1,
+      },
+      kind: "complete",
+    })
+    expect(new URL(calls[0] as string).searchParams.get("name")).toBe("target-database")
+    await expect(provider.listByName("")).rejects.toThrow(/must be non-empty/u)
+    expect(calls).toHaveLength(1)
+  })
+
+  it("preserves name-scoped pagination while discarding global total metadata", async () => {
+    const responses = [
+      jsonResponse({
+        result: Array.from({ length: 10 }, (_, index) => ({
+          ...database(index),
+          name: index === 0 ? "target-database" : `target-database-${index}`,
+        })),
+        result_info: { count: 10, page: 1, per_page: 10, total_count: 50_000 },
+        success: true,
+      }),
+      jsonResponse({
+        result: [{ ...database(10), name: "target-database" }],
+        result_info: { count: 1, page: 2, per_page: 10, total_count: 50_001 },
+        success: true,
+      }),
+    ]
+    const provider = client(() => responses.shift() as Response)
+    await expect(provider.listByName("target-database")).resolves.toMatchObject({
+      inventory: { pageCount: 2, totalCount: 2 },
+      kind: "complete",
+    })
+    expect(responses).toHaveLength(0)
+  })
 })
 
 describe("Cloudflare D1 exact observation", () => {
@@ -297,6 +348,17 @@ describe("Cloudflare D1 exact observation", () => {
   it("treats only an exact authenticated 404 as absence", async () => {
     const provider = client(() => jsonResponse({ errors: [], success: false }, 404))
     await expect(provider.getDatabase(databaseId)).resolves.toMatchObject({ kind: "absent" })
+
+    for (const response of [
+      new Response("not-a-cloudflare-envelope", { status: 404 }),
+      jsonResponse({ errors: {}, success: false }, 404),
+      jsonResponse({ errors: [], success: true }, 404),
+    ]) {
+      await expect(client(() => response).getDatabase(databaseId)).resolves.toMatchObject({
+        kind: "inconclusive",
+        reason: "malformed_response",
+      })
+    }
   })
 
   it("keeps transport, throttling, and rejection observations inconclusive", async () => {

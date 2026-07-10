@@ -1,6 +1,7 @@
 import { NozzleError } from "@nozzle/core"
 import {
   type CompleteD1Inventory,
+  type CompleteD1NameInventory,
   classifyProviderAttempt,
   type D1DatabaseUpdate,
   type D1ListPage,
@@ -45,24 +46,34 @@ export interface ProviderErrorSummary {
   readonly message: string
 }
 
+interface D1InventoryInconclusive {
+  readonly errors: readonly ProviderErrorSummary[]
+  readonly evidence: readonly ProviderAttemptEvidence[]
+  readonly kind: "inconclusive"
+  readonly reason:
+    | "inconsistent_inventory"
+    | "malformed_response"
+    | "page_limit"
+    | "provider_rejected"
+    | "retry_required"
+    | "transport_error"
+}
+
 export type D1InventoryResult =
   | {
       readonly evidence: readonly ProviderAttemptEvidence[]
       readonly inventory: CompleteD1Inventory
       readonly kind: "complete"
     }
+  | D1InventoryInconclusive
+
+export type D1NameInventoryResult =
   | {
-      readonly errors: readonly ProviderErrorSummary[]
       readonly evidence: readonly ProviderAttemptEvidence[]
-      readonly kind: "inconclusive"
-      readonly reason:
-        | "inconsistent_inventory"
-        | "malformed_response"
-        | "page_limit"
-        | "provider_rejected"
-        | "retry_required"
-        | "transport_error"
+      readonly inventory: CompleteD1NameInventory
+      readonly kind: "complete"
     }
+  | D1InventoryInconclusive
 
 export type ProviderResourceObservation<T> =
   | { readonly evidence: ProviderAttemptEvidence; readonly kind: "absent" }
@@ -111,6 +122,10 @@ export interface CloudflareD1ProviderClient {
     databaseId: string,
     options?: { readonly signal?: AbortSignal },
   ): Promise<ProviderResourceObservation<ObservedD1Database>>
+  listByName(
+    name: string,
+    options?: { readonly signal?: AbortSignal },
+  ): Promise<D1NameInventoryResult>
   listInventory(options?: { readonly signal?: AbortSignal }): Promise<D1InventoryResult>
   updateDatabase(
     databaseId: string,
@@ -532,13 +547,15 @@ export function createCloudflareD1ProviderClient(
     }
   }
 
-  async function listInventory(
-    callOptions: { readonly signal?: AbortSignal } = {},
-  ): Promise<D1InventoryResult> {
+  async function listPages(
+    callOptions: { readonly signal?: AbortSignal },
+    exactName: string | undefined,
+  ): Promise<D1InventoryResult | D1NameInventoryResult> {
     const evidence: ProviderAttemptEvidence[] = []
     const pages = []
     for (let page = 1; page <= maxInventoryPages; page += 1) {
       const url = new URL(accountPath)
+      if (exactName !== undefined) url.searchParams.set("name", exactName)
       url.searchParams.set("page", String(page))
       url.searchParams.set("per_page", String(perPage))
       const result = await attempt("d1.list", url.href, "GET", undefined, callOptions.signal)
@@ -571,12 +588,38 @@ export function createCloudflareD1ProviderClient(
           reason: "malformed_response",
         })
       }
-      pages.push(decoded)
+      pages.push(
+        exactName === undefined || decoded.reportedTotalCount === undefined
+          ? decoded
+          : Object.freeze({
+              databases: decoded.databases,
+              ...(decoded.nextPage === undefined ? {} : { nextPage: decoded.nextPage }),
+              page: decoded.page,
+              perPage: decoded.perPage,
+            }),
+      )
       if (decoded.nextPage === undefined) {
         try {
+          const inventory = mergeD1ListPages(pages)
+          if (exactName !== undefined) {
+            const databases = Object.freeze(
+              inventory.databases.filter((database) => database.name === exactName),
+            )
+            return Object.freeze({
+              evidence: Object.freeze(evidence),
+              inventory: Object.freeze({
+                complete: true,
+                databases,
+                exactName,
+                pageCount: inventory.pageCount,
+                totalCount: databases.length,
+              }),
+              kind: "complete",
+            })
+          }
           return Object.freeze({
             evidence: Object.freeze(evidence),
-            inventory: mergeD1ListPages(pages),
+            inventory,
             kind: "complete",
           })
         } catch {
@@ -597,6 +640,20 @@ export function createCloudflareD1ProviderClient(
     })
   }
 
+  async function listInventory(
+    callOptions: { readonly signal?: AbortSignal } = {},
+  ): Promise<D1InventoryResult> {
+    return (await listPages(callOptions, undefined)) as D1InventoryResult
+  }
+
+  async function listByName(
+    name: string,
+    callOptions: { readonly signal?: AbortSignal } = {},
+  ): Promise<D1NameInventoryResult> {
+    nonEmpty(name, "Cloudflare D1 database name")
+    return (await listPages(callOptions, name)) as D1NameInventoryResult
+  }
+
   async function getDatabase(
     databaseId: string,
     callOptions: { readonly signal?: AbortSignal } = {},
@@ -609,7 +666,20 @@ export function createCloudflareD1ProviderClient(
       callOptions.signal,
     )
     if (result.evidence.status === 404) {
-      return Object.freeze({ evidence: result.evidence, kind: "absent" })
+      if (
+        result.evidence.bodyState === "complete" &&
+        plainRecord(result.body) &&
+        result.body.success === false &&
+        Array.isArray(result.body.errors)
+      ) {
+        return Object.freeze({ evidence: result.evidence, kind: "absent" })
+      }
+      return Object.freeze({
+        errors: freezeErrors(result.body),
+        evidence: result.evidence,
+        kind: "inconclusive",
+        reason: "malformed_response",
+      })
     }
     const decision = classifyEvidence(result.evidence, false)
     if (decision.disposition !== "success") {
@@ -723,6 +793,7 @@ export function createCloudflareD1ProviderClient(
     createDatabase,
     deleteDatabase,
     getDatabase,
+    listByName,
     listInventory,
     updateDatabase,
   })
