@@ -736,7 +736,7 @@ export function referenceFanoutOrder<T>(input: {
   return Object.freeze(rows)
 }
 
-function validateCurrentIdentity(
+export function validateFanoutContinuationIdentity(
   state: FanoutContinuationState,
   current: FanoutCurrentIdentity,
 ): void {
@@ -773,7 +773,7 @@ export function mergeFanoutPage<T>(input: {
   readonly state: FanoutContinuationState
 }): FanoutPageResult<T> {
   const state = loadFanoutContinuation(input.state)
-  validateCurrentIdentity(state, input.current)
+  validateFanoutContinuationIdentity(state, input.current)
   integer(input.nowMs, "Fan-out current time", 0, Number.MAX_SAFE_INTEGER)
   if (input.nowMs >= state.deadlineAtMs) {
     throw new NozzleError("CapacityGuardError", "Fan-out operation deadline has elapsed.")

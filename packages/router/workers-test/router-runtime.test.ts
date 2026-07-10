@@ -10,6 +10,7 @@ import {
 import { blob, integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { beforeEach, describe, expect, it } from "vitest"
 import { createFanoutContinuation, mergeFanoutPage } from "../src/fanout.js"
+import { createFanoutToken, decodeFanoutToken } from "../src/fanout-token.js"
 import { RouterLeaf } from "../src/leaf.js"
 import { createSessionToken, resolveRouteAwareSession } from "../src/session.js"
 import { createRouterTransport } from "../src/transport.js"
@@ -105,7 +106,7 @@ async function reset(): Promise<void> {
 beforeEach(reset)
 
 describe("real workerd router-to-D1 transport", () => {
-  it("runs the bounded fan-out heap and continuation model in workerd", () => {
+  it("runs bounded fan-out merging and encrypted continuations in workerd", async () => {
     const checksums = {
       manifestChecksum: "11".repeat(32),
       queryChecksum: "22".repeat(32),
@@ -158,6 +159,17 @@ describe("real workerd router-to-D1 transport", () => {
 
     expect(result.rows.map((row) => row.value)).toEqual(["first", "second"])
     expect(result.complete).toBe(true)
+
+    const key = Uint8Array.from({ length: 32 }, (_, index) => index)
+    const token = await createFanoutToken({ key, nowMs: 2_000, state })
+    await expect(
+      decodeFanoutToken({
+        current: { ...checksums, shardIds: state.shardIds },
+        key,
+        nowMs: 2_000,
+        token,
+      }),
+    ).resolves.toEqual(state)
   })
 
   it("preserves Drizzle result types through the explicit wire codec", async () => {

@@ -31,6 +31,7 @@ export default defineConfig({
         "packages/drizzle/src/plan.ts",
         "packages/router/src/leaf.ts",
         "packages/router/src/fanout.ts",
+        "packages/router/src/fanout-token.ts",
         "packages/router/src/session.ts",
         "packages/router/src/transport.ts",
         "packages/router/src/wire.ts",
