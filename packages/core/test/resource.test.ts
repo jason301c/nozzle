@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest"
 import {
-  bindD1Resource,
   createD1ResourceRecord,
   type D1ResourceIdentity,
+  type D1ResourceLifecycleAction,
+  type D1ResourceObservation,
   type D1ResourceRecord,
+  observeD1Resource,
+  registerD1Resource,
   transitionD1Resource,
 } from "../src/resource.js"
 
@@ -25,32 +28,17 @@ function identity(overrides: Partial<D1ResourceIdentity> = {}): D1ResourceIdenti
   }
 }
 
-function advance(
-  record: D1ResourceRecord,
-  kind:
-    | "activate"
-    | "begin_delete"
-    | "begin_provisioning"
-    | "confirm_deleted"
-    | "intervene"
-    | "quarantine"
-    | "register"
-    | "retire",
-): D1ResourceRecord {
+function advance(record: D1ResourceRecord, action: D1ResourceLifecycleAction): D1ResourceRecord {
   return transitionD1Resource(record, {
-    action: { kind },
-    evidenceChecksum: `evidence-${kind}`,
+    action,
+    evidenceChecksum: `evidence-${action.kind}`,
     expectedStateVersion: record.stateVersion,
   })
 }
 
-function provisioning(): D1ResourceRecord {
-  return advance(createD1ResourceRecord(identity()), "begin_provisioning")
-}
-
-function bound(): D1ResourceRecord {
-  const record = provisioning()
-  return bindD1Resource(record, {
+function registered(): D1ResourceRecord {
+  const record = createD1ResourceRecord(identity())
+  return registerD1Resource(record, {
     attributionEvidenceChecksum: "attribution-a",
     databaseId,
     databaseName: record.databaseName,
@@ -58,6 +46,26 @@ function bound(): D1ResourceRecord {
     jurisdiction: record.desiredJurisdiction,
     providerResultChecksum: "provider-result-a",
   })
+}
+
+function presentObservation(
+  record: D1ResourceRecord,
+  overrides: Partial<Extract<D1ResourceObservation, { presence: "present" }>> = {},
+): D1ResourceRecord {
+  return observeD1Resource(record, {
+    databaseId,
+    databaseName: record.databaseName,
+    evidenceChecksum: "observation-present",
+    expectedStateVersion: record.stateVersion,
+    jurisdiction: record.desiredJurisdiction,
+    observationOperationId: "operation-observe-present",
+    presence: "present",
+    ...overrides,
+  })
+}
+
+function ready(): D1ResourceRecord {
+  return advance(presentObservation(registered()), { kind: "mark_ready" })
 }
 
 describe("D1 resource lifecycle", () => {
@@ -70,82 +78,148 @@ describe("D1 resource lifecycle", () => {
       stateVersion: 0,
     })
     expect(record.binding).toBeUndefined()
+    expect(record.lastObservation).toBeUndefined()
     expect(Object.isFrozen(record)).toBe(true)
   })
 
-  it("binds exact provider identity once and replays only exact evidence", () => {
-    const record = provisioning()
+  it("registers exact provider identity once and replays only exact evidence", () => {
+    const planned = createD1ResourceRecord(identity())
     const input = {
       attributionEvidenceChecksum: "attribution-a",
       databaseId,
-      databaseName: record.databaseName,
-      expectedStateVersion: record.stateVersion,
-      jurisdiction: record.desiredJurisdiction,
+      databaseName: planned.databaseName,
+      expectedStateVersion: planned.stateVersion,
+      jurisdiction: planned.desiredJurisdiction,
       providerResultChecksum: "provider-result-a",
     } as const
-    const attributed = bindD1Resource(record, input)
-    expect(attributed).toMatchObject({
+    const record = registerD1Resource(planned, input)
+    expect(record).toMatchObject({
       binding: {
         attributionEvidenceChecksum: "attribution-a",
         databaseId,
         jurisdiction: "eu",
       },
-      lifecycle: "provisioning",
-      stateVersion: 2,
+      lifecycle: "registered",
+      stateVersion: 1,
     })
-    expect(Object.isFrozen(attributed)).toBe(true)
-    expect(Object.isFrozen(attributed.binding)).toBe(true)
-    expect(bindD1Resource(attributed, input)).toBe(attributed)
+    expect(Object.isFrozen(record)).toBe(true)
+    expect(Object.isFrozen(record.binding)).toBe(true)
+    expect(registerD1Resource(record, input)).toBe(record)
     expect(() =>
-      bindD1Resource(attributed, { ...input, databaseId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" }),
+      registerD1Resource(record, {
+        ...input,
+        databaseId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      }),
     ).toThrow(/contradictory provider identity/u)
   })
 
-  it("runs the guarded registration, activation, retirement, and deletion path", () => {
-    const registered = advance(bound(), "register")
-    const active = advance(registered, "activate")
-    const quarantined = advance(active, "quarantine")
-    const retired = advance(quarantined, "retire")
-    const deleting = advance(retired, "begin_delete")
-    const deleted = advance(deleting, "confirm_deleted")
+  it("keeps desired, recorded, and observed provider state distinct", () => {
+    const record = registered()
+    const drifted = presentObservation(record, {
+      databaseName: "renamed-out-of-band",
+      jurisdiction: "fedramp",
+    })
+    expect(drifted).toMatchObject({
+      binding: { databaseName: record.databaseName, jurisdiction: "eu" },
+      databaseName: record.databaseName,
+      desiredJurisdiction: "eu",
+      lastObservation: {
+        databaseName: "renamed-out-of-band",
+        jurisdiction: "fedramp",
+        observedAtStateVersion: 2,
+        presence: "present",
+      },
+    })
+    expect(() => advance(drifted, { kind: "mark_ready" })).toThrow(/matching provider evidence/u)
+    expect(advance(drifted, { kind: "quarantine" }).lifecycle).toBe("quarantined")
+  })
+
+  it("runs the stable ready, quarantine, retirement, and deletion projection", () => {
+    const active = ready()
+    const quarantined = advance(active, { kind: "quarantine" })
+    expect(() => advance(quarantined, { kind: "recover_ready" })).toThrow(/recovery evidence/u)
+    const recoveryObservation = presentObservation(quarantined, {
+      evidenceChecksum: "observation-recovery",
+      observationOperationId: "operation-observe-recovery",
+    })
+    const recovered = advance(recoveryObservation, { kind: "recover_ready" })
+    const requarantined = advance(recovered, { kind: "quarantine" })
+    const retired = advance(requarantined, { kind: "retire" })
+    const absent = observeD1Resource(retired, {
+      databaseId,
+      evidenceChecksum: "observation-absent",
+      expectedStateVersion: retired.stateVersion,
+      observationOperationId: "operation-observe-absent",
+      presence: "absent",
+    })
+    const deleted = advance(absent, { kind: "confirm_deleted" })
     expect([
-      registered.lifecycle,
       active.lifecycle,
       quarantined.lifecycle,
+      recovered.lifecycle,
       retired.lifecycle,
-      deleting.lifecycle,
+      absent.lastObservation?.presence,
       deleted.lifecycle,
-    ]).toEqual(["registered", "active", "quarantined", "retired", "deleting", "deleted"])
+    ]).toEqual(["ready", "quarantined", "ready", "retired", "absent", "deleted"])
     expect(deleted.binding?.databaseId).toBe(databaseId)
-    expect(deleted.stateVersion).toBe(8)
+    expect(deleted.stateVersion).toBe(10)
   })
 
-  it("can quarantine pre-active resources or stop any nonterminal lifecycle for intervention", () => {
-    for (const record of [
-      createD1ResourceRecord(identity()),
-      provisioning(),
-      advance(bound(), "register"),
-    ]) {
-      expect(advance(record, "quarantine").lifecycle).toBe("quarantined")
-    }
-    for (const record of [
-      createD1ResourceRecord(identity()),
-      provisioning(),
-      advance(bound(), "register"),
-      advance(advance(bound(), "register"), "activate"),
-      advance(advance(advance(bound(), "register"), "activate"), "quarantine"),
-      advance(advance(advance(advance(bound(), "register"), "activate"), "quarantine"), "retire"),
-      advance(
-        advance(advance(advance(advance(bound(), "register"), "activate"), "quarantine"), "retire"),
-        "begin_delete",
-      ),
-    ]) {
-      expect(advance(record, "intervene").lifecycle).toBe("intervention_required")
-    }
+  it("recovers a quarantined binding as registered and abandons only pristine intent", () => {
+    const quarantined = advance(registered(), { kind: "quarantine" })
+    expect(advance(quarantined, { kind: "recover_registered" }).lifecycle).toBe("registered")
+    const abandoned = advance(createD1ResourceRecord(identity()), { kind: "abandon" })
+    expect(abandoned).toMatchObject({ lifecycle: "abandoned", stateVersion: 1 })
+    expect(() => advance(abandoned, { kind: "quarantine" })).toThrow(/not valid/u)
   })
 
-  it("rejects stale, premature, contradictory, and malformed bindings", () => {
-    const record = provisioning()
+  it("replays an exact observation and rejects stale or malformed observations", () => {
+    const record = registered()
+    const input = {
+      databaseId,
+      databaseName: record.databaseName,
+      evidenceChecksum: "observation-present",
+      expectedStateVersion: record.stateVersion,
+      jurisdiction: record.desiredJurisdiction,
+      observationOperationId: "operation-observe-present",
+      presence: "present",
+    } as const
+    const observed = observeD1Resource(record, input)
+    expect(observeD1Resource(observed, input)).toBe(observed)
+    expect(Object.isFrozen(observed.lastObservation)).toBe(true)
+    expect(() =>
+      observeD1Resource(observed, {
+        ...input,
+        evidenceChecksum: "new-observation",
+        expectedStateVersion: record.stateVersion,
+      }),
+    ).toThrow(/stale state version/u)
+    for (const invalid of [
+      { ...input, databaseId: "bad" },
+      { ...input, databaseId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" },
+      { ...input, databaseName: "" },
+      { ...input, evidenceChecksum: "" },
+      { ...input, jurisdiction: "moon" },
+      { ...input, observationOperationId: "" },
+    ]) {
+      expect(() => observeD1Resource(record, invalid as never)).toThrow()
+    }
+    expect(() => observeD1Resource(record, { ...input, presence: "future" } as never)).toThrow(
+      /presence is unsupported/u,
+    )
+    expect(() =>
+      observeD1Resource(record, {
+        databaseId,
+        evidenceChecksum: "premature-absence",
+        expectedStateVersion: record.stateVersion,
+        observationOperationId: "operation-premature-absence",
+        presence: "absent",
+      }),
+    ).toThrow(/only after resource retirement/u)
+  })
+
+  it("rejects stale, premature, contradictory, and malformed registration", () => {
+    const record = createD1ResourceRecord(identity())
     const base = {
       attributionEvidenceChecksum: "attribution-a",
       databaseId,
@@ -157,61 +231,95 @@ describe("D1 resource lifecycle", () => {
     for (const input of [
       { ...base, expectedStateVersion: 9 },
       { ...base, databaseId: "not-a-uuid" },
+      { ...base, databaseId: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE" },
       { ...base, databaseName: "" },
       { ...base, jurisdiction: "moon" },
       { ...base, attributionEvidenceChecksum: "" },
       { ...base, providerResultChecksum: "" },
     ]) {
-      expect(() => bindD1Resource(record, input as never)).toThrow()
+      expect(() => registerD1Resource(record, input as never)).toThrow()
     }
     expect(() =>
-      bindD1Resource(createD1ResourceRecord(identity()), { ...base, expectedStateVersion: 0 }),
-    ).toThrow(/only while provisioning/u)
-    expect(() => bindD1Resource(record, { ...base, databaseName: "other" })).toThrow(
-      /does not match/u,
+      registerD1Resource(advance(record, { kind: "quarantine" }), {
+        ...base,
+        expectedStateVersion: 1,
+      }),
+    ).toThrow(/Only a planned/u)
+    expect(() => registerD1Resource(record, { ...base, databaseName: "other" })).toThrow(
+      /contradicts/u,
     )
-    expect(() => bindD1Resource(record, { ...base, jurisdiction: "fedramp" })).toThrow(
-      /does not match/u,
+    expect(() => registerD1Resource(record, { ...base, jurisdiction: "fedramp" })).toThrow(
+      /contradicts/u,
     )
-    expect(() => bindD1Resource(record, { ...base, databaseId: "" })).toThrow(/non-empty/u)
   })
 
-  it("rejects illegal lifecycle edges, stale versions, missing evidence, and missing binding", () => {
+  it("rejects illegal lifecycle edges and deletion without authoritative absence", () => {
     const planned = createD1ResourceRecord(identity())
     for (const kind of [
-      "activate",
-      "begin_delete",
       "confirm_deleted",
-      "register",
+      "mark_ready",
+      "recover_ready",
+      "recover_registered",
       "retire",
     ] as const) {
-      expect(() => advance(planned, kind)).toThrow(/not valid/u)
+      expect(() => advance(planned, { kind })).toThrow(/not valid/u)
     }
     expect(() =>
       transitionD1Resource(planned, {
-        action: { kind: "begin_provisioning" },
+        action: { kind: "quarantine" },
         evidenceChecksum: "evidence",
         expectedStateVersion: 2,
       }),
     ).toThrow(/stale state version/u)
     expect(() =>
       transitionD1Resource(planned, {
-        action: { kind: "begin_provisioning" },
+        action: { kind: "quarantine" },
         evidenceChecksum: "",
         expectedStateVersion: 0,
       }),
     ).toThrow(/non-empty/u)
-    expect(() => advance(provisioning(), "register")).toThrow(/without verified/u)
-    const deleted = advance(
-      advance(advance(advance(advance(bound(), "register"), "activate"), "quarantine"), "retire"),
-      "begin_delete",
-    )
-    const terminal = advance(deleted, "confirm_deleted")
-    expect(() => advance(terminal, "intervene")).toThrow(/not valid/u)
-    expect(() => advance(advance(planned, "intervene"), "quarantine")).toThrow(/not valid/u)
+    expect(() => advance(registered(), { kind: "mark_ready" })).toThrow(/matching provider/u)
+    const retired = advance(advance(registered(), { kind: "quarantine" }), { kind: "retire" })
+    expect(() => advance(retired, { kind: "confirm_deleted" })).toThrow(/absence evidence/u)
+    expect(() => advance(ready(), { kind: "abandon" })).toThrow(/not valid/u)
+
+    const unboundQuarantine = advance(planned, { kind: "quarantine" })
+    for (const kind of ["recover_ready", "recover_registered", "retire"] as const) {
+      expect(() => advance(unboundQuarantine, { kind })).toThrow(/unbound|lacks matching/u)
+    }
   })
 
-  it("fails closed on malformed persisted identity, lifecycle, binding, and versions", () => {
+  it("rejects observations on unmaterialized and terminal resources", () => {
+    const input = {
+      databaseId,
+      evidenceChecksum: "absence",
+      expectedStateVersion: 0,
+      observationOperationId: "observe",
+      presence: "absent",
+    } as const
+    expect(() => observeD1Resource(createD1ResourceRecord(identity()), input)).toThrow(
+      /before provider registration/u,
+    )
+    const abandoned = advance(createD1ResourceRecord(identity()), { kind: "abandon" })
+    expect(() => observeD1Resource(abandoned, { ...input, expectedStateVersion: 1 })).toThrow(
+      /before provider registration/u,
+    )
+    const retired = advance(advance(registered(), { kind: "quarantine" }), { kind: "retire" })
+    const absent = observeD1Resource(retired, {
+      ...input,
+      expectedStateVersion: retired.stateVersion,
+    })
+    const deleted = advance(absent, { kind: "confirm_deleted" })
+    expect(() =>
+      observeD1Resource(deleted, {
+        ...input,
+        evidenceChecksum: "later-absence",
+        expectedStateVersion: deleted.stateVersion,
+      }),
+    ).toThrow(/cannot accept/u)
+  })
+
+  it("fails closed on malformed persisted identity, lifecycle, binding, observation, and versions", () => {
     for (const value of ["", null]) {
       for (const field of [
         "resourceId",
@@ -231,7 +339,7 @@ describe("D1 resource lifecycle", () => {
       createD1ResourceRecord(identity({ desiredJurisdiction: "moon" as never })),
     ).toThrow(/unsupported/u)
 
-    const valid = bound()
+    const valid = presentObservation(registered())
     for (const corrupt of [
       { ...valid, stateVersion: -1 },
       { ...valid, stateVersion: 0.5 },
@@ -242,15 +350,55 @@ describe("D1 resource lifecycle", () => {
       { ...valid, binding: { ...valid.binding, jurisdiction: "fedramp" } },
       { ...valid, binding: { ...valid.binding, attributionEvidenceChecksum: "" } },
       { ...valid, binding: { ...valid.binding, providerResultChecksum: "" } },
-      { ...valid, stateVersion: Number.MAX_SAFE_INTEGER },
+      { ...valid, lastObservation: { ...valid.lastObservation, databaseId: "bad" } },
+      { ...valid, lastObservation: { ...valid.lastObservation, databaseId: "other" } },
+      { ...valid, lastObservation: { ...valid.lastObservation, evidenceChecksum: "" } },
+      { ...valid, lastObservation: { ...valid.lastObservation, observationOperationId: "" } },
+      { ...valid, lastObservation: { ...valid.lastObservation, observedAtStateVersion: 0 } },
+      { ...valid, lastObservation: { ...valid.lastObservation, observedAtStateVersion: 99 } },
     ]) {
-      expect(() => advance(corrupt as never, "register")).toThrow()
+      expect(() => advance(corrupt as never, { kind: "mark_ready" })).toThrow()
     }
     expect(() =>
       advance(
-        { ...createD1ResourceRecord(identity()), lifecycle: "active" } as D1ResourceRecord,
-        "quarantine",
+        {
+          ...createD1ResourceRecord(identity()),
+          stateVersion: Number.MAX_SAFE_INTEGER,
+        } as D1ResourceRecord,
+        { kind: "quarantine" },
+      ),
+    ).toThrow(/version overflowed/u)
+    expect(() =>
+      advance(
+        {
+          ...createD1ResourceRecord(identity()),
+          binding: registered().binding,
+        } as D1ResourceRecord,
+        { kind: "quarantine" },
+      ),
+    ).toThrow(/cannot retain provider state/u)
+    expect(() =>
+      advance({ ...registered(), lifecycle: "ready" } as D1ResourceRecord, { kind: "quarantine" }),
+    ).toThrow(/lacks a matching recent/u)
+    expect(() =>
+      advance({ ...registered(), lifecycle: "deleted" } as D1ResourceRecord, {
+        kind: "quarantine",
+      }),
+    ).toThrow(/lacks authoritative absence/u)
+    expect(() =>
+      advance(
+        { ...createD1ResourceRecord(identity()), lifecycle: "registered" } as D1ResourceRecord,
+        { kind: "quarantine" },
       ),
     ).toThrow(/requires a provider binding/u)
+    expect(() =>
+      advance(
+        {
+          ...valid,
+          lastObservation: { ...valid.lastObservation, presence: "absent" },
+        } as D1ResourceRecord,
+        { kind: "mark_ready" },
+      ),
+    ).toThrow(/invalid resource lifecycle/u)
   })
 })

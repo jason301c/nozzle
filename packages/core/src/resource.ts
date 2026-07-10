@@ -2,14 +2,12 @@ import { NozzleError } from "./errors.js"
 
 export const D1_RESOURCE_LIFECYCLES = [
   "planned",
-  "provisioning",
   "registered",
-  "active",
+  "ready",
   "quarantined",
   "retired",
-  "deleting",
   "deleted",
-  "intervention_required",
+  "abandoned",
 ] as const
 
 export type D1ResourceLifecycle = (typeof D1_RESOURCE_LIFECYCLES)[number]
@@ -36,24 +34,48 @@ export interface D1ResourceBinding {
   readonly providerResultChecksum: string
 }
 
+export type D1ResourceObservationValue =
+  | {
+      readonly databaseId: string
+      readonly databaseName: string
+      readonly evidenceChecksum: string
+      readonly jurisdiction: D1ResourceJurisdiction
+      readonly observationOperationId: string
+      readonly presence: "present"
+    }
+  | {
+      readonly databaseId: string
+      readonly evidenceChecksum: string
+      readonly observationOperationId: string
+      readonly presence: "absent"
+    }
+
+export type D1ResourceObservation = D1ResourceObservationValue & {
+  readonly observedAtStateVersion: number
+}
+
+export type ObserveD1ResourceInput = D1ResourceObservationValue & {
+  readonly expectedStateVersion: number
+}
+
 export interface D1ResourceRecord extends D1ResourceIdentity {
   readonly binding?: D1ResourceBinding
   readonly lastEvidenceChecksum: string
+  readonly lastObservation?: D1ResourceObservation
   readonly lifecycle: D1ResourceLifecycle
   readonly stateVersion: number
 }
 
 export type D1ResourceLifecycleAction =
-  | { readonly kind: "activate" }
-  | { readonly kind: "begin_delete" }
-  | { readonly kind: "begin_provisioning" }
+  | { readonly kind: "abandon" }
   | { readonly kind: "confirm_deleted" }
-  | { readonly kind: "intervene" }
+  | { readonly kind: "mark_ready" }
   | { readonly kind: "quarantine" }
-  | { readonly kind: "register" }
+  | { readonly kind: "recover_ready" }
+  | { readonly kind: "recover_registered" }
   | { readonly kind: "retire" }
 
-const D1_UUID_PATTERN = /^[A-Fa-f0-9]{8}-(?:[A-Fa-f0-9]{4}-){3}[A-Fa-f0-9]{12}$/u
+const D1_UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u
 
 function configuration(message: string): never {
   throw new NozzleError("ConfigurationError", message)
@@ -98,6 +120,56 @@ function validateIdentity(input: D1ResourceIdentity): void {
   jurisdiction(input.desiredJurisdiction, "Desired D1 resource jurisdiction")
 }
 
+function validateBinding(binding: D1ResourceBinding, record: D1ResourceIdentity): void {
+  text(binding.databaseId, "Bound D1 database ID")
+  if (!D1_UUID_PATTERN.test(binding.databaseId)) {
+    intervention("The bound D1 database ID is malformed.")
+  }
+  text(binding.databaseName, "Bound D1 database name")
+  jurisdiction(binding.jurisdiction, "Bound D1 database jurisdiction")
+  text(binding.attributionEvidenceChecksum, "D1 attribution evidence checksum")
+  text(binding.providerResultChecksum, "D1 provider result checksum")
+  if (
+    binding.databaseName !== record.databaseName ||
+    binding.jurisdiction !== record.desiredJurisdiction
+  ) {
+    intervention("The bound D1 database contradicts the immutable resource intent.")
+  }
+}
+
+function validateObservation(
+  observation: D1ResourceObservationValue,
+  binding: D1ResourceBinding | undefined,
+): void {
+  if (binding === undefined) {
+    intervention("A D1 resource observation cannot exist before provider registration.")
+  }
+  text(observation.databaseId, "Observed D1 database ID")
+  if (!D1_UUID_PATTERN.test(observation.databaseId)) {
+    intervention("The observed D1 database ID is malformed.")
+  }
+  if (observation.databaseId !== binding.databaseId) {
+    intervention("The D1 resource observation belongs to a different provider database.")
+  }
+  text(observation.evidenceChecksum, "D1 observation evidence checksum")
+  text(observation.observationOperationId, "D1 observation operation ID")
+  if (observation.presence === "present") {
+    text(observation.databaseName, "Observed D1 database name")
+    jurisdiction(observation.jurisdiction, "Observed D1 database jurisdiction")
+  } else if (observation.presence !== "absent") {
+    intervention("The persisted D1 resource observation presence is unsupported.")
+  }
+}
+
+function observationMatchesIntent(record: D1ResourceRecord): boolean {
+  const observation = record.lastObservation
+  return (
+    observation?.presence === "present" &&
+    observation.databaseName === record.databaseName &&
+    observation.jurisdiction === record.desiredJurisdiction
+  )
+}
+
 function validateRecord(record: D1ResourceRecord): void {
   validateIdentity(record)
   version(record.stateVersion)
@@ -105,31 +177,53 @@ function validateRecord(record: D1ResourceRecord): void {
   if (!D1_RESOURCE_LIFECYCLES.includes(record.lifecycle)) {
     intervention("The persisted D1 resource lifecycle is unsupported.")
   }
-  if (record.binding !== undefined) {
-    text(record.binding.databaseId, "Bound D1 database ID")
-    if (!D1_UUID_PATTERN.test(record.binding.databaseId)) {
-      intervention("The bound D1 database ID is malformed.")
-    }
-    text(record.binding.databaseName, "Bound D1 database name")
-    jurisdiction(record.binding.jurisdiction, "Bound D1 database jurisdiction")
-    text(record.binding.attributionEvidenceChecksum, "D1 attribution evidence checksum")
-    text(record.binding.providerResultChecksum, "D1 provider result checksum")
+  if (record.binding !== undefined) validateBinding(record.binding, record)
+  if (record.lastObservation !== undefined) {
+    validateObservation(record.lastObservation, record.binding)
     if (
-      record.binding.databaseName !== record.databaseName ||
-      record.binding.jurisdiction !== record.desiredJurisdiction
+      !Number.isSafeInteger(record.lastObservation.observedAtStateVersion) ||
+      record.lastObservation.observedAtStateVersion < 1 ||
+      record.lastObservation.observedAtStateVersion > record.stateVersion
     ) {
-      intervention("The bound D1 database contradicts the immutable resource intent.")
+      intervention("The persisted D1 resource observation version is malformed.")
     }
   }
   if (
     (record.lifecycle === "registered" ||
-      record.lifecycle === "active" ||
+      record.lifecycle === "ready" ||
       record.lifecycle === "retired" ||
-      record.lifecycle === "deleting" ||
       record.lifecycle === "deleted") &&
     record.binding === undefined
   ) {
     intervention("The persisted D1 resource lifecycle requires a provider binding.")
+  }
+  if (
+    (record.lifecycle === "planned" || record.lifecycle === "abandoned") &&
+    (record.binding !== undefined || record.lastObservation !== undefined)
+  ) {
+    intervention("An unmaterialized D1 resource cannot retain provider state.")
+  }
+  if (
+    record.lastObservation?.presence === "absent" &&
+    record.lifecycle !== "retired" &&
+    record.lifecycle !== "deleted"
+  ) {
+    intervention("Authoritative D1 absence is attached to an invalid resource lifecycle.")
+  }
+  if (
+    record.lifecycle === "ready" &&
+    (!observationMatchesIntent(record) ||
+      (record.lastObservation?.observedAtStateVersion !== record.stateVersion &&
+        record.lastObservation?.observedAtStateVersion !== record.stateVersion - 1))
+  ) {
+    intervention("A ready D1 resource lacks a matching recent provider observation.")
+  }
+  if (
+    record.lifecycle === "deleted" &&
+    (record.lastObservation?.presence !== "absent" ||
+      record.lastObservation.observedAtStateVersion !== record.stateVersion - 1)
+  ) {
+    intervention("A deleted D1 resource lacks authoritative absence evidence.")
   }
 }
 
@@ -137,6 +231,32 @@ function increment(value: number): number {
   const next = value + 1
   if (!Number.isSafeInteger(next)) intervention("The D1 resource state version overflowed.")
   return next
+}
+
+function exactBinding(left: D1ResourceBinding, right: D1ResourceBinding): boolean {
+  return (
+    left.databaseId === right.databaseId &&
+    left.databaseName === right.databaseName &&
+    left.jurisdiction === right.jurisdiction &&
+    left.attributionEvidenceChecksum === right.attributionEvidenceChecksum &&
+    left.providerResultChecksum === right.providerResultChecksum
+  )
+}
+
+function exactObservation(
+  left: D1ResourceObservationValue,
+  right: D1ResourceObservationValue,
+): boolean {
+  return (
+    left.presence === right.presence &&
+    left.databaseId === right.databaseId &&
+    left.evidenceChecksum === right.evidenceChecksum &&
+    left.observationOperationId === right.observationOperationId &&
+    (left.presence === "absent" ||
+      (right.presence === "present" &&
+        left.databaseName === right.databaseName &&
+        left.jurisdiction === right.jurisdiction))
+  )
 }
 
 export function createD1ResourceRecord(input: D1ResourceIdentity): D1ResourceRecord {
@@ -149,62 +269,86 @@ export function createD1ResourceRecord(input: D1ResourceIdentity): D1ResourceRec
   })
 }
 
-export function bindD1Resource(
+export function registerD1Resource(
   record: D1ResourceRecord,
-  input: {
-    readonly attributionEvidenceChecksum: string
-    readonly databaseId: string
-    readonly databaseName: string
-    readonly expectedStateVersion: number
-    readonly jurisdiction: D1ResourceJurisdiction
-    readonly providerResultChecksum: string
-  },
+  input: D1ResourceBinding & { readonly expectedStateVersion: number },
 ): D1ResourceRecord {
   validateRecord(record)
-  text(input.databaseId, "Bound D1 database ID")
-  if (!D1_UUID_PATTERN.test(input.databaseId)) {
-    return configuration("Bound D1 database ID must use canonical UUID form.")
-  }
-  text(input.databaseName, "Bound D1 database name")
-  jurisdiction(input.jurisdiction, "Bound D1 database jurisdiction")
-  text(input.attributionEvidenceChecksum, "D1 attribution evidence checksum")
-  text(input.providerResultChecksum, "D1 provider result checksum")
-  const requested = Object.freeze({
+  const requested: D1ResourceBinding = Object.freeze({
     attributionEvidenceChecksum: input.attributionEvidenceChecksum,
     databaseId: input.databaseId,
     databaseName: input.databaseName,
     jurisdiction: input.jurisdiction,
     providerResultChecksum: input.providerResultChecksum,
   })
+  validateBinding(requested, record)
   if (record.binding !== undefined) {
-    if (
-      record.binding.databaseId === requested.databaseId &&
-      record.binding.databaseName === requested.databaseName &&
-      record.binding.jurisdiction === requested.jurisdiction &&
-      record.binding.attributionEvidenceChecksum === requested.attributionEvidenceChecksum &&
-      record.binding.providerResultChecksum === requested.providerResultChecksum
-    ) {
-      return record
-    }
+    if (exactBinding(record.binding, requested)) return record
     return intervention("The D1 resource is already bound to contradictory provider identity.")
   }
   if (record.stateVersion !== input.expectedStateVersion) {
-    return resume("The D1 resource binding was based on a stale state version.")
+    return resume("The D1 resource registration was based on a stale state version.")
   }
-  if (record.lifecycle !== "provisioning") {
-    return resume("A D1 resource can be bound only while provisioning.")
-  }
-  if (
-    requested.databaseName !== record.databaseName ||
-    requested.jurisdiction !== record.desiredJurisdiction
-  ) {
-    return intervention("The observed D1 resource does not match the immutable creation intent.")
+  if (record.lifecycle !== "planned") {
+    return resume("Only a planned D1 resource can register provider identity.")
   }
   return Object.freeze({
     ...record,
     binding: requested,
-    lastEvidenceChecksum: input.attributionEvidenceChecksum,
+    lastEvidenceChecksum: requested.attributionEvidenceChecksum,
+    lifecycle: "registered",
     stateVersion: increment(record.stateVersion),
+  })
+}
+
+export function observeD1Resource(
+  record: D1ResourceRecord,
+  input: ObserveD1ResourceInput,
+): D1ResourceRecord {
+  validateRecord(record)
+  const requested: D1ResourceObservationValue =
+    input.presence === "present"
+      ? Object.freeze({
+          databaseId: input.databaseId,
+          databaseName: input.databaseName,
+          evidenceChecksum: input.evidenceChecksum,
+          jurisdiction: input.jurisdiction,
+          observationOperationId: input.observationOperationId,
+          presence: input.presence,
+        })
+      : Object.freeze({
+          databaseId: input.databaseId,
+          evidenceChecksum: input.evidenceChecksum,
+          observationOperationId: input.observationOperationId,
+          presence: input.presence,
+        })
+  validateObservation(requested, record.binding)
+  if (record.lastObservation !== undefined && exactObservation(record.lastObservation, requested)) {
+    return record
+  }
+  if (record.stateVersion !== input.expectedStateVersion) {
+    return resume("The D1 resource observation was based on a stale state version.")
+  }
+  if (
+    record.lifecycle === "planned" ||
+    record.lifecycle === "abandoned" ||
+    record.lifecycle === "deleted"
+  ) {
+    return resume(`A ${record.lifecycle} D1 resource cannot accept a new provider observation.`)
+  }
+  if (requested.presence === "absent" && record.lifecycle !== "retired") {
+    return resume("Authoritative D1 absence can be recorded only after resource retirement.")
+  }
+  const stateVersion = increment(record.stateVersion)
+  const observation: D1ResourceObservation = Object.freeze({
+    ...requested,
+    observedAtStateVersion: stateVersion,
+  })
+  return Object.freeze({
+    ...record,
+    lastEvidenceChecksum: observation.evidenceChecksum,
+    lastObservation: observation,
+    stateVersion,
   })
 }
 
@@ -233,48 +377,61 @@ export function transitionD1Resource(
   }
   let lifecycle: D1ResourceLifecycle
   switch (input.action.kind) {
-    case "begin_provisioning":
-      requiredLifecycle(record.lifecycle, ["planned"], input.action.kind)
-      lifecycle = "provisioning"
+    case "mark_ready":
+      requiredLifecycle(record.lifecycle, ["registered"], input.action.kind)
+      if (
+        !observationMatchesIntent(record) ||
+        record.lastObservation?.observedAtStateVersion !== record.stateVersion
+      ) {
+        return intervention("A D1 resource cannot become ready without matching provider evidence.")
+      }
+      lifecycle = "ready"
       break
-    case "register":
-      requiredLifecycle(record.lifecycle, ["provisioning"], input.action.kind)
+    case "quarantine":
+      requiredLifecycle(record.lifecycle, ["planned", "registered", "ready"], input.action.kind)
+      lifecycle = "quarantined"
+      break
+    case "recover_registered":
+      requiredLifecycle(record.lifecycle, ["quarantined"], input.action.kind)
       if (record.binding === undefined) {
-        return intervention("A D1 resource cannot register without verified provider identity.")
+        return intervention("An unbound quarantined D1 resource cannot recover as registered.")
       }
       lifecycle = "registered"
       break
-    case "activate":
-      requiredLifecycle(record.lifecycle, ["registered"], input.action.kind)
-      lifecycle = "active"
-      break
-    case "quarantine":
-      requiredLifecycle(
-        record.lifecycle,
-        ["planned", "provisioning", "registered", "active"],
-        input.action.kind,
-      )
-      lifecycle = "quarantined"
+    case "recover_ready":
+      requiredLifecycle(record.lifecycle, ["quarantined"], input.action.kind)
+      if (
+        record.binding === undefined ||
+        !observationMatchesIntent(record) ||
+        record.lastObservation?.observedAtStateVersion !== record.stateVersion
+      ) {
+        return intervention("A quarantined D1 resource lacks matching recovery evidence.")
+      }
+      lifecycle = "ready"
       break
     case "retire":
       requiredLifecycle(record.lifecycle, ["quarantined"], input.action.kind)
+      if (record.binding === undefined) {
+        return intervention("An unbound quarantined D1 resource cannot be retired.")
+      }
       lifecycle = "retired"
       break
-    case "begin_delete":
-      requiredLifecycle(record.lifecycle, ["retired"], input.action.kind)
-      lifecycle = "deleting"
-      break
     case "confirm_deleted":
-      requiredLifecycle(record.lifecycle, ["deleting"], input.action.kind)
+      requiredLifecycle(record.lifecycle, ["retired"], input.action.kind)
+      if (
+        record.binding === undefined ||
+        record.lastObservation?.presence !== "absent" ||
+        record.lastObservation.observedAtStateVersion !== record.stateVersion
+      ) {
+        return intervention(
+          "D1 deletion requires a retained binding and authoritative absence evidence.",
+        )
+      }
       lifecycle = "deleted"
       break
-    case "intervene":
-      requiredLifecycle(
-        record.lifecycle,
-        ["planned", "provisioning", "registered", "active", "quarantined", "retired", "deleting"],
-        input.action.kind,
-      )
-      lifecycle = "intervention_required"
+    case "abandon":
+      requiredLifecycle(record.lifecycle, ["planned"], input.action.kind)
+      lifecycle = "abandoned"
       break
   }
   return Object.freeze({
