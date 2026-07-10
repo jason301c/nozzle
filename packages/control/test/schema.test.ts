@@ -264,6 +264,237 @@ describe("control D1 schema", () => {
     })
   })
 
+  it("requires fenced operation effects and append-only receipts for saga state", () => {
+    withDatabase((database) => {
+      const descriptorChecksum = "d".repeat(64)
+      const record = (stateVersion: number, status: "planned" | "succeeded") =>
+        JSON.stringify({
+          deadlineAtMs: 10_000,
+          descriptor: {
+            descriptorChecksum,
+            descriptorId: "transfer",
+            version: 1,
+          },
+          idempotencyKey: "saga-key",
+          inputChecksum: "saga-input",
+          sagaId: "saga-a",
+          stateVersion,
+          status,
+          terminationCause: null,
+          terminationRequestedAtMs: null,
+        })
+      database
+        .prepare(
+          `INSERT INTO "nozzle_operations"
+           ("operation_id", "environment_id", "operation_type", "idempotency_scope",
+            "idempotency_key", "input_checksum", "input_json", "plan_checksum", "plan_json",
+            "capability_snapshot_checksum", "capability_snapshot_json", "required_shards_json",
+            "status", "created_at_ms", "updated_at_ms")
+           VALUES ('operation-saga', 'production', 'saga:transfer.v1', 'saga', 'saga-key',
+             'saga-input', '{}', 'plan', '{}', 'capability', '{}', '[]', 'running', 1, 1)`,
+        )
+        .run()
+      database
+        .prepare(
+          `INSERT INTO "nozzle_operation_steps"
+           ("operation_id", "step_id", "idempotency_key", "lease_key", "plan_json",
+            "record_json", "state", "fencing_token", "updated_at_ms")
+           VALUES
+             ('operation-saga', 'saga:init', 'init-key', 'saga:lease', '{}',
+              '{"state":"pending"}', 'pending', NULL, 1),
+             ('operation-saga', 'saga:a:forward', 'action-key', 'saga:lease', '{}',
+              '{"activeAttemptId":"attempt-a","state":"running"}', 'running', 1, 1)`,
+        )
+        .run()
+      database
+        .prepare(
+          `INSERT INTO "nozzle_leases"
+           ("lease_key", "holder_id", "acquisition_id", "fencing_token", "expires_at_ms",
+            "updated_at_ms")
+           VALUES ('saga:lease', 'controller', 'acquisition', 1, 9000000000000000, 1)`,
+        )
+        .run()
+      database
+        .prepare(
+          `INSERT INTO "nozzle_operation_transitions"
+           ("transition_id", "operation_id", "step_id", "from_record_json", "to_record_json",
+            "from_operation_status", "to_operation_status", "audit_event_hash", "fencing_token",
+            "lease_key", "holder_id", "acquisition_id", "created_at_ms")
+           VALUES ('transition-init', 'operation-saga', 'saga:init', '{"state":"pending"}',
+             '{"resultChecksum":"init","state":"succeeded"}', 'running', 'running',
+             'audit-init', 1, 'saga:lease', 'controller', 'acquisition', 1)`,
+        )
+        .run()
+      database
+        .prepare(
+          `INSERT INTO "nozzle_operation_effects"
+           ("effect_id", "transition_id", "operation_id", "step_id", "resource_kind",
+            "resource_id", "effect_kind", "from_state_version", "to_state_version",
+            "evidence_checksum", "record_checksum", "record_json", "lease_key", "holder_id",
+            "acquisition_id", "fencing_token", "created_at_ms")
+           VALUES ('effect-saga-0', 'transition-init', 'operation-saga', 'saga:init', 'saga',
+             'saga-a', 'create', NULL, 0, 'evidence-0', 'record-0', ?, 'saga:lease',
+             'controller', 'acquisition', 1, 1)`,
+        )
+        .run(record(0, "planned"))
+      database
+        .prepare(
+          `INSERT INTO "nozzle_sagas"
+           ("saga_id", "operation_id", "descriptor_id", "descriptor_version",
+            "descriptor_checksum", "descriptor_json", "idempotency_key", "input_checksum",
+            "deadline_at_ms", "status", "commitment", "termination_cause",
+            "termination_requested_at_ms", "state_version", "last_evidence_checksum",
+            "last_effect_id", "record_checksum", "record_json", "created_at_ms", "updated_at_ms")
+           VALUES ('saga-a', 'operation-saga', 'transfer', 1, ?, '{}', 'saga-key', 'saga-input',
+             10000, 'planned', 'none', NULL, NULL, 0, 'evidence-0', 'effect-saga-0', 'record-0',
+             ?, 1, 1)`,
+        )
+        .run(descriptorChecksum, record(0, "planned"))
+
+      expect(() =>
+        database.prepare(`UPDATE "nozzle_sagas" SET "status" = 'running'`).run(),
+      ).toThrow("NOZZLE_CONTROL_SAGA_EFFECT_REQUIRED")
+      database
+        .prepare(
+          `INSERT INTO "nozzle_operation_transitions"
+           ("transition_id", "operation_id", "step_id", "from_record_json", "to_record_json",
+            "from_operation_status", "to_operation_status", "audit_event_hash", "fencing_token",
+            "lease_key", "holder_id", "acquisition_id", "created_at_ms")
+           VALUES ('transition-action', 'operation-saga', 'saga:a:forward',
+             '{"activeAttemptId":"attempt-a","state":"running"}',
+             '{"resultChecksum":"action","state":"succeeded"}', 'running', 'running',
+             'audit-action', 1, 'saga:lease', 'controller', 'acquisition', 2)`,
+        )
+        .run()
+      database
+        .prepare(
+          `INSERT INTO "nozzle_operation_effects"
+           ("effect_id", "transition_id", "operation_id", "step_id", "resource_kind",
+            "resource_id", "effect_kind", "from_state_version", "to_state_version",
+            "evidence_checksum", "record_checksum", "record_json", "lease_key", "holder_id",
+            "acquisition_id", "fencing_token", "created_at_ms")
+           VALUES ('effect-saga-1', 'transition-action', 'operation-saga', 'saga:a:forward', 'saga',
+             'saga-a', 'forward:succeeded', 0, 1, 'evidence-1', 'record-1', ?, 'saga:lease',
+             'controller', 'acquisition', 1, 2)`,
+        )
+        .run(record(1, "succeeded"))
+      database
+        .prepare(
+          `UPDATE "nozzle_sagas"
+           SET "status" = 'succeeded', "commitment" = 'complete', "state_version" = 1,
+               "last_evidence_checksum" = 'evidence-1', "last_effect_id" = 'effect-saga-1',
+               "record_checksum" = 'record-1', "record_json" = ?, "updated_at_ms" = 2
+           WHERE "saga_id" = 'saga-a'`,
+        )
+        .run(record(1, "succeeded"))
+      expect(
+        database
+          .prepare(
+            `SELECT "status", "state_version" FROM "nozzle_sagas" WHERE "saga_id" = 'saga-a'`,
+          )
+          .get(),
+      ).toEqual({ state_version: 1, status: "succeeded" })
+      const identityRecord = JSON.stringify({
+        ...(JSON.parse(record(2, "succeeded")) as Record<string, unknown>),
+        descriptor: {
+          descriptorChecksum,
+          descriptorId: "other",
+          version: 1,
+        },
+      })
+      database
+        .prepare(
+          `INSERT INTO "nozzle_operation_effects"
+           ("effect_id", "transition_id", "operation_id", "step_id", "resource_kind",
+            "resource_id", "effect_kind", "from_state_version", "to_state_version",
+            "evidence_checksum", "record_checksum", "record_json", "lease_key", "holder_id",
+            "acquisition_id", "fencing_token", "created_at_ms")
+           VALUES ('effect-identity', 'transition-init', 'operation-saga', 'saga:init', 'saga',
+             'saga-a', 'rewrite', 1, 2, 'identity-evidence', 'identity-record', ?, 'saga:lease',
+             'controller', 'acquisition', 1, 1)`,
+        )
+        .run(identityRecord)
+      expect(() =>
+        database
+          .prepare(
+            `UPDATE "nozzle_sagas"
+             SET "descriptor_id" = 'other', "state_version" = 2,
+                 "last_evidence_checksum" = 'identity-evidence',
+                 "last_effect_id" = 'effect-identity', "record_checksum" = 'identity-record',
+                 "record_json" = ?, "updated_at_ms" = 2`,
+          )
+          .run(identityRecord),
+      ).toThrow("NOZZLE_CONTROL_SAGA_IDENTITY_IMMUTABLE")
+      expect(() => database.prepare(`DELETE FROM "nozzle_sagas"`).run()).toThrow(
+        "NOZZLE_CONTROL_SAGA_PERSISTENT",
+      )
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO "nozzle_operation_effects"
+             ("effect_id", "transition_id", "operation_id", "step_id", "resource_kind",
+              "resource_id", "effect_kind", "from_state_version", "to_state_version",
+              "evidence_checksum", "record_checksum", "record_json", "lease_key", "holder_id",
+              "acquisition_id", "fencing_token", "created_at_ms")
+             VALUES ('duplicate-create', 'transition-init', 'operation-saga', 'saga:init', 'saga',
+               'saga-a', 'create', NULL, 0, 'evidence', 'record', ?, 'saga:lease', 'controller',
+               'acquisition', 1, 1)`,
+          )
+          .run(record(0, "planned")),
+      ).toThrow("NOZZLE_CONTROL_OPERATION_EFFECT_SOURCE_MISMATCH")
+
+      database
+        .prepare(
+          `INSERT INTO "nozzle_saga_action_attempts"
+           ("attempt_id", "saga_id", "operation_id", "operation_step_id", "saga_step_id",
+            "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
+            "lease_key", "holder_id", "acquisition_id", "fencing_token", "accepted_at_ms")
+           VALUES ('attempt-a', 'saga-a', 'operation-saga', 'saga:a:forward', 'a', 'forward',
+             'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'saga:lease',
+             'controller', 'acquisition', 1, 1)`,
+        )
+        .run()
+      database
+        .prepare(
+          `INSERT INTO "nozzle_saga_action_attempt_outcomes"
+           ("attempt_id", "state", "evidence_checksum", "evidence_json", "output_checksum",
+            "output_json", "error_checksum", "error_json", "outcome_checksum", "completed_at_ms")
+           VALUES ('attempt-a', 'confirmed', 'evidence', '{}', 'output', '{}', NULL, NULL,
+             'outcome', 2)`,
+        )
+        .run()
+      expect(() =>
+        database
+          .prepare(`UPDATE "nozzle_saga_action_attempts" SET "action_key" = 'rewritten'`)
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_SAGA_ATTEMPT_IMMUTABLE")
+      expect(() => database.prepare(`DELETE FROM "nozzle_saga_action_attempts"`).run()).toThrow(
+        "NOZZLE_CONTROL_SAGA_ATTEMPT_PERSISTENT",
+      )
+      expect(() =>
+        database
+          .prepare(`UPDATE "nozzle_saga_action_attempt_outcomes" SET "state" = 'unknown'`)
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_IMMUTABLE")
+      expect(() =>
+        database.prepare(`DELETE FROM "nozzle_saga_action_attempt_outcomes"`).run(),
+      ).toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_PERSISTENT")
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO "nozzle_saga_action_attempts"
+             ("attempt_id", "saga_id", "operation_id", "operation_step_id", "saga_step_id",
+              "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
+              "lease_key", "holder_id", "acquisition_id", "fencing_token", "accepted_at_ms")
+             VALUES ('fenced', 'saga-a', 'operation-saga', 'saga:a:forward', 'a', 'forward',
+               'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'saga:lease',
+               'controller', 'acquisition', 2, 1)`,
+          )
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_SAGA_ATTEMPT_FENCED")
+    })
+  })
+
   it("prevents lease rollback, unfenced takeover, deletion, and audit rewriting", () => {
     withDatabase((database) => {
       database

@@ -21,6 +21,9 @@ export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_provider_attempts",
   "nozzle_route_overrides",
   "nozzle_route_versions",
+  "nozzle_saga_action_attempt_outcomes",
+  "nozzle_saga_action_attempts",
+  "nozzle_sagas",
   "nozzle_schema_artifacts",
   "nozzle_schema_versions",
   "nozzle_shards",
@@ -307,12 +310,85 @@ ON CONFLICT ("singleton") DO NOTHING;`,
   "created_at_ms" INTEGER NOT NULL CHECK ("created_at_ms" >= 0),
   CHECK (("from_state_version" IS NULL AND "to_state_version" = 0)
     OR "to_state_version" = "from_state_version" + 1),
-  CHECK (json_extract("record_json", '$.resourceId') = "resource_id"),
+  CHECK ("resource_kind" <> 'd1_database'
+    OR json_extract("record_json", '$.resourceId') = "resource_id"),
   CHECK (json_extract("record_json", '$.stateVersion') = "to_state_version"),
-  CHECK (json_extract("record_json", '$.lastEvidenceChecksum') = "evidence_checksum"),
+  CHECK ("resource_kind" <> 'd1_database'
+    OR json_extract("record_json", '$.lastEvidenceChecksum') = "evidence_checksum"),
   FOREIGN KEY ("operation_id", "step_id")
     REFERENCES "nozzle_operation_steps" ("operation_id", "step_id"),
   UNIQUE ("resource_kind", "resource_id", "to_state_version")
+);`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_sagas" (
+  "saga_id" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("saga_id")) BETWEEN 1 AND 512),
+  "operation_id" TEXT UNIQUE NOT NULL REFERENCES "nozzle_operations" ("operation_id"),
+  "descriptor_id" TEXT NOT NULL CHECK (length(trim("descriptor_id")) BETWEEN 1 AND 255),
+  "descriptor_version" INTEGER NOT NULL CHECK ("descriptor_version" >= 1),
+  "descriptor_checksum" TEXT NOT NULL CHECK (length("descriptor_checksum") = 64),
+  "descriptor_json" TEXT NOT NULL CHECK (json_valid("descriptor_json")),
+  "idempotency_key" TEXT NOT NULL CHECK (length(trim("idempotency_key")) > 0),
+  "input_checksum" TEXT NOT NULL CHECK (length(trim("input_checksum")) > 0),
+  "deadline_at_ms" INTEGER NOT NULL CHECK ("deadline_at_ms" >= 0),
+  "status" TEXT NOT NULL CHECK ("status" IN ('planned', 'running', 'compensating', 'succeeded', 'failed', 'cancelled', 'timed_out', 'intervention_required')),
+  "commitment" TEXT NOT NULL CHECK ("commitment" IN ('none', 'possible', 'confirmed_partial', 'complete')),
+  "termination_cause" TEXT CHECK ("termination_cause" IS NULL OR "termination_cause" IN ('failure', 'cancellation', 'timeout')),
+  "termination_requested_at_ms" INTEGER CHECK ("termination_requested_at_ms" IS NULL OR "termination_requested_at_ms" >= 0),
+  "state_version" INTEGER NOT NULL CHECK ("state_version" >= 0),
+  "last_evidence_checksum" TEXT NOT NULL CHECK (length(trim("last_evidence_checksum")) > 0),
+  "last_effect_id" TEXT NOT NULL REFERENCES "nozzle_operation_effects" ("effect_id"),
+  "record_checksum" TEXT NOT NULL CHECK (length(trim("record_checksum")) > 0),
+  "record_json" TEXT NOT NULL CHECK (json_valid("record_json")),
+  "created_at_ms" INTEGER NOT NULL CHECK ("created_at_ms" >= 0),
+  "updated_at_ms" INTEGER NOT NULL CHECK ("updated_at_ms" >= "created_at_ms"),
+  CHECK (("termination_cause" IS NULL) = ("termination_requested_at_ms" IS NULL)),
+  CHECK (json_extract("record_json", '$.sagaId') = "saga_id"),
+  CHECK (json_extract("record_json", '$.descriptor.descriptorId') = "descriptor_id"),
+  CHECK (json_extract("record_json", '$.descriptor.version') = "descriptor_version"),
+  CHECK (json_extract("record_json", '$.descriptor.descriptorChecksum') = "descriptor_checksum"),
+  CHECK (json_extract("record_json", '$.idempotencyKey') = "idempotency_key"),
+  CHECK (json_extract("record_json", '$.inputChecksum') = "input_checksum"),
+  CHECK (json_extract("record_json", '$.deadlineAtMs') = "deadline_at_ms"),
+  CHECK (json_extract("record_json", '$.status') = "status"),
+  CHECK (json_extract("record_json", '$.terminationCause') IS "termination_cause"),
+  CHECK (json_extract("record_json", '$.terminationRequestedAtMs') IS "termination_requested_at_ms"),
+  CHECK (json_extract("record_json", '$.stateVersion') = "state_version")
+);`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_saga_action_attempts" (
+  "attempt_id" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("attempt_id")) BETWEEN 1 AND 512),
+  "saga_id" TEXT NOT NULL REFERENCES "nozzle_sagas" ("saga_id"),
+  "operation_id" TEXT NOT NULL,
+  "operation_step_id" TEXT NOT NULL,
+  "saga_step_id" TEXT NOT NULL CHECK (length(trim("saga_step_id")) BETWEEN 1 AND 255),
+  "phase" TEXT NOT NULL CHECK ("phase" IN ('forward', 'compensation')),
+  "purpose" TEXT NOT NULL CHECK ("purpose" IN ('effect', 'observation')),
+  "action_key" TEXT NOT NULL CHECK (length(trim("action_key")) > 0),
+  "idempotency_key" TEXT NOT NULL CHECK (length(trim("idempotency_key")) > 0),
+  "input_checksum" TEXT NOT NULL CHECK (length(trim("input_checksum")) > 0),
+  "input_json" TEXT NOT NULL CHECK (json_valid("input_json") AND length("input_json") <= 1048576),
+  "lease_key" TEXT NOT NULL,
+  "holder_id" TEXT NOT NULL,
+  "acquisition_id" TEXT NOT NULL,
+  "fencing_token" INTEGER NOT NULL CHECK ("fencing_token" >= 1),
+  "accepted_at_ms" INTEGER NOT NULL CHECK ("accepted_at_ms" >= 0),
+  FOREIGN KEY ("operation_id", "operation_step_id")
+    REFERENCES "nozzle_operation_steps" ("operation_id", "step_id")
+);`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_saga_action_attempt_outcomes" (
+  "attempt_id" TEXT PRIMARY KEY NOT NULL REFERENCES "nozzle_saga_action_attempts" ("attempt_id"),
+  "state" TEXT NOT NULL CHECK ("state" IN ('confirmed', 'not_applied', 'unknown', 'indeterminate', 'failed')),
+  "evidence_checksum" TEXT NOT NULL CHECK (length(trim("evidence_checksum")) > 0),
+  "evidence_json" TEXT NOT NULL CHECK (json_valid("evidence_json") AND length("evidence_json") <= 1048576),
+  "output_checksum" TEXT,
+  "output_json" TEXT CHECK ("output_json" IS NULL OR (json_valid("output_json") AND length("output_json") <= 1048576)),
+  "error_checksum" TEXT,
+  "error_json" TEXT CHECK ("error_json" IS NULL OR (json_valid("error_json") AND length("error_json") <= 1048576)),
+  "outcome_checksum" TEXT NOT NULL CHECK (length(trim("outcome_checksum")) > 0),
+  "completed_at_ms" INTEGER NOT NULL CHECK ("completed_at_ms" >= 0),
+  CHECK (("state" = 'confirmed') = ("output_json" IS NOT NULL)),
+  CHECK (("state" = 'confirmed') = ("output_checksum" IS NOT NULL)),
+  CHECK (("state" <> 'confirmed') = ("error_json" IS NOT NULL)),
+  CHECK (("state" <> 'confirmed') = ("error_checksum" IS NOT NULL)),
+  CHECK ("output_json" IS NULL OR "error_json" IS NULL)
 );`,
   `CREATE TABLE IF NOT EXISTS "nozzle_d1_resources" (
   "resource_id" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("resource_id")) > 0),
@@ -498,7 +574,8 @@ WHEN NOT EXISTS (
   WHERE "transition"."transition_id" = NEW."transition_id"
     AND "transition"."operation_id" = NEW."operation_id"
     AND "transition"."step_id" = NEW."step_id"
-    AND json_extract("transition"."to_record_json", '$.state') = 'succeeded'
+    AND (NEW."resource_kind" = 'saga'
+      OR json_extract("transition"."to_record_json", '$.state') = 'succeeded')
     AND "transition"."lease_key" = NEW."lease_key"
     AND "transition"."holder_id" = NEW."holder_id"
     AND "transition"."acquisition_id" = NEW."acquisition_id"
@@ -511,13 +588,18 @@ WHEN NOT EXISTS (
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_OPERATION_EFFECT_FENCED'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_operation_effect_source"
 BEFORE INSERT ON "nozzle_operation_effects"
-WHEN (NEW."from_state_version" IS NULL AND EXISTS (
+WHEN (NEW."resource_kind" = 'd1_database' AND NEW."from_state_version" IS NULL AND EXISTS (
   SELECT 1 FROM "nozzle_d1_resources"
-  WHERE NEW."resource_kind" = 'd1_database' AND "resource_id" = NEW."resource_id"
-)) OR (NEW."from_state_version" IS NOT NULL AND NOT EXISTS (
+  WHERE "resource_id" = NEW."resource_id"
+)) OR (NEW."resource_kind" = 'd1_database' AND NEW."from_state_version" IS NOT NULL AND NOT EXISTS (
   SELECT 1 FROM "nozzle_d1_resources"
-  WHERE NEW."resource_kind" = 'd1_database' AND "resource_id" = NEW."resource_id"
+  WHERE "resource_id" = NEW."resource_id"
     AND "state_version" = NEW."from_state_version"
+)) OR (NEW."resource_kind" = 'saga' AND NEW."from_state_version" IS NULL AND EXISTS (
+  SELECT 1 FROM "nozzle_sagas" WHERE "saga_id" = NEW."resource_id"
+)) OR (NEW."resource_kind" = 'saga' AND NEW."from_state_version" IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM "nozzle_sagas"
+  WHERE "saga_id" = NEW."resource_id" AND "state_version" = NEW."from_state_version"
 ))
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_OPERATION_EFFECT_SOURCE_MISMATCH'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_operation_effect_update"
@@ -526,6 +608,105 @@ BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_OPERATION_EFFECT_IMMUTABLE'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_operation_effect_delete"
 BEFORE DELETE ON "nozzle_operation_effects"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_OPERATION_EFFECT_PERSISTENT'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_insert"
+BEFORE INSERT ON "nozzle_sagas"
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_operation_effects"
+  WHERE "effect_id" = NEW."last_effect_id"
+    AND "resource_kind" = 'saga'
+    AND "resource_id" = NEW."saga_id"
+    AND "operation_id" = NEW."operation_id"
+    AND "from_state_version" IS NULL
+    AND "to_state_version" = 0
+    AND "evidence_checksum" = NEW."last_evidence_checksum"
+    AND "record_checksum" = NEW."record_checksum"
+    AND "record_json" = NEW."record_json"
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_EFFECT_REQUIRED'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_identity_update"
+BEFORE UPDATE ON "nozzle_sagas"
+WHEN NEW."saga_id" IS NOT OLD."saga_id"
+  OR NEW."operation_id" IS NOT OLD."operation_id"
+  OR NEW."descriptor_id" IS NOT OLD."descriptor_id"
+  OR NEW."descriptor_version" IS NOT OLD."descriptor_version"
+  OR NEW."descriptor_checksum" IS NOT OLD."descriptor_checksum"
+  OR NEW."descriptor_json" IS NOT OLD."descriptor_json"
+  OR NEW."idempotency_key" IS NOT OLD."idempotency_key"
+  OR NEW."input_checksum" IS NOT OLD."input_checksum"
+  OR NEW."deadline_at_ms" IS NOT OLD."deadline_at_ms"
+  OR NEW."created_at_ms" IS NOT OLD."created_at_ms"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_IDENTITY_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_update"
+BEFORE UPDATE ON "nozzle_sagas"
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_operation_effects"
+  WHERE "effect_id" = NEW."last_effect_id"
+    AND "resource_kind" = 'saga'
+    AND "resource_id" = OLD."saga_id"
+    AND "operation_id" = OLD."operation_id"
+    AND "from_state_version" = OLD."state_version"
+    AND "to_state_version" = NEW."state_version"
+    AND "evidence_checksum" = NEW."last_evidence_checksum"
+    AND "record_checksum" = NEW."record_checksum"
+    AND "record_json" = NEW."record_json"
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_EFFECT_REQUIRED'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_delete"
+BEFORE DELETE ON "nozzle_sagas"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_PERSISTENT'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_attempt_insert"
+BEFORE INSERT ON "nozzle_saga_action_attempts"
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_sagas" AS "saga"
+  JOIN "nozzle_operation_steps" AS "step"
+    ON "step"."operation_id" = NEW."operation_id"
+   AND "step"."step_id" = NEW."operation_step_id"
+  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = NEW."lease_key"
+  WHERE "saga"."saga_id" = NEW."saga_id"
+    AND "saga"."operation_id" = NEW."operation_id"
+    AND "step"."lease_key" = NEW."lease_key"
+    AND (
+      (NEW."purpose" = 'effect'
+       AND "step"."state" = 'running'
+       AND json_extract("step"."record_json", '$.activeAttemptId') = NEW."attempt_id"
+       AND "step"."fencing_token" = NEW."fencing_token")
+      OR
+      (NEW."purpose" = 'observation'
+       AND "step"."state" = 'unknown'
+       AND "step"."fencing_token" < NEW."fencing_token")
+    )
+    AND "lease"."holder_id" = NEW."holder_id"
+    AND "lease"."acquisition_id" = NEW."acquisition_id"
+    AND "lease"."fencing_token" = NEW."fencing_token"
+    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_ATTEMPT_FENCED'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_attempt_update"
+BEFORE UPDATE ON "nozzle_saga_action_attempts"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_ATTEMPT_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_attempt_delete"
+BEFORE DELETE ON "nozzle_saga_action_attempts"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_ATTEMPT_PERSISTENT'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_outcome_insert"
+BEFORE INSERT ON "nozzle_saga_action_attempt_outcomes"
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_saga_action_attempts" AS "attempt"
+  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = "attempt"."lease_key"
+  WHERE "attempt"."attempt_id" = NEW."attempt_id"
+    AND "lease"."holder_id" = "attempt"."holder_id"
+    AND "lease"."acquisition_id" = "attempt"."acquisition_id"
+    AND "lease"."fencing_token" = "attempt"."fencing_token"
+    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_FENCED'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_outcome_update"
+BEFORE UPDATE ON "nozzle_saga_action_attempt_outcomes"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_outcome_delete"
+BEFORE DELETE ON "nozzle_saga_action_attempt_outcomes"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_PERSISTENT'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_d1_resource_insert"
 BEFORE INSERT ON "nozzle_d1_resources"
 WHEN NOT EXISTS (
