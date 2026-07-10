@@ -12,6 +12,7 @@ import {
 import { assertTrustedSagaHandlerRegistry, type SagaHandlerRegistry } from "./saga-registry.js"
 import {
   SAGA_INIT_OPERATION_STEP_ID,
+  SAGA_SETTLE_OPERATION_STEP_ID,
   SAGA_TERMINATION_OPERATION_STEP_ID,
   sagaActionOperationStepId,
 } from "./saga-store.js"
@@ -239,6 +240,42 @@ export async function sealSagaOperationPlan(
     retryClassification: "idempotent",
     stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
   })
+  const settlement: OperationStepPlanInput = Object.freeze({
+    checkpoint: "reversible",
+    completionRole: "settlement",
+    dependsOn: [],
+    effectProtocol: "opaque",
+    idempotencyKey: `${input.operationIdempotencyKey}:settle`,
+    inputChecksum: await valueChecksum(
+      digest,
+      input.descriptor.descriptorChecksum,
+      input.sagaId,
+      SAGA_SETTLE_OPERATION_STEP_ID,
+      "input",
+      input.inputChecksum,
+    ),
+    leaseKey: input.leaseKey,
+    postconditionChecksum: await valueChecksum(
+      digest,
+      input.descriptor.descriptorChecksum,
+      input.sagaId,
+      SAGA_SETTLE_OPERATION_STEP_ID,
+      "postcondition",
+      input.descriptor.descriptorChecksum,
+    ),
+    preconditionChecksum: await valueChecksum(
+      digest,
+      input.descriptor.descriptorChecksum,
+      input.sagaId,
+      SAGA_SETTLE_OPERATION_STEP_ID,
+      "precondition",
+      input.inputChecksum,
+    ),
+    recoveryInstructions:
+      "Settle only from a terminal checksum-verified saga projection after every conditional path is classified.",
+    retryClassification: "never",
+    stepId: SAGA_SETTLE_OPERATION_STEP_ID,
+  })
   const actions: OperationStepPlanInput[] = []
   for (const step of input.descriptor.steps) {
     actions.push(await actionStep(input, step, "forward", digest))
@@ -251,7 +288,7 @@ export async function sealSagaOperationPlan(
       inputChecksum: input.inputChecksum,
       operationId: input.operationId,
       operationType: `saga:${input.descriptor.descriptorId}@${input.descriptor.version}`,
-      steps: [init, termination, ...actions],
+      steps: [init, settlement, termination, ...actions],
     },
     digest,
   )

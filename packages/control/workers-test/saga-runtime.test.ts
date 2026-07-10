@@ -128,8 +128,9 @@ describe("real workerd D1 saga projection", () => {
       digest,
     )
     expect(registry.manifest.manifestChecksum).toMatch(/^[0-9a-f]{64}$/u)
-    expect(plan.steps).toHaveLength(4)
-    expect(plan.steps.filter((step) => step.activation === "required")).toHaveLength(1)
+    expect(plan.steps).toHaveLength(5)
+    expect(plan.steps.filter((step) => step.activation === "required")).toHaveLength(2)
+    expect(plan.steps.filter((step) => step.completionRole === "settlement")).toHaveLength(1)
     expect(plan.steps.filter((step) => step.effectProtocol === "saga_receipt")).toHaveLength(2)
     await expect(
       invokeSagaEffectHandler(registry.effect(forwardAction), {

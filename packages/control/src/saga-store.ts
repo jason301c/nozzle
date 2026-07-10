@@ -27,6 +27,7 @@ const RECORD_DOMAIN = "nozzle.saga-record.v1"
 const MAX_IDENTITY_BYTES = 512
 
 export const SAGA_INIT_OPERATION_STEP_ID = "saga:init"
+export const SAGA_SETTLE_OPERATION_STEP_ID = "saga:settle"
 export const SAGA_TERMINATION_OPERATION_STEP_ID = "saga:termination"
 
 export function sagaActionOperationStepId(stepId: string, phase: SagaActionPhase): string {

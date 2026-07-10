@@ -9,6 +9,7 @@ import { sealSagaOperationPlan } from "../src/saga-plan.js"
 import { type SagaHandlerRegistration, sealSagaHandlerRegistry } from "../src/saga-registry.js"
 import {
   SAGA_INIT_OPERATION_STEP_ID,
+  SAGA_SETTLE_OPERATION_STEP_ID,
   SAGA_TERMINATION_OPERATION_STEP_ID,
   sagaActionOperationStepId,
 } from "../src/saga-store.js"
@@ -129,6 +130,7 @@ describe("saga operation plan compiler", () => {
     const plan = await sealSagaOperationPlan(input, digest)
     const byId = new Map(plan.steps.map((step) => [step.stepId, step] as const))
     const init = byId.get(SAGA_INIT_OPERATION_STEP_ID)
+    const settlement = byId.get(SAGA_SETTLE_OPERATION_STEP_ID)
     const termination = byId.get(SAGA_TERMINATION_OPERATION_STEP_ID)
     const chargeForward = byId.get(sagaActionOperationStepId("charge", "forward"))
     const chargeCompensation = byId.get(sagaActionOperationStepId("charge", "compensation"))
@@ -140,8 +142,14 @@ describe("saga operation plan compiler", () => {
       operationType: "saga:checkout@1",
       schemaVersion: 1,
     })
-    expect(plan.steps).toHaveLength(5)
+    expect(plan.steps).toHaveLength(6)
     expect(init).toMatchObject({ activation: "required", effectProtocol: "opaque" })
+    expect(settlement).toMatchObject({
+      activation: "required",
+      completionRole: "settlement",
+      effectProtocol: "opaque",
+      retryClassification: "never",
+    })
     expect(termination).toMatchObject({ activation: "conditional", effectProtocol: "opaque" })
     expect(chargeForward).toMatchObject({
       activation: "conditional",

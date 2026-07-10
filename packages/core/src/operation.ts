@@ -22,11 +22,13 @@ export type RetryClassification = "idempotent" | "never" | "reconcile_first"
 export type CheckpointKind = "irreversible" | "reversible"
 export type EffectProtocol = "opaque" | "provider_receipt" | "saga_receipt"
 export type StepActivation = "conditional" | "required"
+export type StepCompletionRole = "settlement" | "work"
 export type DigestFunction = (input: Uint8Array) => Promise<string> | string
 
 export interface OperationStepPlanInput {
   readonly activation?: StepActivation
   readonly checkpoint: CheckpointKind
+  readonly completionRole?: StepCompletionRole
   readonly dependsOn?: readonly string[]
   readonly effectProtocol?: EffectProtocol
   readonly idempotencyKey: string
@@ -50,6 +52,7 @@ export interface OperationPlanInput {
 
 export interface OperationStepPlan extends OperationStepPlanInput {
   readonly activation: StepActivation
+  readonly completionRole: StepCompletionRole
   readonly dependsOn: readonly string[]
   readonly effectProtocol: EffectProtocol
 }
@@ -288,6 +291,10 @@ function normalizeStep(step: OperationStepPlanInput): OperationStepPlan {
   if (!(["conditional", "required"] as const).includes(activation)) {
     configurationError("Step activation is invalid.")
   }
+  const completionRole = step.completionRole ?? "work"
+  if (!(["settlement", "work"] as const).includes(completionRole)) {
+    configurationError("Step completion role is invalid.")
+  }
   const effectProtocol = step.effectProtocol ?? "opaque"
   if (!(["opaque", "provider_receipt", "saga_receipt"] as const).includes(effectProtocol)) {
     configurationError("Step effect protocol is invalid.")
@@ -300,6 +307,7 @@ function normalizeStep(step: OperationStepPlanInput): OperationStepPlan {
   return Object.freeze({
     ...step,
     activation,
+    completionRole,
     dependsOn: Object.freeze(dependsOn),
     effectProtocol,
   })
@@ -330,6 +338,13 @@ function normalizePlan(input: OperationPlanInput): Omit<OperationPlan, "planChec
   }
   if (!steps.some((step) => step.activation === "required")) {
     configurationError("An operation requires at least one required step.")
+  }
+  const settlements = steps.filter((step) => step.completionRole === "settlement")
+  if (settlements.length > 1) {
+    configurationError("An operation can declare at most one settlement step.")
+  }
+  if (settlements[0]?.activation === "conditional") {
+    configurationError("An operation settlement step must be required.")
   }
   for (const step of steps) {
     if (step.dependsOn.includes(step.stepId)) configurationError("A step cannot depend on itself.")
@@ -401,6 +416,7 @@ function planChecksumValues(plan: Omit<OperationPlan, "planChecksum">): readonly
       step.preconditionChecksum,
       step.postconditionChecksum,
       step.activation,
+      step.completionRole,
       step.effectProtocol,
       step.retryClassification,
       step.checkpoint,
@@ -765,6 +781,17 @@ function updateStep(
 
 export function operationStatus(operation: OperationRecord): OperationStatus {
   const states = Object.values(operation.steps).map((step) => step.state)
+  const settlement = operation.plan.steps.find((step) => step.completionRole === "settlement")
+  if (settlement !== undefined) {
+    const state = operation.steps[settlement.stepId]?.state
+    if (state === "succeeded") return "succeeded"
+    if (state === "intervention_required") return "intervention_required"
+    if (state === "failed") return "failed"
+    if (state === "unknown") return "reconciling"
+    if (states.includes("unknown")) return "reconciling"
+    if (state === "running" || states.includes("running")) return "running"
+    return states.every((candidate) => candidate === "pending") ? "planned" : "paused"
+  }
   if (states.every((state) => state === "succeeded" || state === "not_required")) {
     return "succeeded"
   }

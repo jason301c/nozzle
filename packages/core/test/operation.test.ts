@@ -152,7 +152,14 @@ describe("immutable operation plans", () => {
     const noDependencies = { ...step("standalone") }
     delete noDependencies.dependsOn
     await expect(sealOperationPlan(planInput([noDependencies]), digest)).resolves.toMatchObject({
-      steps: [{ activation: "required", dependsOn: [], effectProtocol: "opaque" }],
+      steps: [
+        {
+          activation: "required",
+          completionRole: "work",
+          dependsOn: [],
+          effectProtocol: "opaque",
+        },
+      ],
     })
   })
 
@@ -194,7 +201,16 @@ describe("immutable operation plans", () => {
     planInput([step("a", { retryClassification: "bad" as "never" })]),
     planInput([step("a", { effectProtocol: "bad" as "opaque" })]),
     planInput([step("a", { activation: "bad" as "required" })]),
+    planInput([step("a", { completionRole: "bad" as "work" })]),
     planInput([step("a", { activation: "conditional" })]),
+    planInput([
+      step("a", { completionRole: "settlement" }),
+      step("b", { completionRole: "settlement" }),
+    ]),
+    planInput([
+      step("a"),
+      step("settle", { activation: "conditional", completionRole: "settlement" }),
+    ]),
     planInput([step("", {})]),
     planInput([step("a", { recoveryInstructions: "" })]),
   ])("rejects malformed or ambiguous plan input", async (input) => {
@@ -635,6 +651,67 @@ describe("sealed irreversible authorization", () => {
 })
 
 describe("operation crash, resume, and idempotency guards", () => {
+  it("defers top-level terminal status to an explicit required settlement step", async () => {
+    const activeLease = acquire()
+    const operation = createOperationRecord(
+      await plan([step("work"), step("settle", { completionRole: "settlement" })]),
+    )
+    expect(operationStatus(operation)).toBe("planned")
+    const running = begin(operation, activeLease, {
+      idempotencyKey: "idempotency-work",
+      precondition: "pre-work",
+      stepId: "work",
+    }).operation
+    expect(operationStatus(running)).toBe("running")
+    const failedWork = recordStepFailure(running, {
+      attemptId: "attempt-1",
+      errorChecksum: "classified-failure",
+      outcome: "permanent",
+      stepId: "work",
+    })
+    expect(failedWork.steps.work?.state).toBe("failed")
+    expect(operationStatus(failedWork)).toBe("paused")
+    const settling = begin(failedWork, activeLease, {
+      idempotencyKey: "idempotency-settle",
+      precondition: "pre-settle",
+      stepId: "settle",
+    }).operation
+    const settledSuccess = recordStepSuccess(settling, {
+      attemptId: "attempt-1",
+      observedPostconditionChecksum: "post-settle",
+      resultChecksum: "terminal-saga-result",
+      stepId: "settle",
+    })
+    expect(operationStatus(settledSuccess)).toBe("succeeded")
+    const settledFailure = recordStepFailure(settling, {
+      attemptId: "attempt-1",
+      errorChecksum: "terminal-saga-failure",
+      outcome: "permanent",
+      stepId: "settle",
+    })
+    expect(operationStatus(settledFailure)).toBe("failed")
+    const unknownSettlement = recordStepFailure(settling, {
+      attemptId: "attempt-1",
+      errorChecksum: "terminal-saga-unknown",
+      outcome: "unknown",
+      stepId: "settle",
+    })
+    expect(operationStatus(unknownSettlement)).toBe("reconciling")
+    const intervention = recordStepReconciliation(unknownSettlement, {
+      evidenceChecksum: "terminal-saga-indeterminate",
+      outcome: "indeterminate",
+      stepId: "settle",
+    })
+    expect(operationStatus(intervention)).toBe("intervention_required")
+    const unknownWork = recordStepFailure(running, {
+      attemptId: "attempt-1",
+      errorChecksum: "work-unknown",
+      outcome: "unknown",
+      stepId: "work",
+    })
+    expect(operationStatus(unknownWork)).toBe("reconciling")
+  })
+
   it("settles unused conditional steps with durable evidence instead of fake success", async () => {
     const activeLease = acquire()
     const operation = createOperationRecord(
