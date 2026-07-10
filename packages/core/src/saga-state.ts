@@ -1,6 +1,8 @@
 import { NozzleError } from "./errors.js"
+import type { DigestFunction } from "./operation.js"
 import {
   assertTrustedSagaDescriptor,
+  loadSagaDescriptor,
   type SagaActionReference,
   type SagaDescriptor,
 } from "./saga.js"
@@ -779,4 +781,370 @@ export function markSagaActionNotDispatched(
   }
   changes.steps = stepWithAction(record, input.stepId, input.phase, next)
   return withRecord(record, changes)
+}
+
+const ACTION_RECORD_KEYS = new Set([
+  "activeAttemptId",
+  "attempts",
+  "errorChecksum",
+  "idempotencyKey",
+  "lastAttemptId",
+  "nextAttemptAtMs",
+  "observationEvidenceChecksum",
+  "resultChecksum",
+  "state",
+])
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function persisted(condition: unknown, message: string): asserts condition {
+  if (!condition) intervention(message)
+}
+
+function persistedAction(
+  value: unknown,
+  expectedIdempotencyKey: string,
+  allowNotRequired: boolean,
+): SagaActionRecord {
+  persisted(plainRecord(value), "Persisted saga action record is malformed.")
+  persisted(
+    Object.keys(value).every((key) => ACTION_RECORD_KEYS.has(key)),
+    "Persisted saga action record contains unknown fields.",
+  )
+  persisted(
+    typeof value.attempts === "number" &&
+      Number.isSafeInteger(value.attempts) &&
+      value.attempts >= 0,
+    "Persisted saga action attempt count is malformed.",
+  )
+  persisted(
+    typeof value.nextAttemptAtMs === "number" &&
+      Number.isSafeInteger(value.nextAttemptAtMs) &&
+      value.nextAttemptAtMs >= 0,
+    "Persisted saga retry time is malformed.",
+  )
+  persisted(
+    typeof value.idempotencyKey === "string" && value.idempotencyKey === expectedIdempotencyKey,
+    "Persisted saga action idempotency key is contradictory.",
+  )
+  persisted(
+    typeof value.state === "string" &&
+      (SAGA_ACTION_STATES as readonly string[]).includes(value.state),
+    "Persisted saga action state is unsupported.",
+  )
+  const state = value.state as SagaActionState
+  persisted(
+    allowNotRequired || state !== "not_required",
+    "Persisted forward action cannot be not-required.",
+  )
+  const optionalStrings = [
+    "activeAttemptId",
+    "errorChecksum",
+    "lastAttemptId",
+    "observationEvidenceChecksum",
+    "resultChecksum",
+  ] as const
+  for (const key of optionalStrings) {
+    persisted(
+      value[key] === undefined || (typeof value[key] === "string" && value[key].trim().length > 0),
+      `Persisted saga action ${key} is malformed.`,
+    )
+  }
+  const noAttempt = state === "pending" || state === "not_required"
+  persisted(
+    noAttempt ? value.attempts === 0 : (value.attempts as number) >= 1,
+    "Persisted saga action state contradicts its attempt count.",
+  )
+  persisted(
+    (state === "running") === (value.activeAttemptId !== undefined),
+    "Persisted saga active attempt contradicts its state.",
+  )
+  persisted(
+    noAttempt ? value.lastAttemptId === undefined : value.lastAttemptId !== undefined,
+    "Persisted saga last attempt contradicts its state.",
+  )
+  persisted(
+    (state === "succeeded") === (value.resultChecksum !== undefined),
+    "Persisted saga result contradicts its state.",
+  )
+  const errorState =
+    state === "retryable_failed" ||
+    state === "unknown" ||
+    state === "failed" ||
+    state === "intervention_required"
+  persisted(
+    errorState === (value.errorChecksum !== undefined),
+    "Persisted saga error evidence contradicts its state.",
+  )
+  persisted(
+    state === "retryable_failed"
+      ? (value.nextAttemptAtMs as number) > 0
+      : value.nextAttemptAtMs === 0,
+    "Persisted saga retry time contradicts its state.",
+  )
+  persisted(
+    value.observationEvidenceChecksum === undefined ||
+      state === "succeeded" ||
+      state === "retryable_failed" ||
+      state === "failed" ||
+      state === "intervention_required",
+    "Persisted saga observation evidence contradicts its state.",
+  )
+  return frozenAction({
+    ...(value.activeAttemptId === undefined
+      ? {}
+      : { activeAttemptId: value.activeAttemptId as string }),
+    attempts: value.attempts as number,
+    ...(value.errorChecksum === undefined ? {} : { errorChecksum: value.errorChecksum as string }),
+    idempotencyKey: value.idempotencyKey,
+    ...(value.lastAttemptId === undefined ? {} : { lastAttemptId: value.lastAttemptId as string }),
+    nextAttemptAtMs: value.nextAttemptAtMs as number,
+    ...(value.observationEvidenceChecksum === undefined
+      ? {}
+      : { observationEvidenceChecksum: value.observationEvidenceChecksum as string }),
+    ...(value.resultChecksum === undefined
+      ? {}
+      : { resultChecksum: value.resultChecksum as string }),
+    state,
+  })
+}
+
+async function loadSagaRecordUnchecked(
+  candidate: unknown,
+  digest: DigestFunction,
+): Promise<SagaRecord> {
+  persisted(plainRecord(candidate), "Persisted saga record is malformed.")
+  const expectedKeys = [
+    "deadlineAtMs",
+    "descriptor",
+    "idempotencyKey",
+    "inputChecksum",
+    "sagaId",
+    "stateVersion",
+    "status",
+    "steps",
+    "terminationCause",
+    "terminationRequestedAtMs",
+  ]
+  persisted(
+    Object.keys(candidate).length === expectedKeys.length &&
+      expectedKeys.every((key) => Object.hasOwn(candidate, key)),
+    "Persisted saga record fields are malformed.",
+  )
+  persisted(
+    typeof candidate.sagaId === "string" && candidate.sagaId.trim().length > 0,
+    "Persisted saga ID is malformed.",
+  )
+  persisted(
+    typeof candidate.idempotencyKey === "string" && candidate.idempotencyKey.trim().length > 0,
+    "Persisted saga idempotency key is malformed.",
+  )
+  persisted(
+    typeof candidate.inputChecksum === "string" && candidate.inputChecksum.trim().length > 0,
+    "Persisted saga input checksum is malformed.",
+  )
+  persisted(
+    typeof candidate.deadlineAtMs === "number" &&
+      Number.isSafeInteger(candidate.deadlineAtMs) &&
+      candidate.deadlineAtMs >= 0,
+    "Persisted saga deadline is malformed.",
+  )
+  persisted(
+    typeof candidate.stateVersion === "number" &&
+      Number.isSafeInteger(candidate.stateVersion) &&
+      candidate.stateVersion >= 0,
+    "Persisted saga state version is malformed.",
+  )
+  persisted(
+    typeof candidate.status === "string" &&
+      [
+        "cancelled",
+        "compensating",
+        "failed",
+        "intervention_required",
+        "planned",
+        "running",
+        "succeeded",
+        "timed_out",
+      ].includes(candidate.status),
+    "Persisted saga status is unsupported.",
+  )
+  const validCause =
+    candidate.terminationCause === null ||
+    candidate.terminationCause === "cancellation" ||
+    candidate.terminationCause === "failure" ||
+    candidate.terminationCause === "timeout"
+  persisted(validCause, "Persisted saga termination cause is unsupported.")
+  persisted(
+    candidate.terminationRequestedAtMs === null ||
+      (typeof candidate.terminationRequestedAtMs === "number" &&
+        Number.isSafeInteger(candidate.terminationRequestedAtMs) &&
+        candidate.terminationRequestedAtMs >= 0),
+    "Persisted saga termination time is malformed.",
+  )
+  persisted(
+    (candidate.terminationCause === null) === (candidate.terminationRequestedAtMs === null),
+    "Persisted saga termination cause and time are contradictory.",
+  )
+  const descriptor = await loadSagaDescriptor(candidate.descriptor, digest)
+  persisted(plainRecord(candidate.steps), "Persisted saga steps are malformed.")
+  const expectedStepIds = descriptor.steps.map((step) => step.stepId).sort()
+  const actualStepIds = Object.keys(candidate.steps).sort()
+  persisted(
+    expectedStepIds.length === actualStepIds.length &&
+      expectedStepIds.every((stepId, index) => stepId === actualStepIds[index]),
+    "Persisted saga step membership contradicts its descriptor.",
+  )
+  const steps: Record<string, SagaStepRecord> = {}
+  const attemptIds = new Set<string>()
+  let uncertainActions = 0
+  for (const step of descriptor.steps) {
+    const value = candidate.steps[step.stepId]
+    persisted(
+      plainRecord(value) &&
+        Object.keys(value).length === 3 &&
+        Object.hasOwn(value, "compensation") &&
+        Object.hasOwn(value, "forward") &&
+        Object.hasOwn(value, "inputChecksum"),
+      "Persisted saga step record is malformed.",
+    )
+    persisted(
+      typeof value.inputChecksum === "string" && value.inputChecksum.trim().length > 0,
+      "Persisted saga step input checksum is malformed.",
+    )
+    const forward = persistedAction(
+      value.forward,
+      actionIdempotencyKey(candidate.sagaId, step.stepId, "forward"),
+      false,
+    )
+    const compensation = persistedAction(
+      value.compensation,
+      actionIdempotencyKey(candidate.sagaId, step.stepId, "compensation"),
+      step.irreversible,
+    )
+    persisted(
+      forward.attempts <= step.maxAttempts && compensation.attempts <= step.maxAttempts,
+      "Persisted saga action attempts exceed the sealed retry limit.",
+    )
+    persisted(
+      (forward.state !== "retryable_failed" || forward.attempts < step.maxAttempts) &&
+        (compensation.state !== "retryable_failed" || compensation.attempts < step.maxAttempts),
+      "Persisted saga retryable action has exhausted its sealed retry limit.",
+    )
+    for (const action of [forward, compensation]) {
+      persisted(
+        action.activeAttemptId === undefined || action.activeAttemptId === action.lastAttemptId,
+        "Persisted saga active and last attempt identities are contradictory.",
+      )
+      if (action.lastAttemptId !== undefined) {
+        persisted(
+          !attemptIds.has(action.lastAttemptId),
+          "Persisted saga reuses an attempt identity across actions.",
+        )
+        attemptIds.add(action.lastAttemptId)
+      }
+    }
+    persisted(
+      step.irreversible
+        ? compensation.state === "not_required"
+        : compensation.state !== "not_required",
+      "Persisted saga compensation state contradicts step reversibility.",
+    )
+    persisted(
+      compensation.attempts === 0 || forward.state === "succeeded",
+      "Persisted saga compensation started before confirmed forward application.",
+    )
+    if (forward.state === "running" || forward.state === "unknown") uncertainActions += 1
+    if (compensation.state === "running" || compensation.state === "unknown") uncertainActions += 1
+    steps[step.stepId] = Object.freeze({
+      compensation,
+      forward,
+      inputChecksum: value.inputChecksum,
+    })
+  }
+  persisted(uncertainActions <= 1, "Persisted saga has multiple in-flight or unknown actions.")
+  let priorSucceeded = true
+  for (const step of descriptor.steps) {
+    const current = steps[step.stepId] as SagaStepRecord
+    persisted(
+      current.forward.attempts === 0 || priorSucceeded,
+      "Persisted saga forward attempts violate serial descriptor order.",
+    )
+    if (current.forward.state !== "succeeded") priorSucceeded = false
+  }
+  let laterCompensationSettled = true
+  for (const step of [...descriptor.steps].reverse()) {
+    const current = steps[step.stepId] as SagaStepRecord
+    persisted(
+      current.compensation.attempts === 0 || laterCompensationSettled,
+      "Persisted saga compensation attempts violate reverse descriptor order.",
+    )
+    if (
+      current.forward.state === "succeeded" &&
+      (step.irreversible || current.compensation.state !== "succeeded")
+    ) {
+      laterCompensationSettled = false
+    }
+  }
+  persisted(
+    candidate.terminationCause !== null ||
+      descriptor.steps.every(
+        (step) => (steps[step.stepId] as SagaStepRecord).compensation.attempts === 0,
+      ),
+    "Persisted saga compensation exists without a termination cause.",
+  )
+  persisted(
+    candidate.terminationCause !== "failure" ||
+      descriptor.steps.some(
+        (step) => (steps[step.stepId] as SagaStepRecord).forward.state === "failed",
+      ),
+    "Persisted saga failure termination has no failed forward action.",
+  )
+  const record: SagaRecord = Object.freeze({
+    deadlineAtMs: candidate.deadlineAtMs,
+    descriptor,
+    idempotencyKey: candidate.idempotencyKey,
+    inputChecksum: candidate.inputChecksum,
+    sagaId: candidate.sagaId,
+    stateVersion: candidate.stateVersion,
+    status: candidate.status as SagaStatus,
+    steps: Object.freeze(steps),
+    terminationCause: candidate.terminationCause as SagaTerminationCause | null,
+    terminationRequestedAtMs: candidate.terminationRequestedAtMs,
+  })
+  const expectedStatus = record.stateVersion === 0 ? "planned" : settledStatus(record)
+  persisted(
+    record.status === expectedStatus,
+    "Persisted saga status contradicts its action states.",
+  )
+  persisted(
+    record.stateVersion !== 0 ||
+      descriptor.steps.every((step) => {
+        const current = record.steps[step.stepId] as SagaStepRecord
+        return (
+          current.forward.state === "pending" &&
+          current.compensation.state === (step.irreversible ? "not_required" : "pending")
+        )
+      }),
+    "Initial persisted saga contains action progress.",
+  )
+  return record
+}
+
+export async function loadSagaRecord(
+  candidate: unknown,
+  digest: DigestFunction,
+): Promise<SagaRecord> {
+  try {
+    return await loadSagaRecordUnchecked(candidate, digest)
+  } catch (error) {
+    if (error instanceof NozzleError && error.code === "OperationInterventionRequiredError") {
+      throw error
+    }
+    return intervention("Persisted saga record could not be reconstructed safely.")
+  }
 }

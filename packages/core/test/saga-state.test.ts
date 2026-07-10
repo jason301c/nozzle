@@ -9,6 +9,7 @@ import {
 import {
   beginSagaAction,
   createSagaRecord,
+  loadSagaRecord,
   markRunningSagaActionUnknown,
   markSagaActionNotDispatched,
   nextSagaCommand,
@@ -122,6 +123,28 @@ function succeed(
 
 function expectCode(callback: () => unknown, code: string): void {
   expect(callback).toThrowError(expect.objectContaining({ code }))
+}
+
+async function expectAsyncCode(promise: Promise<unknown>, code: string): Promise<void> {
+  await expect(promise).rejects.toMatchObject({ code })
+}
+
+type MutableRecord = Record<string, unknown>
+
+function mutableRecord(value: unknown): MutableRecord {
+  return value as MutableRecord
+}
+
+function mutableStep(candidate: MutableRecord, stepId: string): MutableRecord {
+  return mutableRecord(mutableRecord(candidate.steps)[stepId])
+}
+
+function mutableAction(
+  candidate: MutableRecord,
+  stepId: string,
+  phase: SagaActionPhase,
+): MutableRecord {
+  return mutableRecord(mutableStep(candidate, stepId)[phase])
 }
 
 describe("serial saga state machine", () => {
@@ -845,6 +868,350 @@ describe("serial saga state machine", () => {
       stepId: "a",
     })
     expect(cancelledNotApplied.status).toBe("cancelled")
+  })
+
+  it("reconstructs every durable saga action phase without trusting object identity", async () => {
+    const initial = await saga()
+    const running = execute(initial, "a", "forward", "a-1", 1_000)
+    const unknown = markRunningSagaActionUnknown(running, {
+      attemptId: "a-1",
+      errorChecksum: "dispatch-uncertain",
+      phase: "forward",
+      stepId: "a",
+    })
+    const retryable = recordSagaActionFailure(running, {
+      attemptId: "a-1",
+      errorChecksum: "retryable",
+      outcome: "definitely_not_applied_retryable",
+      phase: "forward",
+      serverTimeMs: 1_001,
+      stepId: "a",
+    })
+    const observed = recordSagaObservation(unknown, {
+      evidenceChecksum: "observed-applied",
+      outcome: "applied",
+      phase: "forward",
+      resultChecksum: "result-a",
+      serverTimeMs: 1_002,
+      stepId: "a",
+    })
+
+    let compensating = succeed(running, "a", "forward", "a-1", 1_001)
+    compensating = execute(compensating, "b", "forward", "b-1", 1_002)
+    compensating = recordSagaActionFailure(compensating, {
+      attemptId: "b-1",
+      errorChecksum: "terminal-b",
+      outcome: "definitely_not_applied_terminal",
+      phase: "forward",
+      serverTimeMs: 1_003,
+      stepId: "b",
+    })
+    const compensatingRunning = execute(compensating, "a", "compensation", "a-compensate-1", 1_004)
+    const compensatingUnknown = markRunningSagaActionUnknown(compensatingRunning, {
+      attemptId: "a-compensate-1",
+      errorChecksum: "compensation-uncertain",
+      phase: "compensation",
+      stepId: "a",
+    })
+    const compensated = succeed(compensatingRunning, "a", "compensation", "a-compensate-1", 1_005)
+
+    const irreversibleInitial = await saga([irreversibleStep("commit")])
+    let irreversible = execute(irreversibleInitial, "commit", "forward", "commit-1", 1_000)
+    irreversible = succeed(irreversible, "commit", "forward", "commit-1", 1_001)
+
+    for (const record of [
+      initial,
+      running,
+      unknown,
+      retryable,
+      observed,
+      compensating,
+      compensatingRunning,
+      compensatingUnknown,
+      compensated,
+      irreversibleInitial,
+      irreversible,
+    ]) {
+      const loaded = await loadSagaRecord(structuredClone(record), digest)
+      expect(loaded).toEqual(record)
+      expect(loaded).not.toBe(record)
+      expect(Object.isFrozen(loaded)).toBe(true)
+      expect(Object.isFrozen(loaded.steps)).toBe(true)
+      expect(Object.isFrozen(loaded.steps[loaded.descriptor.steps[0]?.stepId as string])).toBe(true)
+    }
+  })
+
+  it("fails closed on malformed or contradictory persisted saga projections", async () => {
+    const initial = await saga()
+    const running = execute(initial, "a", "forward", "a-1", 1_000)
+    const irreversible = await saga([irreversibleStep("commit")])
+
+    for (const candidate of [null, [], new Date(), Object.create(null)]) {
+      await expectAsyncCode(loadSagaRecord(candidate, digest), "OperationInterventionRequiredError")
+    }
+
+    const initialMutations: readonly ((candidate: MutableRecord) => void)[] = [
+      (candidate) => {
+        candidate.extra = true
+      },
+      (candidate) => {
+        delete candidate.status
+      },
+      (candidate) => {
+        candidate.sagaId = ""
+      },
+      (candidate) => {
+        candidate.idempotencyKey = 1
+      },
+      (candidate) => {
+        candidate.inputChecksum = " "
+      },
+      (candidate) => {
+        candidate.deadlineAtMs = -1
+      },
+      (candidate) => {
+        candidate.deadlineAtMs = 1.5
+      },
+      (candidate) => {
+        candidate.stateVersion = -1
+      },
+      (candidate) => {
+        candidate.stateVersion = Number.MAX_SAFE_INTEGER + 1
+      },
+      (candidate) => {
+        candidate.status = "paused"
+      },
+      (candidate) => {
+        candidate.terminationCause = "operator"
+      },
+      (candidate) => {
+        candidate.terminationRequestedAtMs = -1
+      },
+      (candidate) => {
+        candidate.terminationCause = "timeout"
+      },
+      (candidate) => {
+        mutableRecord(candidate.descriptor).descriptorChecksum = "tampered"
+      },
+      (candidate) => {
+        candidate.steps = []
+      },
+      (candidate) => {
+        mutableRecord(candidate.steps).ghost = mutableStep(candidate, "a")
+      },
+      (candidate) => {
+        delete mutableRecord(candidate.steps).a
+      },
+      (candidate) => {
+        mutableRecord(candidate.steps).a = null
+      },
+      (candidate) => {
+        mutableStep(candidate, "a").extra = true
+      },
+      (candidate) => {
+        delete mutableStep(candidate, "a").forward
+      },
+      (candidate) => {
+        mutableStep(candidate, "a").inputChecksum = ""
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").extra = true
+      },
+      (candidate) => {
+        delete mutableAction(candidate, "a", "forward").attempts
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").attempts = 0.5
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").nextAttemptAtMs = -1
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").idempotencyKey = "wrong"
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").state = "lost"
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").state = "not_required"
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").errorChecksum = ""
+      },
+      (candidate) => {
+        const action = mutableAction(candidate, "a", "forward")
+        action.state = "failed"
+        action.attempts = 0
+      },
+      (candidate) => {
+        const action = mutableAction(candidate, "a", "forward")
+        action.state = "running"
+        action.attempts = 1
+        action.lastAttemptId = "a-1"
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").lastAttemptId = "a-1"
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").resultChecksum = "unexpected"
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").errorChecksum = "unexpected"
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").nextAttemptAtMs = 1_001
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").observationEvidenceChecksum = "unexpected"
+      },
+      (candidate) => {
+        const compensation = mutableAction(candidate, "a", "compensation")
+        compensation.state = "running"
+        compensation.attempts = 1
+        compensation.activeAttemptId = "a-c-1"
+        compensation.lastAttemptId = "a-c-1"
+      },
+      (candidate) => {
+        const forward = mutableAction(candidate, "b", "forward")
+        forward.state = "running"
+        forward.attempts = 1
+        forward.activeAttemptId = "b-1"
+        forward.lastAttemptId = "b-1"
+        candidate.stateVersion = 1
+        candidate.status = "running"
+      },
+      (candidate) => {
+        candidate.stateVersion = 1
+      },
+      (candidate) => {
+        candidate.terminationCause = "failure"
+        candidate.terminationRequestedAtMs = 1_000
+        candidate.stateVersion = 1
+        candidate.status = "failed"
+      },
+    ]
+
+    for (const mutate of initialMutations) {
+      const candidate = mutableRecord(structuredClone(initial))
+      mutate(candidate)
+      await expectAsyncCode(loadSagaRecord(candidate, digest), "OperationInterventionRequiredError")
+    }
+
+    const runningMutations: readonly ((candidate: MutableRecord) => void)[] = [
+      (candidate) => {
+        candidate.stateVersion = 0
+        candidate.status = "planned"
+      },
+      (candidate) => {
+        candidate.status = "succeeded"
+      },
+      (candidate) => {
+        const action = mutableAction(candidate, "a", "forward")
+        action.activeAttemptId = ""
+      },
+      (candidate) => {
+        const action = mutableAction(candidate, "a", "forward")
+        action.activeAttemptId = "other-attempt"
+      },
+      (candidate) => {
+        mutableAction(candidate, "a", "forward").attempts = 4
+      },
+      (candidate) => {
+        const action = mutableAction(candidate, "a", "forward")
+        action.resultChecksum = "unexpected"
+      },
+      (candidate) => {
+        const action = mutableAction(candidate, "b", "forward")
+        action.state = "unknown"
+        action.attempts = 1
+        action.errorChecksum = "unknown-b"
+        action.lastAttemptId = "b-1"
+      },
+    ]
+    for (const mutate of runningMutations) {
+      const candidate = mutableRecord(structuredClone(running))
+      mutate(candidate)
+      await expectAsyncCode(loadSagaRecord(candidate, digest), "OperationInterventionRequiredError")
+    }
+
+    const exhaustedRetry = mutableRecord(structuredClone(running))
+    const exhaustedAction = mutableAction(exhaustedRetry, "a", "forward")
+    delete exhaustedAction.activeAttemptId
+    exhaustedAction.state = "retryable_failed"
+    exhaustedAction.attempts = 3
+    exhaustedAction.errorChecksum = "retryable"
+    exhaustedAction.nextAttemptAtMs = 2_000
+    await expectAsyncCode(
+      loadSagaRecord(exhaustedRetry, digest),
+      "OperationInterventionRequiredError",
+    )
+
+    let duplicateAttempt = succeed(running, "a", "forward", "a-1", 1_001)
+    duplicateAttempt = execute(duplicateAttempt, "b", "forward", "b-1", 1_002)
+    const duplicateAttemptProjection = mutableRecord(structuredClone(duplicateAttempt))
+    const duplicateAction = mutableAction(duplicateAttemptProjection, "b", "forward")
+    duplicateAction.activeAttemptId = "a-1"
+    duplicateAction.lastAttemptId = "a-1"
+    await expectAsyncCode(
+      loadSagaRecord(duplicateAttemptProjection, digest),
+      "OperationInterventionRequiredError",
+    )
+
+    let reverseOrder = requestSagaTermination(duplicateAttempt, {
+      cause: "cancellation",
+      serverTimeMs: 1_003,
+    })
+    reverseOrder = succeed(reverseOrder, "b", "forward", "b-1", 1_004)
+    const reverseOrderProjection = mutableRecord(structuredClone(reverseOrder))
+    const earlyCompensation = mutableAction(reverseOrderProjection, "a", "compensation")
+    earlyCompensation.state = "running"
+    earlyCompensation.attempts = 1
+    earlyCompensation.activeAttemptId = "a-c-1"
+    earlyCompensation.lastAttemptId = "a-c-1"
+    await expectAsyncCode(
+      loadSagaRecord(reverseOrderProjection, digest),
+      "OperationInterventionRequiredError",
+    )
+
+    const compensationRunning = execute(reverseOrder, "b", "compensation", "b-c-1", 1_005)
+    const exhaustedCompensation = mutableRecord(structuredClone(compensationRunning))
+    const exhaustedCompensationAction = mutableAction(exhaustedCompensation, "b", "compensation")
+    delete exhaustedCompensationAction.activeAttemptId
+    exhaustedCompensationAction.state = "retryable_failed"
+    exhaustedCompensationAction.attempts = 3
+    exhaustedCompensationAction.errorChecksum = "retryable"
+    exhaustedCompensationAction.nextAttemptAtMs = 2_000
+    await expectAsyncCode(
+      loadSagaRecord(exhaustedCompensation, digest),
+      "OperationInterventionRequiredError",
+    )
+
+    const illegalIrreversibleCompensation = mutableRecord(structuredClone(irreversible))
+    mutableAction(illegalIrreversibleCompensation, "commit", "compensation").state = "pending"
+    await expectAsyncCode(
+      loadSagaRecord(illegalIrreversibleCompensation, digest),
+      "OperationInterventionRequiredError",
+    )
+
+    const throwingDigest: DigestFunction = async () => {
+      throw new Error("digest unavailable")
+    }
+    await expectAsyncCode(
+      loadSagaRecord(structuredClone(initial), throwingDigest),
+      "OperationInterventionRequiredError",
+    )
+
+    const throwingProjection = mutableRecord(structuredClone(initial))
+    Object.defineProperty(throwingProjection, "sagaId", {
+      enumerable: true,
+      get() {
+        throw new Error("storage decoder failed")
+      },
+    })
+    await expectAsyncCode(
+      loadSagaRecord(throwingProjection, digest),
+      "OperationInterventionRequiredError",
+    )
   })
 
   it("model-checks generated forward and compensation outcomes for bounded step counts", async () => {
