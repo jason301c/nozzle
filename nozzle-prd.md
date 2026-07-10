@@ -925,6 +925,8 @@ Multi-shard writes use explicit durable sagas. Saga definitions are immutable, v
 
 Deployments seal a deterministic handler manifest before accepting saga work. One action ID and version identifies exactly one artifact and one handler kind; changing code requires a new version. A descriptor is accepted only when every exact effect and observation reference is present. Adding an unrelated handler changes the deployment manifest but does not alter an already sealed saga plan because the descriptor itself binds every referenced artifact.
 
+Every invocation stores one canonical, schema-versioned operation input envelope containing the saga and descriptor identity, overall public input, and the exact per-step input values. The operation checksum covers the complete envelope, while each step input also receives the domain-separated checksum used by action receipts. The envelope is capped at one MiB and reconstructs every first dispatch after process or deployment restart; checksums alone are never treated as durable input storage.
+
 Saga support MUST include:
 
 - caller-supplied or generated idempotency keys;
@@ -2111,6 +2113,7 @@ No distributed system is literally failure-proof. For Nozzle, bulletproof means:
 61. Conditional operation paths are sealed explicitly and settle as evidenced `not_required`, never as fake successful attempts; required steps cannot be skipped, and at least one required step anchors every plan.
 62. Saga handlers are deploy-time, kind-checked, artifact-checksummed registrations; the deterministic compiler seals all possible paths while the descriptor—not unrelated registry membership—binds the exact executable versions.
 63. Handler exceptions, timeouts, malformed returns, and late completion cross one strict boundary: effect ambiguity becomes `unknown`, observation ambiguity becomes `indeterminate`, durable JSON is canonical and bounded, and private exception text is never persisted.
+64. The canonical operation input envelope is the durable source for saga and per-step inputs; it is descriptor-bound, checksum-verified, one-MiB bounded, and sufficient to reconstruct a first dispatch without process memory.
 
 ### 29.4 Mechanisms intentionally rejected
 

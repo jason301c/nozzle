@@ -10,6 +10,7 @@ import { D1LeaseStore } from "../src/lease-store.js"
 import { D1OperationStore, operationTransitionIdentity } from "../src/operation-store.js"
 import { D1SagaAttemptStore, sagaActionInputChecksum } from "../src/saga-attempt-store.js"
 import { invokeSagaEffectHandler } from "../src/saga-handler.js"
+import { loadSagaInvocationInput, sealSagaInvocationInput } from "../src/saga-input.js"
 import { sealSagaOperationPlan } from "../src/saga-plan.js"
 import { sealSagaHandlerRegistry } from "../src/saga-registry.js"
 import {
@@ -100,17 +101,29 @@ describe("real workerd D1 saga projection", () => {
       },
       digest,
     )
+    const invocation = await sealSagaInvocationInput(
+      {
+        descriptor,
+        inputJson: '{"request":"workerd"}',
+        sagaId: "workerd-registry",
+        stepInputJsons: { write: '{"value":9}' },
+      },
+      digest,
+    )
+    await expect(
+      loadSagaInvocationInput(invocation.operationInputJson, descriptor, digest),
+    ).resolves.toEqual(invocation)
     const plan = await sealSagaOperationPlan(
       {
         capabilitySnapshotChecksum: "7".repeat(64),
         descriptor,
-        inputChecksum: "8".repeat(64),
+        inputChecksum: invocation.inputChecksum,
         leaseKey: "saga:workerd-registry",
         operationId: "workerd-registry-operation",
         operationIdempotencyKey: "workerd-registry-operation-key",
         registry,
         sagaId: "workerd-registry",
-        stepInputChecksums: { write: "9".repeat(64) },
+        stepInputChecksums: invocation.stepInputChecksums,
       },
       digest,
     )
