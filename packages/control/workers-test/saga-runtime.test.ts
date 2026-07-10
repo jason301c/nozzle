@@ -55,7 +55,8 @@ describe("real workerd D1 saga projection", () => {
         steps: [SAGA_INIT_OPERATION_STEP_ID, writeOperationStepId].map((stepId) => ({
           checkpoint: "reversible" as const,
           dependsOn: [],
-          effectProtocol: "opaque" as const,
+          effectProtocol:
+            stepId === writeOperationStepId ? ("saga_receipt" as const) : ("opaque" as const),
           idempotencyKey: `workerd-saga:${stepId}:key`,
           inputChecksum: `workerd-saga:${stepId}:input`,
           leaseKey,

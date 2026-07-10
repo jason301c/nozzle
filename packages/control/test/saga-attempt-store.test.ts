@@ -261,7 +261,7 @@ describe("D1SagaAttemptStore", () => {
         steps: [SAGA_INIT_OPERATION_STEP_ID, actionStepId].map((stepId) => ({
           checkpoint: "reversible" as const,
           dependsOn: [],
-          effectProtocol: "opaque" as const,
+          effectProtocol: stepId === actionStepId ? ("saga_receipt" as const) : ("opaque" as const),
           idempotencyKey: `${operationId}:${stepId}:key`,
           inputChecksum: `${operationId}:${stepId}:input`,
           leaseKey,

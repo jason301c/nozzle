@@ -167,6 +167,7 @@ interface TransitionFaults {
   readonly hideCurrentAfterBatch?: boolean
   readonly hideOperationAfterBatch?: boolean
   readonly providerAttemptRow?: unknown
+  readonly sagaAttemptRow?: unknown
   readonly transitionRow?: unknown
   readonly throwTransitionBatch?: boolean
 }
@@ -195,6 +196,12 @@ class FaultInjectingDatabase implements TransactionalControlDatabase {
       Object.hasOwn(this.#faults, "providerAttemptRow")
     ) {
       return new ScriptedStatement(sql, { first: () => this.#faults.providerAttemptRow })
+    }
+    if (
+      sql.includes('FROM "nozzle_saga_action_attempts" AS "attempt"') &&
+      Object.hasOwn(this.#faults, "sagaAttemptRow")
+    ) {
+      return new ScriptedStatement(sql, { first: () => this.#faults.sagaAttemptRow })
     }
     if (
       sql.includes('FROM "nozzle_operation_transitions" WHERE "transition_id"') &&
@@ -1285,6 +1292,355 @@ describe("D1OperationStore", () => {
     expect(audit.map((row) => JSON.parse(row.event_json).eventType)).toContain(
       "step.crash.not_dispatched",
     )
+  })
+
+  it("recovers saga-receipt steps from exact dispatch presence or absence", async () => {
+    const running = async (suffix: string) => {
+      const input = planInput({
+        idempotencyKey: `saga-recovery-${suffix}-key`,
+        operationId: `saga-recovery-${suffix}`,
+      })
+      const firstStep = input.steps[0]
+      if (!firstStep) throw new Error("Fixture step is missing.")
+      const leaseKey = `fleet-a:saga-recovery:${suffix}`
+      const plan = await sealTestPlan({
+        ...input,
+        steps: [{ ...firstStep, effectProtocol: "saga_receipt", leaseKey }],
+      })
+      await store.create(creationInput(plan))
+      const leases = new D1LeaseStore(database)
+      const first = await leases.acquire({
+        acquisitionId: `saga-recovery-${suffix}-first`,
+        holderId: `saga-recovery-${suffix}-controller`,
+        leaseKey,
+        ttlMs: 60_000,
+      })
+      if (!first.acquired) throw new Error("Fixture lease acquisition failed.")
+      const firstProof = leaseProof(first.record)
+      const attemptId = `saga-recovery-${suffix}-attempt`
+      await store.beginStep({
+        actorChecksum: "actor",
+        attemptId,
+        idempotencyKey: "step-a-key",
+        observedPreconditionChecksum: "step-a-pre",
+        operationId: plan.operationId,
+        proof: firstProof,
+        stepId: "a",
+      })
+      await leases.release({ proof: firstProof })
+      const second = await leases.acquire({
+        acquisitionId: `saga-recovery-${suffix}-second`,
+        holderId: `saga-recovery-${suffix}-recovery`,
+        leaseKey,
+        ttlMs: 60_000,
+      })
+      if (!second.acquired) throw new Error("Fixture lease reacquisition failed.")
+      return { attemptId, plan, proof: leaseProof(second.record) }
+    }
+
+    for (const [suffix, sagaAttemptRow, message] of [
+      [
+        "malformed",
+        {
+          acceptance_checksum: "accepted",
+          attempt_id: "saga-recovery-malformed-attempt",
+          operation_id: null,
+          operation_step_id: "a",
+          outcome_checksum: null,
+          purpose: "effect",
+          state: null,
+        },
+        /saga-attempt recovery evidence is malformed/u,
+      ],
+      [
+        "different",
+        {
+          acceptance_checksum: "accepted",
+          attempt_id: "saga-recovery-different-attempt",
+          operation_id: "different-operation",
+          operation_step_id: "a",
+          outcome_checksum: null,
+          purpose: "effect",
+          state: null,
+        },
+        /belongs to a different step/u,
+      ],
+    ] as const) {
+      const fixture = await running(suffix)
+      const faulted = new D1OperationStore(
+        new FaultInjectingDatabase(database, { sagaAttemptRow }),
+        digest,
+      )
+      await expect(
+        faulted.recoverRunningStep({
+          actorChecksum: "recovery-actor",
+          operationId: fixture.plan.operationId,
+          proof: fixture.proof,
+          recoveryId: `saga-recovery-${suffix}`,
+          stepId: "a",
+        }),
+      ).rejects.toThrow(message)
+    }
+
+    const present = await running("present")
+    const presentStore = new D1OperationStore(
+      new FaultInjectingDatabase(database, {
+        sagaAttemptRow: {
+          acceptance_checksum: "accepted",
+          attempt_id: present.attemptId,
+          operation_id: present.plan.operationId,
+          operation_step_id: "a",
+          outcome_checksum: null,
+          purpose: "effect",
+          state: null,
+        },
+      }),
+      digest,
+    )
+    await expect(
+      presentStore.recoverRunningStep({
+        actorChecksum: "recovery-actor",
+        operationId: present.plan.operationId,
+        proof: present.proof,
+        recoveryId: "saga-recovery-present",
+        stepId: "a",
+      }),
+    ).resolves.toMatchObject({ steps: { a: { state: "unknown" } } })
+
+    const absent = await running("absent")
+    await expect(
+      store.recoverRunningStep({
+        actorChecksum: "recovery-actor",
+        operationId: absent.plan.operationId,
+        proof: absent.proof,
+        recoveryId: "saga-recovery-absent",
+        stepId: "a",
+      }),
+    ).resolves.toMatchObject({ steps: { a: { state: "retryable_failed" } } })
+  })
+
+  it("requires exact terminal saga receipts before operation outcomes", async () => {
+    const running = async (suffix: string) => {
+      const input = planInput({
+        idempotencyKey: `saga-outcome-${suffix}-key`,
+        operationId: `saga-outcome-${suffix}`,
+      })
+      const firstStep = input.steps[0]
+      if (!firstStep) throw new Error("Fixture step is missing.")
+      const leaseKey = `fleet-a:saga-outcome:${suffix}`
+      const plan = await sealTestPlan({
+        ...input,
+        steps: [{ ...firstStep, effectProtocol: "saga_receipt", leaseKey }],
+      })
+      await store.create(creationInput(plan))
+      const leases = new D1LeaseStore(database)
+      const acquired = await leases.acquire({
+        acquisitionId: `saga-outcome-${suffix}-acquisition`,
+        holderId: `saga-outcome-${suffix}-controller`,
+        leaseKey,
+        ttlMs: 60_000,
+      })
+      if (!acquired.acquired) throw new Error("Fixture lease acquisition failed.")
+      const proof = leaseProof(acquired.record)
+      const attemptId = `saga-outcome-${suffix}-attempt`
+      await store.beginStep({
+        actorChecksum: "actor",
+        attemptId,
+        idempotencyKey: "step-a-key",
+        observedPreconditionChecksum: "step-a-pre",
+        operationId: plan.operationId,
+        proof,
+        stepId: "a",
+      })
+      return { attemptId, plan, proof }
+    }
+
+    for (const [suffix, sagaAttemptRow, message] of [
+      ["missing", null, /no terminal outcome receipt/u],
+      [
+        "accepted",
+        {
+          acceptance_checksum: "accepted",
+          attempt_id: "saga-outcome-accepted-attempt",
+          operation_id: "saga-outcome-accepted",
+          operation_step_id: "a",
+          outcome_checksum: null,
+          purpose: "effect",
+          state: null,
+        },
+        /no terminal outcome receipt/u,
+      ],
+      [
+        "malformed",
+        {
+          acceptance_checksum: "accepted",
+          attempt_id: "saga-outcome-malformed-attempt",
+          operation_id: "saga-outcome-malformed",
+          operation_step_id: "a",
+          outcome_checksum: null,
+          purpose: "effect",
+          state: "other",
+        },
+        /recovery evidence is malformed/u,
+      ],
+      [
+        "contradictory",
+        {
+          acceptance_checksum: "accepted",
+          attempt_id: "saga-outcome-contradictory-attempt",
+          operation_id: "saga-outcome-contradictory",
+          operation_step_id: "a",
+          outcome_checksum: "result",
+          purpose: "effect",
+          state: "failed",
+        },
+        /contradicts the operation transition/u,
+      ],
+    ] as const) {
+      const fixture = await running(suffix)
+      const faulted = new D1OperationStore(
+        new FaultInjectingDatabase(database, { sagaAttemptRow }),
+        digest,
+      )
+      await expect(
+        faulted.completeStep({
+          actorChecksum: "actor",
+          attemptId: fixture.attemptId,
+          observedPostconditionChecksum: "step-a-post",
+          operationId: fixture.plan.operationId,
+          proof: fixture.proof,
+          resultChecksum: "result",
+          stepId: "a",
+        }),
+      ).rejects.toThrow(message)
+    }
+
+    const valid = await running("valid")
+    const validStore = new D1OperationStore(
+      new FaultInjectingDatabase(database, {
+        sagaAttemptRow: {
+          acceptance_checksum: "accepted",
+          attempt_id: valid.attemptId,
+          operation_id: valid.plan.operationId,
+          operation_step_id: "a",
+          outcome_checksum: "result",
+          purpose: "effect",
+          state: "confirmed",
+        },
+      }),
+      digest,
+    )
+    await expect(
+      validStore.completeStep({
+        actorChecksum: "actor",
+        attemptId: valid.attemptId,
+        observedPostconditionChecksum: "step-a-post",
+        operationId: valid.plan.operationId,
+        proof: valid.proof,
+        resultChecksum: "result",
+        stepId: "a",
+      }),
+    ).resolves.toMatchObject({ steps: { a: { state: "succeeded" } } })
+
+    const reconcile = await running("reconcile-without-receipt")
+    const unknownStore = new D1OperationStore(
+      new FaultInjectingDatabase(database, {
+        sagaAttemptRow: {
+          acceptance_checksum: "accepted",
+          attempt_id: reconcile.attemptId,
+          operation_id: reconcile.plan.operationId,
+          operation_step_id: "a",
+          outcome_checksum: "unknown",
+          purpose: "effect",
+          state: "unknown",
+        },
+      }),
+      digest,
+    )
+    await unknownStore.failStep({
+      actorChecksum: "actor",
+      attemptId: reconcile.attemptId,
+      errorChecksum: "unknown",
+      operationId: reconcile.plan.operationId,
+      outcome: "unknown",
+      proof: reconcile.proof,
+      stepId: "a",
+    })
+    await expect(
+      store.reconcileStep({
+        actorChecksum: "actor",
+        evidenceChecksum: "evidence",
+        operationId: reconcile.plan.operationId,
+        outcome: "indeterminate",
+        proof: reconcile.proof,
+        reconciliationId: "missing-observation-receipt",
+        stepId: "a",
+      }),
+    ).rejects.toThrow(/lacks receipt requirements/u)
+
+    for (const [outcome, sagaState, operationState] of [
+      ["applied", "confirmed", "succeeded"],
+      ["not_applied", "not_applied", "retryable_failed"],
+      ["indeterminate", "indeterminate", "intervention_required"],
+    ] as const) {
+      const fixture = await running(`reconcile-${outcome}`)
+      const effectReceiptStore = new D1OperationStore(
+        new FaultInjectingDatabase(database, {
+          sagaAttemptRow: {
+            acceptance_checksum: "accepted",
+            attempt_id: fixture.attemptId,
+            operation_id: fixture.plan.operationId,
+            operation_step_id: "a",
+            outcome_checksum: "unknown",
+            purpose: "effect",
+            state: "unknown",
+          },
+        }),
+        digest,
+      )
+      await effectReceiptStore.failStep({
+        actorChecksum: "actor",
+        attemptId: fixture.attemptId,
+        errorChecksum: "unknown",
+        operationId: fixture.plan.operationId,
+        outcome: "unknown",
+        proof: fixture.proof,
+        stepId: "a",
+      })
+      const observationAttemptId = `${fixture.attemptId}:observation`
+      const observationReceiptStore = new D1OperationStore(
+        new FaultInjectingDatabase(database, {
+          sagaAttemptRow: {
+            acceptance_checksum: "observed",
+            attempt_id: observationAttemptId,
+            operation_id: fixture.plan.operationId,
+            operation_step_id: "a",
+            outcome_checksum: `evidence-${outcome}`,
+            purpose: "observation",
+            state: sagaState,
+          },
+        }),
+        digest,
+      )
+      await expect(
+        observationReceiptStore.reconcileStep({
+          actorChecksum: "actor",
+          evidenceChecksum: `evidence-${outcome}`,
+          ...(outcome === "applied"
+            ? {
+                observedPostconditionChecksum: "step-a-post",
+                resultChecksum: "result",
+              }
+            : {}),
+          observationAttemptId,
+          operationId: fixture.plan.operationId,
+          outcome,
+          proof: fixture.proof,
+          reconciliationId: `reconcile-${outcome}`,
+          stepId: "a",
+        }),
+      ).resolves.toMatchObject({ steps: { a: { state: operationState } } })
+    }
   })
 
   it("persists retryable and permanent failures with their bounded next action", async () => {

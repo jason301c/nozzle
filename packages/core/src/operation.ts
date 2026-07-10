@@ -19,7 +19,7 @@ export const OPERATION_STEP_STATES = [
 export type OperationStepState = (typeof OPERATION_STEP_STATES)[number]
 export type RetryClassification = "idempotent" | "never" | "reconcile_first"
 export type CheckpointKind = "irreversible" | "reversible"
-export type EffectProtocol = "opaque" | "provider_receipt"
+export type EffectProtocol = "opaque" | "provider_receipt" | "saga_receipt"
 export type DigestFunction = (input: Uint8Array) => Promise<string> | string
 
 export interface OperationStepPlanInput {
@@ -281,7 +281,7 @@ function normalizeStep(step: OperationStepPlanInput): OperationStepPlan {
     configurationError("Step retry classification is invalid.")
   }
   const effectProtocol = step.effectProtocol ?? "opaque"
-  if (!(["opaque", "provider_receipt"] as const).includes(effectProtocol)) {
+  if (!(["opaque", "provider_receipt", "saga_receipt"] as const).includes(effectProtocol)) {
     configurationError("Step effect protocol is invalid.")
   }
   const dependsOn = [...new Set(step.dependsOn ?? [])].sort()

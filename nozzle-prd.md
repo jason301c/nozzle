@@ -2099,6 +2099,7 @@ No distributed system is literally failure-proof. For Nozzle, bulletproof means:
 57. Fan-out reducers run in canonical shard order; exact integer aggregation and deterministic compensated floating aggregation are distinct public contracts.
 58. Every saga projection is an exactly fenced materialization of a named canonical operation transition; action dispatch requires agreement between the operation step and saga projection, and serial or reverse-compensation eligibility comes only from the sealed saga state machine.
 59. Saga action inputs and outcomes use append-only, domain-separated Control receipts; those receipts prove dispatch history but never substitute for the shard-local atomic mutation receipt required of D1 action adapters.
+60. A saga action operation step declares the `saga_receipt` effect protocol. Dispatch requires its exact accepted Control receipt; under a newer fence, receipt absence proves the attempt was not dispatched, while receipt presence without a terminal outcome remains unknown. An operation outcome may commit only when the exact terminal saga receipt agrees with its attempt, purpose, step, and checksum.
 
 ### 29.4 Mechanisms intentionally rejected
 
