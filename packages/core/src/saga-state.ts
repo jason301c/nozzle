@@ -149,8 +149,15 @@ function frozenAction(input: SagaActionRecord): SagaActionRecord {
   return Object.freeze({ ...input })
 }
 
-function actionIdempotencyKey(sagaId: string, stepId: string, phase: SagaActionPhase): string {
-  return `saga:${sagaId.length}:${sagaId}:${stepId.length}:${stepId}:${phase}`
+export function sagaActionIdempotencyKey(
+  sagaId: string,
+  stepId: string,
+  actionPhase: SagaActionPhase,
+): string {
+  nonEmpty(sagaId, "Saga ID")
+  nonEmpty(stepId, "Saga step ID")
+  phase(actionPhase)
+  return `saga:${sagaId.length}:${sagaId}:${stepId.length}:${stepId}:${actionPhase}`
 }
 
 function initialAction(idempotencyKey: string, state: SagaActionState): SagaActionRecord {
@@ -270,10 +277,13 @@ export function createSagaRecord(input: {
     nonEmpty(inputChecksum, "Saga step input checksum")
     steps[step.stepId] = Object.freeze({
       compensation: initialAction(
-        actionIdempotencyKey(input.sagaId, step.stepId, "compensation"),
+        sagaActionIdempotencyKey(input.sagaId, step.stepId, "compensation"),
         step.irreversible ? "not_required" : "pending",
       ),
-      forward: initialAction(actionIdempotencyKey(input.sagaId, step.stepId, "forward"), "pending"),
+      forward: initialAction(
+        sagaActionIdempotencyKey(input.sagaId, step.stepId, "forward"),
+        "pending",
+      ),
       inputChecksum,
     })
   }
@@ -1018,12 +1028,12 @@ async function loadSagaRecordUnchecked(
     )
     const forward = persistedAction(
       value.forward,
-      actionIdempotencyKey(candidate.sagaId, step.stepId, "forward"),
+      sagaActionIdempotencyKey(candidate.sagaId, step.stepId, "forward"),
       false,
     )
     const compensation = persistedAction(
       value.compensation,
-      actionIdempotencyKey(candidate.sagaId, step.stepId, "compensation"),
+      sagaActionIdempotencyKey(candidate.sagaId, step.stepId, "compensation"),
       step.irreversible,
     )
     persisted(

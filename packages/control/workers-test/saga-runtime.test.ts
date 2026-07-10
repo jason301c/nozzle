@@ -9,6 +9,8 @@ import { beforeAll, describe, expect, it } from "vitest"
 import { D1LeaseStore } from "../src/lease-store.js"
 import { D1OperationStore, operationTransitionIdentity } from "../src/operation-store.js"
 import { D1SagaAttemptStore, sagaActionInputChecksum } from "../src/saga-attempt-store.js"
+import { sealSagaOperationPlan } from "../src/saga-plan.js"
+import { sealSagaHandlerRegistry } from "../src/saga-registry.js"
 import {
   D1SagaStore,
   SAGA_INIT_OPERATION_STEP_ID,
@@ -37,6 +39,86 @@ beforeAll(async () => {
 })
 
 describe("real workerd D1 saga projection", () => {
+  it("seals a deploy-time handler registry and complete conditional saga plan", async () => {
+    const forwardAction = {
+      actionId: "workerd.registry.forward",
+      artifactChecksum: "1".repeat(64),
+      version: 1,
+    }
+    const forwardObservation = {
+      actionId: "workerd.registry.observe-forward",
+      artifactChecksum: "2".repeat(64),
+      version: 1,
+    }
+    const compensationAction = {
+      actionId: "workerd.registry.compensate",
+      artifactChecksum: "3".repeat(64),
+      version: 1,
+    }
+    const compensationObservation = {
+      actionId: "workerd.registry.observe-compensation",
+      artifactChecksum: "4".repeat(64),
+      version: 1,
+    }
+    const effect = () => ({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" as const })
+    const observation = () => ({
+      evidenceJson: "{}",
+      outputJson: "{}",
+      state: "applied" as const,
+    })
+    const registry = await sealSagaHandlerRegistry(
+      [
+        { handler: effect, kind: "effect", reference: forwardAction },
+        { handler: observation, kind: "observation", reference: forwardObservation },
+        { handler: effect, kind: "effect", reference: compensationAction },
+        { handler: observation, kind: "observation", reference: compensationObservation },
+      ],
+      digest,
+    )
+    const descriptor = await sealSagaDescriptor(
+      {
+        descriptorId: "workerd-registry",
+        steps: [
+          {
+            authorizationPolicyChecksum: null,
+            baseRetryDelayMs: 10,
+            compensationAction,
+            compensationObservation,
+            forwardAction,
+            forwardObservation,
+            inputSchemaChecksum: "5".repeat(64),
+            irreversible: false,
+            maxAttempts: 3,
+            maxRetryDelayMs: 100,
+            outputSchemaChecksum: "6".repeat(64),
+            stepId: "write",
+            timeoutMs: 1_000,
+          },
+        ],
+        version: 1,
+      },
+      digest,
+    )
+    const plan = await sealSagaOperationPlan(
+      {
+        capabilitySnapshotChecksum: "7".repeat(64),
+        descriptor,
+        inputChecksum: "8".repeat(64),
+        leaseKey: "saga:workerd-registry",
+        operationId: "workerd-registry-operation",
+        operationIdempotencyKey: "workerd-registry-operation-key",
+        registry,
+        sagaId: "workerd-registry",
+        stepInputChecksums: { write: "9".repeat(64) },
+      },
+      digest,
+    )
+    expect(registry.manifest.manifestChecksum).toMatch(/^[0-9a-f]{64}$/u)
+    expect(plan.steps).toHaveLength(4)
+    expect(plan.steps.filter((step) => step.activation === "required")).toHaveLength(1)
+    expect(plan.steps.filter((step) => step.effectProtocol === "saga_receipt")).toHaveLength(2)
+  })
+
   it("atomically advances a saga only through exact fenced operation transitions", async () => {
     const operationId = "workerd-saga-operation"
     const sagaId = "workerd-saga"

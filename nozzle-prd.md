@@ -923,6 +923,8 @@ Concurrent inserts, updates, and deletes may appear in or disappear from later p
 
 Multi-shard writes use explicit durable sagas. Saga definitions are immutable, versioned descriptors registered at build or deploy time. Each step names versioned forward, observe, and compensation actions plus an artifact checksum. A required action version cannot be removed while a nonterminal saga or retained recovery record references it.
 
+Deployments seal a deterministic handler manifest before accepting saga work. One action ID and version identifies exactly one artifact and one handler kind; changing code requires a new version. A descriptor is accepted only when every exact effect and observation reference is present. Adding an unrelated handler changes the deployment manifest but does not alter an already sealed saga plan because the descriptor itself binds every referenced artifact.
+
 Saga support MUST include:
 
 - caller-supplied or generated idempotency keys;
@@ -943,6 +945,8 @@ Saga version 1 is deliberately serial. It executes forward actions in sealed ord
 Every D1 saga action writes its shard-local idempotency and result receipt atomically with the application mutation. External actions require an adapter that proves idempotency or provides an observation oracle. A noncompensable mutation is rejected unless it is marked irreversible, ordered last, and protected by sealed authorization. Sagas use the canonical operation envelope rather than an independent orchestration authority.
 
 Each saga projection version and its operation-effect receipt commit in one Control D1 batch and reference one exact immutable operation-transition ID under the active fence. Canonical operation step IDs are `saga:init`, `saga:termination`, and `saga:<phase>:<descriptor-step-id>`. The projection store rejects a transition whose step, state, or attempt identity does not match the requested saga transition. Action receipt acceptance additionally requires both the matching canonical operation-step state and the matching saga action state, so an operation transition alone cannot authorize dispatch. Saga action operation steps are declared independently in the generic plan because a failed forward must not make compensation ineligible through ordinary success-only dependency edges; the sealed serial saga state machine remains the eligibility oracle.
+
+The saga plan compiler emits required `saga:init`, conditional `saga:termination`, and every possible conditional forward and compensation action before execution. Action steps use `saga_receipt`, have no ordinary dependency edges, and bind the descriptor artifact, schema, static input, lease, and recovery contract. An irreversible forward is an irreversible checkpoint and has no compensation step. Terminal orchestration marks every unchosen conditional path `not_required` using the checksum-verified terminal saga projection as decision evidence.
 
 Control-plane saga attempt receipts are append-only dispatch and observation evidence; they do not replace the shard-local receipt that a D1 application mutation commits atomically with its data change. Attempt inputs, evidence, outputs, and errors are canonical JSON capped at one MiB, with domain-separated payload, acceptance, and outcome checksums. The acceptance receipt binds the exact descriptor action key, saga and operation identity, phase, purpose, idempotency key, payload, and lease fence. An accepted attempt without a terminal outcome remains accepted evidence of possible dispatch and is recovered as unknown; absence of an acceptance receipt is the only Control-plane proof that dispatch did not occur.
 
@@ -2103,6 +2107,7 @@ No distributed system is literally failure-proof. For Nozzle, bulletproof means:
 59. Saga action inputs and outcomes use append-only, domain-separated Control receipts; those receipts prove dispatch history but never substitute for the shard-local atomic mutation receipt required of D1 action adapters.
 60. A saga action operation step declares the `saga_receipt` effect protocol. Dispatch requires its exact accepted Control receipt; under a newer fence, receipt absence proves the attempt was not dispatched, while receipt presence without a terminal outcome remains unknown. An operation outcome may commit only when the exact terminal saga receipt agrees with its attempt, purpose, step, and checksum.
 61. Conditional operation paths are sealed explicitly and settle as evidenced `not_required`, never as fake successful attempts; required steps cannot be skipped, and at least one required step anchors every plan.
+62. Saga handlers are deploy-time, kind-checked, artifact-checksummed registrations; the deterministic compiler seals all possible paths while the descriptor—not unrelated registry membership—binds the exact executable versions.
 
 ### 29.4 Mechanisms intentionally rejected
 
