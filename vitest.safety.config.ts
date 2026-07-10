@@ -20,6 +20,7 @@ export default defineConfig({
         "packages/core/src/movement.ts",
         "packages/core/src/operation.ts",
         "packages/core/src/ownership.ts",
+        "packages/core/src/placement.ts",
         "packages/core/src/routes.ts",
         "packages/drizzle/src/plan.ts",
         "packages/router/src/leaf.ts",
