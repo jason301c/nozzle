@@ -127,10 +127,11 @@ describe("control D1 schema", () => {
       database
         .prepare(
           `INSERT INTO "nozzle_operations"
-           ("operation_id", "operation_type", "idempotency_key", "plan_checksum", "plan_json",
+           ("operation_id", "environment_id", "operation_type", "idempotency_scope",
+            "idempotency_key", "input_checksum", "plan_checksum", "plan_json",
             "capability_snapshot_checksum", "required_shards_json", "status", "created_at_ms", "updated_at_ms")
-           VALUES ('operation-a', 'migration', 'idempotency-a', 'plan-a', '{}', 'capability-a',
-             '[]', 'planned', 1, 1)`,
+           VALUES ('operation-a', 'production', 'migration', 'fleet-a', 'idempotency-a',
+             'input-a', 'plan-a', '{}', 'capability-a', '[]', 'planned', 1, 1)`,
         )
         .run()
       database
@@ -180,6 +181,31 @@ describe("control D1 schema", () => {
           .prepare(`DELETE FROM "nozzle_operations" WHERE "operation_id" = 'operation-a'`)
           .run(),
       ).toThrow("NOZZLE_CONTROL_OPERATION_PERSISTENT")
+
+      database
+        .prepare(
+          `INSERT INTO "nozzle_idempotency_keys"
+           ("environment_id", "scope", "idempotency_key", "operation_id", "input_checksum",
+            "created_at_ms")
+           VALUES ('production', 'fleet-a', 'idempotency-a', 'operation-a', 'input-a', 1)`,
+        )
+        .run()
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO "nozzle_idempotency_keys"
+             ("environment_id", "scope", "idempotency_key", "operation_id", "input_checksum",
+              "created_at_ms")
+             VALUES ('production', 'wrong', 'wrong', 'operation-a', 'wrong', 1)`,
+          )
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_IDEMPOTENCY_MISMATCH")
+      expect(() =>
+        database.prepare(`UPDATE "nozzle_idempotency_keys" SET "input_checksum" = 'wrong'`).run(),
+      ).toThrow("NOZZLE_CONTROL_IDEMPOTENCY_IMMUTABLE")
+      expect(() => database.prepare(`DELETE FROM "nozzle_idempotency_keys"`).run()).toThrow(
+        "NOZZLE_CONTROL_IDEMPOTENCY_IMMUTABLE",
+      )
     })
   })
 

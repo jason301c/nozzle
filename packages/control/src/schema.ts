@@ -184,27 +184,32 @@ ON CONFLICT ("singleton") DO NOTHING;`,
 );`,
   `CREATE TABLE IF NOT EXISTS "nozzle_operations" (
   "operation_id" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("operation_id")) > 0),
+  "environment_id" TEXT NOT NULL CHECK (length(trim("environment_id")) > 0),
   "operation_type" TEXT NOT NULL CHECK (length(trim("operation_type")) > 0),
-  "idempotency_key" TEXT NOT NULL UNIQUE CHECK (length(trim("idempotency_key")) > 0),
+  "idempotency_scope" TEXT NOT NULL CHECK (length(trim("idempotency_scope")) > 0),
+  "idempotency_key" TEXT NOT NULL CHECK (length(trim("idempotency_key")) > 0),
+  "input_checksum" TEXT NOT NULL CHECK (length(trim("input_checksum")) > 0),
   "plan_checksum" TEXT NOT NULL CHECK (length(trim("plan_checksum")) > 0),
   "plan_json" TEXT NOT NULL CHECK (json_valid("plan_json")),
   "capability_snapshot_checksum" TEXT NOT NULL,
   "required_shards_json" TEXT NOT NULL CHECK (json_valid("required_shards_json")),
   "status" TEXT NOT NULL CHECK ("status" IN ('planned', 'running', 'paused', 'reconciling', 'failed', 'intervention_required', 'succeeded')),
   "created_at_ms" INTEGER NOT NULL CHECK ("created_at_ms" >= 0),
-  "updated_at_ms" INTEGER NOT NULL CHECK ("updated_at_ms" >= 0)
+  "updated_at_ms" INTEGER NOT NULL CHECK ("updated_at_ms" >= 0),
+  UNIQUE ("environment_id", "idempotency_scope", "idempotency_key")
 );`,
   `CREATE TABLE IF NOT EXISTS "nozzle_operation_steps" (
   "operation_id" TEXT NOT NULL REFERENCES "nozzle_operations" ("operation_id"),
   "step_id" TEXT NOT NULL CHECK (length(trim("step_id")) > 0),
-  "idempotency_key" TEXT NOT NULL UNIQUE,
+  "idempotency_key" TEXT NOT NULL,
   "lease_key" TEXT NOT NULL,
   "plan_json" TEXT NOT NULL CHECK (json_valid("plan_json")),
   "record_json" TEXT NOT NULL CHECK (json_valid("record_json")),
   "state" TEXT NOT NULL CHECK ("state" IN ('pending', 'running', 'retryable_failed', 'unknown', 'succeeded', 'failed', 'intervention_required')),
   "fencing_token" INTEGER,
   "updated_at_ms" INTEGER NOT NULL CHECK ("updated_at_ms" >= 0),
-  PRIMARY KEY ("operation_id", "step_id")
+  PRIMARY KEY ("operation_id", "step_id"),
+  UNIQUE ("operation_id", "idempotency_key")
 );`,
   `CREATE TABLE IF NOT EXISTS "nozzle_leases" (
   "lease_key" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("lease_key")) BETWEEN 1 AND 512),
@@ -217,12 +222,13 @@ ON CONFLICT ("singleton") DO NOTHING;`,
 );`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "nozzle_leases_acquisition" ON "nozzle_leases" ("acquisition_id") WHERE "acquisition_id" IS NOT NULL;`,
   `CREATE TABLE IF NOT EXISTS "nozzle_idempotency_keys" (
+  "environment_id" TEXT NOT NULL,
   "scope" TEXT NOT NULL,
   "idempotency_key" TEXT NOT NULL,
   "operation_id" TEXT NOT NULL REFERENCES "nozzle_operations" ("operation_id"),
   "input_checksum" TEXT NOT NULL,
   "created_at_ms" INTEGER NOT NULL CHECK ("created_at_ms" >= 0),
-  PRIMARY KEY ("scope", "idempotency_key")
+  PRIMARY KEY ("environment_id", "scope", "idempotency_key")
 );`,
   `CREATE TABLE IF NOT EXISTS "nozzle_capacity_samples" (
   "fleet_id" TEXT NOT NULL,
@@ -283,8 +289,11 @@ ON CONFLICT ("singleton") DO NOTHING;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_operation_plan_update"
 BEFORE UPDATE ON "nozzle_operations"
 WHEN NEW."operation_id" IS NOT OLD."operation_id"
+  OR NEW."environment_id" IS NOT OLD."environment_id"
   OR NEW."operation_type" IS NOT OLD."operation_type"
+  OR NEW."idempotency_scope" IS NOT OLD."idempotency_scope"
   OR NEW."idempotency_key" IS NOT OLD."idempotency_key"
+  OR NEW."input_checksum" IS NOT OLD."input_checksum"
   OR NEW."plan_checksum" IS NOT OLD."plan_checksum"
   OR NEW."plan_json" IS NOT OLD."plan_json"
   OR NEW."capability_snapshot_checksum" IS NOT OLD."capability_snapshot_checksum"
@@ -301,6 +310,23 @@ WHEN NEW."operation_id" IS NOT OLD."operation_id"
   OR NEW."plan_json" IS NOT OLD."plan_json"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IMMUTABLE_STEP_PLAN'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_step_delete" BEFORE DELETE ON "nozzle_operation_steps" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_STEP_PERSISTENT'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_idempotency_insert"
+BEFORE INSERT ON "nozzle_idempotency_keys"
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_operations"
+  WHERE "operation_id" = NEW."operation_id"
+    AND "environment_id" = NEW."environment_id"
+    AND "idempotency_scope" = NEW."scope"
+    AND "idempotency_key" = NEW."idempotency_key"
+    AND "input_checksum" = NEW."input_checksum"
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IDEMPOTENCY_MISMATCH'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_idempotency_update"
+BEFORE UPDATE ON "nozzle_idempotency_keys"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IDEMPOTENCY_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_idempotency_delete"
+BEFORE DELETE ON "nozzle_idempotency_keys"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IDEMPOTENCY_IMMUTABLE'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_migration_operation_update"
 BEFORE UPDATE ON "nozzle_migration_operations"
 WHEN NEW."operation_id" IS NOT OLD."operation_id"

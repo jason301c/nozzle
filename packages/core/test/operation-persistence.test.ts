@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest"
 import {
+  appendAuditEvent,
   beginOperationStep,
   createOperationRecord,
   type DigestFunction,
   decideLeaseAcquisition,
   leaseProof,
+  loadAuditEvent,
   loadOperationRecord,
   markRunningStepsUnknownAfterCrash,
   type OperationPlan,
@@ -363,5 +365,79 @@ describe("persisted operation record integrity", () => {
         digest,
       ),
     ).rejects.toThrow(/authorization state/u)
+  })
+})
+
+describe("persisted audit event integrity", () => {
+  it("loads standalone verified audit heads with null and non-null chain fields", async () => {
+    const first = await appendAuditEvent(
+      undefined,
+      {
+        actorChecksum: "actor",
+        environmentId: "production",
+        eventType: "operation.created",
+        fencingToken: null,
+        idempotencyKey: "audit-one",
+        operationId: "operation-1",
+        payloadChecksum: "payload-one",
+        serverTimeMs: 100,
+        stepId: null,
+      },
+      digest,
+    )
+    const second = await appendAuditEvent(
+      first,
+      {
+        actorChecksum: "actor",
+        environmentId: "production",
+        eventType: "step.started",
+        fencingToken: 1,
+        idempotencyKey: "audit-two",
+        operationId: "operation-1",
+        payloadChecksum: "payload-two",
+        serverTimeMs: 101,
+        stepId: "one",
+      },
+      digest,
+    )
+    for (const event of [first, second]) {
+      const loaded = await loadAuditEvent(JSON.parse(JSON.stringify(event)) as unknown, digest)
+      expect(loaded).toEqual(event)
+      expect(Object.isFrozen(loaded)).toBe(true)
+    }
+  })
+
+  it("rejects malformed, incomplete, unsupported, and checksum-invalid audit heads", async () => {
+    const valid = await appendAuditEvent(
+      undefined,
+      {
+        actorChecksum: "actor",
+        environmentId: "production",
+        eventType: "operation.created",
+        fencingToken: null,
+        idempotencyKey: "audit-one",
+        operationId: "operation-1",
+        payloadChecksum: "payload",
+        serverTimeMs: 100,
+        stepId: null,
+      },
+      digest,
+    )
+    for (const malformed of [
+      null,
+      [],
+      new Date(),
+      { ...valid, unknown: true },
+      { ...valid, schemaVersion: 2 },
+      { ...valid, sequence: 0 },
+      { ...valid, serverTimeMs: -1 },
+      { ...valid, actorChecksum: undefined },
+      { ...valid, previousHash: undefined },
+      { ...valid, stepId: undefined },
+      { ...valid, fencingToken: 0 },
+      { ...valid, eventHash: "tampered" },
+    ]) {
+      await expect(loadAuditEvent(malformed, digest)).rejects.toThrow()
+    }
   })
 })

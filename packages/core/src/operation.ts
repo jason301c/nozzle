@@ -1401,6 +1401,104 @@ export async function appendAuditEvent(
   return Object.freeze({ ...event, eventHash })
 }
 
+const PERSISTED_AUDIT_EVENT_KEYS = new Set([
+  "actorChecksum",
+  "environmentId",
+  "eventHash",
+  "eventType",
+  "fencingToken",
+  "idempotencyKey",
+  "operationId",
+  "payloadChecksum",
+  "previousHash",
+  "schemaVersion",
+  "sequence",
+  "serverTimeMs",
+  "stepId",
+])
+
+export async function loadAuditEvent(
+  candidate: unknown,
+  digest: DigestFunction,
+): Promise<AuditEvent> {
+  persistedInvariant(plainRecord(candidate), "The persisted audit event is malformed.")
+  persistedInvariant(
+    Object.keys(candidate).every((key) => PERSISTED_AUDIT_EVENT_KEYS.has(key)),
+    "The persisted audit event contains unknown fields.",
+  )
+  persistedInvariant(
+    candidate.schemaVersion === 1,
+    "The persisted audit event version is unsupported.",
+  )
+  persistedInvariant(
+    typeof candidate.sequence === "number" &&
+      Number.isSafeInteger(candidate.sequence) &&
+      candidate.sequence >= 1,
+    "The persisted audit sequence is malformed.",
+  )
+  persistedInvariant(
+    typeof candidate.serverTimeMs === "number" &&
+      Number.isSafeInteger(candidate.serverTimeMs) &&
+      candidate.serverTimeMs >= 0,
+    "The persisted audit server time is malformed.",
+  )
+  const actorChecksum = persistedOptionalString(candidate.actorChecksum, "Audit actor checksum")
+  const environmentId = persistedOptionalString(candidate.environmentId, "Audit environment ID")
+  const eventHash = persistedOptionalString(candidate.eventHash, "Audit event checksum")
+  const eventType = persistedOptionalString(candidate.eventType, "Audit event type")
+  const idempotencyKey = persistedOptionalString(candidate.idempotencyKey, "Audit idempotency key")
+  const operationId = persistedOptionalString(candidate.operationId, "Audit operation ID")
+  const payloadChecksum = persistedOptionalString(
+    candidate.payloadChecksum,
+    "Audit payload checksum",
+  )
+  const previousHash =
+    candidate.previousHash === null
+      ? null
+      : persistedOptionalString(candidate.previousHash, "Previous audit checksum")
+  const stepId =
+    candidate.stepId === null ? null : persistedOptionalString(candidate.stepId, "Audit step ID")
+  persistedInvariant(
+    actorChecksum !== undefined &&
+      environmentId !== undefined &&
+      eventHash !== undefined &&
+      eventType !== undefined &&
+      idempotencyKey !== undefined &&
+      operationId !== undefined &&
+      payloadChecksum !== undefined &&
+      previousHash !== undefined &&
+      stepId !== undefined,
+    "The persisted audit event is incomplete.",
+  )
+  const fencingToken = candidate.fencingToken
+  persistedInvariant(
+    fencingToken === null ||
+      (typeof fencingToken === "number" && Number.isSafeInteger(fencingToken) && fencingToken >= 1),
+    "The persisted audit fencing token is malformed.",
+  )
+  const event: Omit<AuditEvent, "eventHash"> = Object.freeze({
+    actorChecksum,
+    environmentId,
+    eventType,
+    fencingToken,
+    idempotencyKey,
+    operationId,
+    payloadChecksum,
+    previousHash,
+    schemaVersion: 1,
+    sequence: candidate.sequence,
+    serverTimeMs: candidate.serverTimeMs,
+    stepId,
+  })
+  const actual = await digestChecksum(
+    encodeAuditEventChecksumInput(event),
+    digest,
+    "Audit event checksum",
+  )
+  persistedInvariant(actual === eventHash, "The persisted audit event checksum does not match.")
+  return Object.freeze({ ...event, eventHash })
+}
+
 export async function verifyAuditChain(
   events: readonly AuditEvent[],
   digest: DigestFunction,

@@ -17,6 +17,7 @@ export default defineConfig({
         "packages/control/src/lease-store.ts",
         "packages/control/src/migration-store.ts",
         "packages/control/src/movement-store.ts",
+        "packages/control/src/operation-store.ts",
         "packages/core/src/hash.ts",
         "packages/core/src/migration.ts",
         "packages/core/src/movement.ts",
