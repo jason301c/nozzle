@@ -58,6 +58,7 @@ describe("Cloudflare D1 inventory decoding", () => {
       jurisdiction: index === 0 ? "eu" : undefined,
       name: `database-${index}`,
       num_tables: index,
+      read_replication: index === 0 ? { mode: "auto" } : undefined,
       uuid: uuid(`uuid-${index}`),
       version: "production",
     }))
@@ -73,6 +74,9 @@ describe("Cloudflare D1 inventory decoding", () => {
         ...(database.jurisdiction === undefined ? {} : { jurisdiction: database.jurisdiction }),
         name: database.name,
         numTables: database.num_tables,
+        ...(database.read_replication === undefined
+          ? {}
+          : { readReplication: database.read_replication }),
         uuid: database.uuid,
         version: database.version,
       })),
@@ -159,6 +163,8 @@ describe("Cloudflare D1 inventory decoding", () => {
       { ...valid, file_size: -1 },
       { ...valid, file_size: 0.5 },
       { ...valid, num_tables: Number.POSITIVE_INFINITY },
+      { ...valid, read_replication: null },
+      { ...valid, read_replication: { mode: "future" } },
       { ...valid, version: 1 },
     ]) {
       expect(() => decodeD1ListPage(envelope([invalid as never]), request)).toThrow()
@@ -252,6 +258,7 @@ describe("complete D1 inventory assembly", () => {
       { ...valid, createdAt: "" },
       { ...valid, fileSize: -1 },
       { ...valid, numTables: 0.1 },
+      { ...valid, readReplication: { mode: "future" } },
       { ...valid, version: "" },
     ]) {
       const page = {
@@ -396,6 +403,33 @@ describe("D1 desired-recorded-observed reconciliation", () => {
     ).toEqual({ kind: "none", observed: database })
   })
 
+  it("inspects list summaries before planning a read-replication update", () => {
+    const desired = {
+      name: "nozzle-production-001",
+      readReplication: { mode: "auto" as const },
+    }
+    const summary = observed("recorded", desired.name)
+    const recorded = { ...desired, uuid: summary.uuid }
+    expect(planD1Reconciliation({ desired, inventory: inventory([summary]), recorded })).toEqual({
+      desired,
+      kind: "inspect_recorded",
+      observed: summary,
+      recorded,
+    })
+
+    const disabled = { ...summary, readReplication: { mode: "disabled" as const } }
+    expect(planD1Reconciliation({ desired, inventory: inventory([disabled]), recorded })).toEqual({
+      databaseId: summary.uuid,
+      kind: "update_read_replication",
+      readReplication: desired.readReplication,
+    })
+    const automatic = { ...summary, readReplication: { mode: "auto" as const } }
+    expect(planD1Reconciliation({ desired, inventory: inventory([automatic]), recorded })).toEqual({
+      kind: "none",
+      observed: automatic,
+    })
+  })
+
   it("quarantines duplicate names and missing or conflicting recorded identities", () => {
     const desired = { name: "nozzle-production-001" }
     expect(
@@ -465,6 +499,7 @@ describe("D1 desired-recorded-observed reconciliation", () => {
       { jurisdiction: "moon", name: "valid" },
       { locationHint: "moon", name: "valid" },
       { jurisdiction: "eu", locationHint: "oc", name: "valid" },
+      { name: "valid", readReplication: { mode: "future" } },
     ]) {
       expect(() => planD1Reconciliation({ ...base, desired } as never)).toThrow()
     }

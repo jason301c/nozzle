@@ -4,12 +4,19 @@ export type D1Jurisdiction = "eu" | "fedramp"
 
 export type D1LocationHint = "apac" | "eeur" | "enam" | "oc" | "weur" | "wnam"
 
+export type D1ReadReplicationMode = "auto" | "disabled"
+
+export interface D1ReadReplication {
+  readonly mode: D1ReadReplicationMode
+}
+
 export interface ObservedD1Database {
   readonly createdAt?: string
   readonly fileSize?: number
   readonly jurisdiction?: D1Jurisdiction
   readonly name: string
   readonly numTables?: number
+  readonly readReplication?: D1ReadReplication
   readonly uuid: string
   readonly version?: string
 }
@@ -40,6 +47,11 @@ export interface DesiredD1Database {
   readonly jurisdiction?: D1Jurisdiction
   readonly locationHint?: D1LocationHint
   readonly name: string
+  readonly readReplication?: D1ReadReplication
+}
+
+export interface D1DatabaseUpdate {
+  readonly readReplication: D1ReadReplication
 }
 
 export interface RecordedD1Database extends DesiredD1Database {
@@ -54,6 +66,17 @@ export type D1ReconciliationAction =
       readonly kind: "inspect_for_adoption"
     }
   | { readonly kind: "none"; readonly observed: ObservedD1Database }
+  | {
+      readonly desired: DesiredD1Database
+      readonly kind: "inspect_recorded"
+      readonly observed: ObservedD1Database
+      readonly recorded: RecordedD1Database
+    }
+  | {
+      readonly databaseId: string
+      readonly kind: "update_read_replication"
+      readonly readReplication: D1ReadReplication
+    }
   | {
       readonly kind: "quarantine_drift"
       readonly observed?: ObservedD1Database
@@ -119,6 +142,23 @@ function optionalNonNegativeInteger(value: unknown, label: string): number | und
   return value
 }
 
+function optionalReadReplication(value: unknown, label: string): D1ReadReplication | undefined {
+  if (value === undefined) return undefined
+  if (!plainRecord(value) || (value.mode !== "auto" && value.mode !== "disabled")) {
+    return providerError(`${label} is malformed.`)
+  }
+  return Object.freeze({ mode: value.mode })
+}
+
+function validateReadReplication(
+  value: unknown,
+  label: string,
+): asserts value is D1ReadReplication {
+  if (!plainRecord(value) || (value.mode !== "auto" && value.mode !== "disabled")) {
+    configuration(`${label} is unsupported.`)
+  }
+}
+
 function validateObservedDatabase(value: unknown): asserts value is ObservedD1Database {
   if (!plainRecord(value)) return providerError("Observed D1 database is malformed.")
   providerString(value.name, "Observed D1 name")
@@ -133,6 +173,7 @@ function validateObservedDatabase(value: unknown): asserts value is ObservedD1Da
   optionalString(value.createdAt, "Observed D1 creation time")
   optionalNonNegativeInteger(value.fileSize, "Observed D1 file size")
   optionalNonNegativeInteger(value.numTables, "Observed D1 table count")
+  optionalReadReplication(value.readReplication, "Observed D1 read replication")
   optionalString(value.version, "Observed D1 version")
 }
 
@@ -151,6 +192,10 @@ export function decodeObservedD1Database(value: unknown): ObservedD1Database {
   const createdAt = optionalString(value.created_at, "Observed D1 creation time")
   const fileSize = optionalNonNegativeInteger(value.file_size, "Observed D1 file size")
   const numTables = optionalNonNegativeInteger(value.num_tables, "Observed D1 table count")
+  const readReplication = optionalReadReplication(
+    value.read_replication,
+    "Observed D1 read replication",
+  )
   const version = optionalString(value.version, "Observed D1 version")
   return Object.freeze({
     ...(createdAt === undefined ? {} : { createdAt }),
@@ -160,6 +205,7 @@ export function decodeObservedD1Database(value: unknown): ObservedD1Database {
       : { jurisdiction: value.jurisdiction as D1Jurisdiction }),
     name: value.name,
     ...(numTables === undefined ? {} : { numTables }),
+    ...(readReplication === undefined ? {} : { readReplication }),
     uuid: value.uuid,
     ...(version === undefined ? {} : { version }),
   })
@@ -363,6 +409,9 @@ function validateDesired(desired: DesiredD1Database): void {
   if (desired.jurisdiction !== undefined && desired.locationHint !== undefined) {
     configuration("D1 jurisdiction and location hint cannot both be authoritative.")
   }
+  if (desired.readReplication !== undefined) {
+    validateReadReplication(desired.readReplication, "Desired D1 read replication")
+  }
 }
 
 function validateInventory(inventory: CompleteD1Inventory): void {
@@ -428,6 +477,24 @@ export function planD1Reconciliation(input: {
         kind: "quarantine_drift",
         observed: identified,
         reason: "immutable_jurisdiction_mismatch",
+      })
+    }
+    if (input.desired.readReplication !== undefined && identified.readReplication === undefined) {
+      return Object.freeze({
+        desired: input.desired,
+        kind: "inspect_recorded",
+        observed: identified,
+        recorded: input.recorded,
+      })
+    }
+    if (
+      input.desired.readReplication !== undefined &&
+      identified.readReplication?.mode !== input.desired.readReplication.mode
+    ) {
+      return Object.freeze({
+        databaseId: identified.uuid,
+        kind: "update_read_replication",
+        readReplication: input.desired.readReplication,
       })
     }
     return Object.freeze({ kind: "none", observed: identified })

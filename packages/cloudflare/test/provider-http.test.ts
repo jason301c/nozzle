@@ -363,6 +363,36 @@ describe("Cloudflare D1 mutation transport", () => {
     expect(body).toBe(JSON.stringify({ name: "database-1", primary_location_hint: "oc" }))
   })
 
+  it("creates and updates the documented read-replication setting", async () => {
+    const calls: { readonly init: RequestInit; readonly url: string }[] = []
+    const provider = client((url, init) => {
+      calls.push({ init, url })
+      return providerResponse({ ...database(1), read_replication: { mode: "auto" } })
+    })
+    await expect(
+      provider.createDatabase({ name: "database-1", readReplication: { mode: "auto" } }),
+    ).resolves.toMatchObject({
+      kind: "confirmed",
+      value: { readReplication: { mode: "auto" } },
+    })
+    await expect(
+      provider.updateDatabase(databaseId, { readReplication: { mode: "auto" } }),
+    ).resolves.toMatchObject({
+      kind: "confirmed",
+      value: { readReplication: { mode: "auto" } },
+    })
+    expect(calls[0]?.init.body).toBe(
+      JSON.stringify({ name: "database-1", read_replication: { mode: "auto" } }),
+    )
+    expect(calls[1]).toMatchObject({
+      init: {
+        body: JSON.stringify({ read_replication: { mode: "auto" } }),
+        method: "PATCH",
+      },
+      url: `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${databaseId}`,
+    })
+  })
+
   it("rejects malformed or contradictory desired state before a request", async () => {
     let calls = 0
     const provider = client(() => {
@@ -374,8 +404,31 @@ describe("Cloudflare D1 mutation transport", () => {
       { jurisdiction: "moon", name: "database" },
       { locationHint: "moon", name: "database" },
       { jurisdiction: "eu", locationHint: "oc", name: "database" },
+      { name: "database", readReplication: { mode: "future" } },
     ]) {
       await expect(provider.createDatabase(desired as never)).rejects.toThrow()
+    }
+    expect(calls).toBe(0)
+  })
+
+  it("rejects malformed read-replication updates before a request", async () => {
+    let calls = 0
+    const provider = client(() => {
+      calls += 1
+      return providerResponse(database(1))
+    })
+    for (const update of [
+      null,
+      {},
+      { readReplication: null },
+      { readReplication: {} },
+      {
+        readReplication: { mode: "future" },
+      },
+    ]) {
+      await expect(provider.updateDatabase(databaseId, update as never)).rejects.toThrow(
+        /read-replication update is unsupported/u,
+      )
     }
     expect(calls).toBe(0)
   })

@@ -2,6 +2,7 @@ import { NozzleError } from "@nozzle/core"
 import {
   type CompleteD1Inventory,
   classifyProviderAttempt,
+  type D1DatabaseUpdate,
   type D1ListPage,
   type DesiredD1Database,
   decodeD1ListPage,
@@ -16,7 +17,7 @@ const DEFAULT_D1_PAGE_SIZE = 1_000
 const DEFAULT_MAX_INVENTORY_PAGES = 100
 const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
-export type D1ProviderEndpoint = "d1.create" | "d1.delete" | "d1.get" | "d1.list"
+export type D1ProviderEndpoint = "d1.create" | "d1.delete" | "d1.get" | "d1.list" | "d1.update"
 
 export interface CloudflareRateLimitSnapshot {
   readonly quota?: number
@@ -111,6 +112,11 @@ export interface CloudflareD1ProviderClient {
     options?: { readonly signal?: AbortSignal },
   ): Promise<ProviderResourceObservation<ObservedD1Database>>
   listInventory(options?: { readonly signal?: AbortSignal }): Promise<D1InventoryResult>
+  updateDatabase(
+    databaseId: string,
+    update: D1DatabaseUpdate,
+    options?: { readonly signal?: AbortSignal },
+  ): Promise<ProviderMutationResult<ObservedD1Database>>
 }
 
 export interface CloudflareD1ProviderClientOptions {
@@ -341,6 +347,49 @@ function classifyEvidence(
   })
 }
 
+function decodeDatabaseMutation(result: RawAttempt): ProviderMutationResult<ObservedD1Database> {
+  const decision = classifyEvidence(result.evidence, true)
+  if (decision.disposition === "unknown_outcome") {
+    return Object.freeze({
+      errors: freezeErrors(result.body),
+      evidence: result.evidence,
+      kind: "unknown",
+      reason: result.evidence.status === null ? "transport_error" : "ambiguous_status",
+    })
+  }
+  if (decision.disposition === "retry" || decision.disposition === "permanent_failure") {
+    return Object.freeze({
+      decision,
+      errors: freezeErrors(result.body),
+      evidence: result.evidence,
+      kind: "rejected",
+    })
+  }
+  const providerResult = envelopeResult(result.body)
+  if (result.evidence.bodyState !== "complete" || providerResult === undefined) {
+    return Object.freeze({
+      errors: freezeErrors(result.body),
+      evidence: result.evidence,
+      kind: "unknown",
+      reason: "malformed_response",
+    })
+  }
+  try {
+    return Object.freeze({
+      evidence: result.evidence,
+      kind: "confirmed",
+      value: decodeObservedD1Database(providerResult),
+    })
+  } catch {
+    return Object.freeze({
+      errors: freezeErrors(result.body),
+      evidence: result.evidence,
+      kind: "unknown",
+      reason: "malformed_response",
+    })
+  }
+}
+
 function databaseIdPath(databaseId: string): string {
   nonEmpty(databaseId, "Cloudflare D1 database ID")
   if (!/^[A-Fa-f0-9]{8}-(?:[A-Fa-f0-9]{4}-){3}[A-Fa-f0-9]{12}$/u.test(databaseId)) {
@@ -366,6 +415,23 @@ function validateDesiredDatabase(desired: DesiredD1Database): void {
   }
   if (desired.jurisdiction !== undefined && desired.locationHint !== undefined) {
     configuration("D1 jurisdiction and location hint cannot both be supplied.")
+  }
+  if (
+    desired.readReplication !== undefined &&
+    (!plainRecord(desired.readReplication) ||
+      (desired.readReplication.mode !== "auto" && desired.readReplication.mode !== "disabled"))
+  ) {
+    configuration("Desired D1 read replication is unsupported.")
+  }
+}
+
+function validateDatabaseUpdate(update: D1DatabaseUpdate): void {
+  if (
+    !plainRecord(update) ||
+    !plainRecord(update.readReplication) ||
+    (update.readReplication.mode !== "auto" && update.readReplication.mode !== "disabled")
+  ) {
+    configuration("D1 read-replication update is unsupported.")
   }
 }
 
@@ -395,7 +461,7 @@ export function createCloudflareD1ProviderClient(
   async function attempt(
     endpoint: D1ProviderEndpoint,
     url: string,
-    method: "DELETE" | "GET" | "POST",
+    method: "DELETE" | "GET" | "PATCH" | "POST",
     body: string | undefined,
     signal: AbortSignal | undefined,
   ): Promise<RawAttempt> {
@@ -590,48 +656,12 @@ export function createCloudflareD1ProviderClient(
       ...(desired.locationHint === undefined
         ? {}
         : { primary_location_hint: desired.locationHint }),
+      ...(desired.readReplication === undefined
+        ? {}
+        : { read_replication: desired.readReplication }),
     })
     const result = await attempt("d1.create", accountPath, "POST", body, callOptions.signal)
-    const decision = classifyEvidence(result.evidence, true)
-    if (decision.disposition === "unknown_outcome") {
-      return Object.freeze({
-        errors: freezeErrors(result.body),
-        evidence: result.evidence,
-        kind: "unknown",
-        reason: result.evidence.status === null ? "transport_error" : "ambiguous_status",
-      })
-    }
-    if (decision.disposition === "retry" || decision.disposition === "permanent_failure") {
-      return Object.freeze({
-        decision,
-        errors: freezeErrors(result.body),
-        evidence: result.evidence,
-        kind: "rejected",
-      })
-    }
-    const providerResult = envelopeResult(result.body)
-    if (result.evidence.bodyState !== "complete" || providerResult === undefined) {
-      return Object.freeze({
-        errors: freezeErrors(result.body),
-        evidence: result.evidence,
-        kind: "unknown",
-        reason: "malformed_response",
-      })
-    }
-    try {
-      return Object.freeze({
-        evidence: result.evidence,
-        kind: "confirmed",
-        value: decodeObservedD1Database(providerResult),
-      })
-    } catch {
-      return Object.freeze({
-        errors: freezeErrors(result.body),
-        evidence: result.evidence,
-        kind: "unknown",
-        reason: "malformed_response",
-      })
-    }
+    return decodeDatabaseMutation(result)
   }
 
   async function deleteDatabase(
@@ -673,5 +703,27 @@ export function createCloudflareD1ProviderClient(
     return Object.freeze({ evidence: result.evidence, kind: "confirmed", value: undefined })
   }
 
-  return Object.freeze({ createDatabase, deleteDatabase, getDatabase, listInventory })
+  async function updateDatabase(
+    databaseId: string,
+    update: D1DatabaseUpdate,
+    callOptions: { readonly signal?: AbortSignal } = {},
+  ): Promise<ProviderMutationResult<ObservedD1Database>> {
+    validateDatabaseUpdate(update)
+    const result = await attempt(
+      "d1.update",
+      `${accountPath}/${databaseIdPath(databaseId)}`,
+      "PATCH",
+      JSON.stringify({ read_replication: update.readReplication }),
+      callOptions.signal,
+    )
+    return decodeDatabaseMutation(result)
+  }
+
+  return Object.freeze({
+    createDatabase,
+    deleteDatabase,
+    getDatabase,
+    listInventory,
+    updateDatabase,
+  })
 }
