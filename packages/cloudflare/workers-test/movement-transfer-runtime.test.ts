@@ -1,7 +1,17 @@
 import { env } from "cloudflare:workers"
+import { SchemaRegistry } from "@nozzle/drizzle"
+import { primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { beforeAll, describe, expect, it } from "vitest"
 import { generateMovementCaptureSql } from "../src/movement-capture.js"
-import { generateMovementTransferSql, movementTransferViewName } from "../src/movement-transfer.js"
+import {
+  compileMovementDelete,
+  compileMovementPage,
+  compileMovementReplayRead,
+  compileMovementReplayReceipt,
+  compileMovementUpsert,
+  decodeMovementPage,
+} from "../src/movement-data.js"
+import { generateMovementTransferSql } from "../src/movement-transfer.js"
 import { generateShardGuardSql } from "../src/shard-guards.js"
 
 declare global {
@@ -13,6 +23,20 @@ declare global {
 }
 
 const token = "t".repeat(43)
+const deleteToken = "d".repeat(43)
+const transferRecords = sqliteTable(
+  "transfer_records",
+  {
+    id: text().notNull(),
+    workspaceId: text("workspace_id").notNull(),
+    payload: text().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.id, table.workspaceId] })],
+)
+const table = new SchemaRegistry({
+  partitionKey: "workspaceId",
+  schema: { transferRecords },
+}).table(transferRecords)
 
 beforeAll(async () => {
   await env.DB.prepare(`CREATE TABLE "transfer_records" (
@@ -73,22 +97,42 @@ beforeAll(async () => {
     .run()
 })
 
-function apply(payload: string): D1PreparedStatement {
-  return env.DB.prepare(
-    `INSERT INTO "${movementTransferViewName("transfer_records")}"
-     ("id", "workspace_id", "payload", "__nozzle_bucket",
-      "__nozzle_capability_token", "__nozzle_mutation_hint")
-     VALUES ('record-1', 'workspace-a', ?1, 77, ?2, 'upsert')`,
-  ).bind(payload, token)
+function prepared(statement: { readonly params: readonly unknown[]; readonly sql: string }) {
+  return env.DB.prepare(statement.sql).bind(...statement.params)
 }
 
-function receipt(): D1PreparedStatement {
-  return env.DB.prepare(
-    `INSERT INTO "nozzle_movement_replay_receipts"
-     ("operation_id", "source_sequence", "table_id", "key_json", "mutation_hint",
-      "result_checksum", "applied_at_ms")
-     VALUES ('movement-transfer', 1, 'transfer_records', '[]', 'upsert', 'result-1', 1)
-     ON CONFLICT ("operation_id", "source_sequence") DO NOTHING`,
+const keyJson = JSON.stringify([
+  { column: "id", type: "text", value: "record-1" },
+  { column: "workspace_id", type: "text", value: "workspace-a" },
+])
+
+function apply(payload: string): D1PreparedStatement {
+  return prepared(
+    compileMovementUpsert({
+      capabilityToken: token,
+      destinationBucketId: 77,
+      row: {
+        __nozzle_bucket: 12,
+        id: "record-1",
+        payload,
+        workspace_id: "workspace-a",
+      },
+      table,
+    }),
+  )
+}
+
+function receipt(sequence = 1, mutationHint: "delete" | "upsert" = "upsert") {
+  return prepared(
+    compileMovementReplayReceipt({
+      appliedAtMs: 1,
+      keyJson,
+      mutationHint,
+      operationId: "movement-transfer",
+      resultChecksum: `result-${sequence}`,
+      sourceSequence: sequence,
+      tableId: "transfer_records",
+    }),
   )
 }
 
@@ -104,6 +148,20 @@ describe("real workerd operation-scoped movement transfer", () => {
 
     await env.DB.batch([apply("copied"), receipt()])
     await env.DB.batch([apply("replayed"), receipt()])
+    const page = compileMovementPage({
+      limit: 10,
+      maxBytes: 10_000,
+      scope: { bucketId: 77 },
+      table,
+    })
+    const pageResult = await prepared(page).all()
+    expect(decodeMovementPage(pageResult.results, 10_000).rows).toMatchObject([
+      { payload: "replayed" },
+    ])
+    const current = compileMovementReplayRead({ keyJson, sourceBucketId: 77, table })
+    await expect(prepared(current).all()).resolves.toMatchObject({
+      results: [{ payload: "replayed" }],
+    })
     await expect(env.DB.prepare(`SELECT * FROM "transfer_records"`).first()).resolves.toEqual({
       __nozzle_bucket: 77,
       id: "record-1",
@@ -117,5 +175,29 @@ describe("real workerd operation-scoped movement transfer", () => {
       env.DB.prepare(`SELECT count(*) AS "count" FROM "nozzle_operation_write_context"`).first(),
     ).resolves.toEqual({ count: 0 })
     await expect(apply("exhausted").run()).rejects.toThrow(/NOZZLE_OPERATION_CAPABILITY_INVALID/u)
+
+    await env.DB.prepare(
+      `INSERT INTO "nozzle_operation_write_capabilities"
+       ("capability_token", "operation_id", "bucket_id", "table_id", "mode",
+        "fencing_token", "expires_at_ms", "remaining_uses", "issued_at_ms")
+       VALUES (?1, 'movement-transfer', 77, 'transfer_records', 'delete', 3,
+         9999999999999, 1, 1)`,
+    )
+      .bind(deleteToken)
+      .run()
+    await env.DB.batch([
+      prepared(
+        compileMovementDelete({
+          capabilityToken: deleteToken,
+          destinationBucketId: 77,
+          keyJson,
+          table,
+        }),
+      ),
+      receipt(2, "delete"),
+    ])
+    await expect(
+      env.DB.prepare(`SELECT count(*) AS "count" FROM "transfer_records"`).first(),
+    ).resolves.toEqual({ count: 0 })
   })
 })

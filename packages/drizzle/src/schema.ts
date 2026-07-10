@@ -3,6 +3,7 @@ import { type AnyColumn, getTableColumns, getTableName, isTable } from "drizzle-
 import { type AnySQLiteTable, getTableConfig, type SQLiteColumn } from "drizzle-orm/sqlite-core"
 
 export type TableClass = "global" | "sharded"
+export type SQLiteStorageType = "blob" | "integer" | "numeric" | "real" | "text"
 
 export interface ColumnMetadata {
   readonly column: SQLiteColumn
@@ -11,6 +12,8 @@ export interface ColumnMetadata {
   readonly notNull: boolean
   readonly primary: boolean
   readonly propertyName: string
+  readonly sqlType: string
+  readonly storageType: SQLiteStorageType
 }
 
 export interface TableMetadata<TTable extends AnySQLiteTable = AnySQLiteTable> {
@@ -35,6 +38,15 @@ function sqliteIdentifierKey(identifier: string): string {
 function reservedIdentifier(identifier: string): boolean {
   const key = sqliteIdentifierKey(identifier)
   return key.startsWith("__nozzle_") || key.startsWith("nozzle_")
+}
+
+function sqliteStorageType(sqlType: string): SQLiteStorageType {
+  const type = sqlType.toUpperCase()
+  if (type.includes("INT")) return "integer"
+  if (type.includes("CHAR") || type.includes("CLOB") || type.includes("TEXT")) return "text"
+  if (type.includes("BLOB") || type.length === 0) return "blob"
+  if (type.includes("REAL") || type.includes("FLOA") || type.includes("DOUB")) return "real"
+  return "numeric"
 }
 
 function compareCodeUnits(left: string, right: string): number {
@@ -110,6 +122,7 @@ export class SchemaRegistry<TSchema extends Record<string, unknown> = Record<str
           )
         }
         columnNames.add(columnNameKey)
+        const sqlType = column.getSQLType()
         const metadata: ColumnMetadata = Object.freeze({
           column: column as SQLiteColumn,
           dataType: column.dataType,
@@ -117,6 +130,8 @@ export class SchemaRegistry<TSchema extends Record<string, unknown> = Record<str
           notNull: column.notNull,
           primary: column.primary,
           propertyName,
+          sqlType,
+          storageType: sqliteStorageType(sqlType),
         })
         this.#columns.set(column, metadata)
         return metadata
@@ -141,6 +156,16 @@ export class SchemaRegistry<TSchema extends Record<string, unknown> = Record<str
         throw new NozzleError(
           "ConfigurationError",
           "Every sharded primary-key column must be explicitly non-null.",
+          { details: { tableName } },
+        )
+      }
+      if (
+        classification === "sharded" &&
+        primaryColumns.some((column) => column.storageType === "numeric")
+      ) {
+        throw new NozzleError(
+          "ConfigurationError",
+          "Sharded primary-key columns require a deterministic SQLite storage affinity.",
           { details: { tableName } },
         )
       }

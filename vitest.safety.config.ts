@@ -9,6 +9,7 @@ export default defineConfig({
         "packages/cloudflare/src/drizzle-movement-capture.ts",
         "packages/cloudflare/src/drizzle-movement-transfer.ts",
         "packages/cloudflare/src/movement-capture.ts",
+        "packages/cloudflare/src/movement-data.ts",
         "packages/cloudflare/src/movement-transfer.ts",
         "packages/cloudflare/src/shard-guards.ts",
         "packages/control/src/lease-store.ts",

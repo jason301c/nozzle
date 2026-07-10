@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm"
-import { blob, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core"
+import { blob, integer, numeric, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { describe, expect, it } from "vitest"
 import { compilePlan } from "../src/compiler.js"
 import { and, eq, gt, inArray, isNotNull, isNull, ne, or } from "../src/expression.js"
@@ -63,6 +63,7 @@ describe("Drizzle schema registry", () => {
     const project = registry.table(projects)
     expect(project.classification).toBe("sharded")
     expect(project.partitionColumn?.dbName).toBe("workspace_id")
+    expect(project.partitionColumn?.storageType).toBe("text")
     expect(project.primaryColumns.map((column) => column.propertyName)).toEqual(["id"])
     expect(registry.table(events).primaryColumns.map((column) => column.propertyName)).toEqual([
       "workspaceId",
@@ -152,6 +153,15 @@ describe("Drizzle schema registry", () => {
     expect(
       () => new SchemaRegistry({ schema: { nullablePrimary }, partitionKey: "workspaceId" }),
     ).toThrow("primary-key column must be explicitly non-null")
+
+    const numericPrimary = sqliteTable(
+      "numeric_primary",
+      { id: numeric().notNull(), workspaceId: text("workspace_id").notNull() },
+      (table) => [primaryKey({ columns: [table.id] })],
+    )
+    expect(
+      () => new SchemaRegistry({ schema: { numericPrimary }, partitionKey: "workspaceId" }),
+    ).toThrow("deterministic SQLite storage affinity")
 
     const nozzleTable = sqliteTable("Nozzle_Application", {
       id: text().primaryKey(),
