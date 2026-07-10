@@ -63,6 +63,53 @@ export interface MovementOperation {
   readonly targetRouteEpoch: number
 }
 
+const MOVEMENT_PHASE_SET = new Set<MovementPhase>(MOVEMENT_PHASES)
+const MOVEMENT_OPERATION_KEYS = new Set([
+  "block",
+  "captureSchemaChecksum",
+  "captureStartSequence",
+  "cleanupAuthorizationChecksum",
+  "cleanupFencingToken",
+  "copy",
+  "destinationDigest",
+  "destinationRowCount",
+  "destinationShardId",
+  "operationId",
+  "partitionDigest",
+  "phase",
+  "publishedRouteChecksum",
+  "quarantineUntilServerTimeMs",
+  "recovery",
+  "replayedThroughSequence",
+  "requiredTableIds",
+  "sourceRouteEpoch",
+  "sourceShardId",
+  "tailSequence",
+  "targetRouteEpoch",
+])
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function corrupt(message: string): never {
+  throw new NozzleError("OperationInterventionRequiredError", message)
+}
+
+function persistedString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0
+}
+
+function persistedNonNegative(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+}
+
+function persistedPositive(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1
+}
+
 function configuration(message: string): never {
   throw new NozzleError("ConfigurationError", message)
 }
@@ -166,6 +213,268 @@ export function createMovementOperation(input: {
     sourceRouteEpoch: input.sourceRouteEpoch,
     sourceShardId: input.sourceShardId,
     targetRouteEpoch: input.targetRouteEpoch,
+  })
+}
+
+export function loadMovementOperation(candidate: unknown): MovementOperation {
+  if (!plainRecord(candidate)) corrupt("Persisted movement state must be an object.")
+  if (Object.keys(candidate).some((key) => !MOVEMENT_OPERATION_KEYS.has(key))) {
+    corrupt("Persisted movement state contains unknown fields.")
+  }
+  if (
+    !persistedString(candidate.operationId) ||
+    !persistedString(candidate.partitionDigest) ||
+    !persistedString(candidate.sourceShardId) ||
+    !persistedString(candidate.destinationShardId) ||
+    !Array.isArray(candidate.requiredTableIds) ||
+    !persistedNonNegative(candidate.sourceRouteEpoch) ||
+    !persistedPositive(candidate.targetRouteEpoch)
+  ) {
+    corrupt("Persisted movement plan is malformed.")
+  }
+  let base: MovementOperation
+  try {
+    base = createMovementOperation({
+      destinationShardId: candidate.destinationShardId,
+      operationId: candidate.operationId,
+      partitionDigest: candidate.partitionDigest,
+      requiredTableIds: candidate.requiredTableIds as readonly string[],
+      sourceRouteEpoch: candidate.sourceRouteEpoch,
+      sourceShardId: candidate.sourceShardId,
+      targetRouteEpoch: candidate.targetRouteEpoch,
+    })
+  } catch {
+    return corrupt("Persisted movement plan violates immutable plan invariants.")
+  }
+  if (
+    typeof candidate.phase !== "string" ||
+    !MOVEMENT_PHASE_SET.has(candidate.phase as MovementPhase)
+  ) {
+    corrupt("Persisted movement phase is invalid.")
+  }
+  if (!plainRecord(candidate.copy)) corrupt("Persisted movement copy state is malformed.")
+  if (
+    Object.keys(candidate.copy).length !== base.requiredTableIds.length ||
+    base.requiredTableIds.some((tableId) => !Object.hasOwn(candidate.copy as object, tableId))
+  ) {
+    corrupt("Persisted movement copy membership does not match the immutable plan.")
+  }
+  let incompleteSeen = false
+  const copy: Record<string, MovementTableCopyState> = {}
+  for (const tableId of base.requiredTableIds) {
+    const state = candidate.copy[tableId]
+    if (
+      !plainRecord(state) ||
+      Object.keys(state).sort().join(",") !== "bytesCopied,complete,cursor,rowsCopied" ||
+      !persistedNonNegative(state.bytesCopied) ||
+      typeof state.complete !== "boolean" ||
+      !(state.cursor === null || persistedString(state.cursor)) ||
+      !persistedNonNegative(state.rowsCopied) ||
+      (state.complete && state.cursor !== null)
+    ) {
+      corrupt("Persisted movement table checkpoint is malformed.")
+    }
+    if (
+      incompleteSeen &&
+      (state.bytesCopied !== 0 || state.cursor !== null || state.rowsCopied !== 0)
+    ) {
+      corrupt("Persisted movement table checkpoints violate dependency order.")
+    }
+    if (!state.complete) incompleteSeen = true
+    copy[tableId] = Object.freeze({
+      bytesCopied: state.bytesCopied,
+      complete: state.complete,
+      cursor: state.cursor,
+      rowsCopied: state.rowsCopied,
+    })
+  }
+
+  const captureFields = [
+    candidate.captureSchemaChecksum,
+    candidate.captureStartSequence,
+    candidate.replayedThroughSequence,
+  ]
+  if (captureFields.some((value) => value !== undefined)) {
+    if (
+      !persistedString(candidate.captureSchemaChecksum) ||
+      !persistedNonNegative(candidate.captureStartSequence) ||
+      !persistedNonNegative(candidate.replayedThroughSequence) ||
+      candidate.replayedThroughSequence < candidate.captureStartSequence
+    ) {
+      corrupt("Persisted movement capture state is malformed.")
+    }
+  }
+  const destinationFields = [candidate.destinationDigest, candidate.destinationRowCount]
+  if (destinationFields.some((value) => value !== undefined)) {
+    if (
+      !persistedString(candidate.destinationDigest) ||
+      !persistedNonNegative(candidate.destinationRowCount)
+    ) {
+      corrupt("Persisted movement destination evidence is malformed.")
+    }
+  }
+  const cleanupFields = [candidate.cleanupAuthorizationChecksum, candidate.cleanupFencingToken]
+  if (cleanupFields.some((value) => value !== undefined)) {
+    if (
+      !persistedString(candidate.cleanupAuthorizationChecksum) ||
+      !persistedPositive(candidate.cleanupFencingToken)
+    ) {
+      corrupt("Persisted movement cleanup authorization is malformed.")
+    }
+  }
+  if (
+    candidate.tailSequence !== undefined &&
+    (!persistedNonNegative(candidate.tailSequence) ||
+      candidate.tailSequence !== candidate.replayedThroughSequence)
+  ) {
+    corrupt("Persisted movement tail evidence is malformed.")
+  }
+  if (
+    candidate.publishedRouteChecksum !== undefined &&
+    !persistedString(candidate.publishedRouteChecksum)
+  ) {
+    corrupt("Persisted movement route evidence is malformed.")
+  }
+  if (
+    candidate.quarantineUntilServerTimeMs !== undefined &&
+    !persistedNonNegative(candidate.quarantineUntilServerTimeMs)
+  ) {
+    corrupt("Persisted movement quarantine state is malformed.")
+  }
+
+  let block: MovementBlock | undefined
+  if (candidate.block !== undefined) {
+    if (
+      !plainRecord(candidate.block) ||
+      Object.keys(candidate.block).sort().join(",") !==
+        "controlSequence,errorChecksum,fencingToken,outcome,phase" ||
+      !persistedPositive(candidate.block.controlSequence) ||
+      !persistedString(candidate.block.errorChecksum) ||
+      !persistedPositive(candidate.block.fencingToken) ||
+      !(["definitely_not_applied", "permanent", "unknown"] as const).includes(
+        candidate.block.outcome as MovementBlock["outcome"],
+      ) ||
+      typeof candidate.block.phase !== "string" ||
+      !MOVEMENT_PHASE_SET.has(candidate.block.phase as MovementPhase)
+    ) {
+      corrupt("Persisted movement block is malformed.")
+    }
+    block = Object.freeze({
+      controlSequence: candidate.block.controlSequence,
+      errorChecksum: candidate.block.errorChecksum,
+      fencingToken: candidate.block.fencingToken,
+      outcome: candidate.block.outcome as MovementBlock["outcome"],
+      phase: candidate.block.phase as MovementPhase,
+    })
+  }
+  let recovery: MovementRecoveryAuthorization | undefined
+  if (candidate.recovery !== undefined) {
+    if (
+      !block ||
+      !plainRecord(candidate.recovery) ||
+      Object.keys(candidate.recovery).sort().join(",") !== "decisionChecksum,fencingToken" ||
+      !persistedString(candidate.recovery.decisionChecksum) ||
+      !persistedPositive(candidate.recovery.fencingToken) ||
+      candidate.recovery.fencingToken <= block.fencingToken
+    ) {
+      corrupt("Persisted movement recovery authorization is malformed.")
+    }
+    recovery = Object.freeze({
+      decisionChecksum: candidate.recovery.decisionChecksum,
+      fencingToken: candidate.recovery.fencingToken,
+    })
+  }
+
+  const phase = candidate.phase as MovementPhase
+  const captureRequired = !(["planned", "rollback_pending", "rolled_back"] as const).includes(
+    phase as "planned",
+  )
+  if (captureRequired && captureFields.some((value) => value === undefined)) {
+    corrupt("Persisted movement phase lacks capture evidence.")
+  }
+  const copyRequired = [
+    "replaying",
+    "source_read_only",
+    "tail_drained",
+    "destination_writable",
+    "route_published",
+    "verified",
+    "quarantined",
+    "cleanup_authorized",
+    "completed",
+  ].includes(phase)
+  if (copyRequired && base.requiredTableIds.some((tableId) => !copy[tableId]?.complete)) {
+    corrupt("Persisted movement phase lacks a completed base copy.")
+  }
+  const tailRequired = [
+    "tail_drained",
+    "destination_writable",
+    "route_published",
+    "verified",
+    "quarantined",
+    "cleanup_authorized",
+    "completed",
+  ].includes(phase)
+  if (tailRequired && candidate.tailSequence === undefined) {
+    corrupt("Persisted movement phase lacks drained-tail evidence.")
+  }
+  const destinationRequired = [
+    "destination_writable",
+    "route_published",
+    "verified",
+    "quarantined",
+    "cleanup_authorized",
+    "completed",
+  ].includes(phase)
+  if (destinationRequired && destinationFields.some((value) => value === undefined)) {
+    corrupt("Persisted movement phase lacks destination verification.")
+  }
+  const routeRequired = [
+    "route_published",
+    "verified",
+    "quarantined",
+    "cleanup_authorized",
+    "completed",
+  ].includes(phase)
+  if (routeRequired && candidate.publishedRouteChecksum === undefined) {
+    corrupt("Persisted movement phase lacks route publication evidence.")
+  }
+  const quarantineRequired = ["quarantined", "cleanup_authorized", "completed"].includes(phase)
+  if (quarantineRequired && candidate.quarantineUntilServerTimeMs === undefined) {
+    corrupt("Persisted movement phase lacks quarantine evidence.")
+  }
+  const cleanupRequired = ["cleanup_authorized", "completed"].includes(phase)
+  if (cleanupRequired && cleanupFields.some((value) => value === undefined)) {
+    corrupt("Persisted movement phase lacks cleanup authorization.")
+  }
+
+  const captureSchemaChecksum = candidate.captureSchemaChecksum as string | undefined
+  const captureStartSequence = candidate.captureStartSequence as number | undefined
+  const cleanupAuthorizationChecksum = candidate.cleanupAuthorizationChecksum as string | undefined
+  const cleanupFencingToken = candidate.cleanupFencingToken as number | undefined
+  const destinationDigest = candidate.destinationDigest as string | undefined
+  const destinationRowCount = candidate.destinationRowCount as number | undefined
+  const publishedRouteChecksum = candidate.publishedRouteChecksum as string | undefined
+  const quarantineUntilServerTimeMs = candidate.quarantineUntilServerTimeMs as number | undefined
+  const replayedThroughSequence = candidate.replayedThroughSequence as number | undefined
+  const tailSequence = candidate.tailSequence as number | undefined
+
+  return Object.freeze({
+    ...base,
+    ...(block ? { block } : {}),
+    ...(captureSchemaChecksum === undefined ? {} : { captureSchemaChecksum }),
+    ...(captureStartSequence === undefined ? {} : { captureStartSequence }),
+    ...(cleanupAuthorizationChecksum === undefined ? {} : { cleanupAuthorizationChecksum }),
+    ...(cleanupFencingToken === undefined ? {} : { cleanupFencingToken }),
+    copy: Object.freeze(copy),
+    ...(destinationDigest === undefined ? {} : { destinationDigest }),
+    ...(destinationRowCount === undefined ? {} : { destinationRowCount }),
+    phase,
+    ...(publishedRouteChecksum === undefined ? {} : { publishedRouteChecksum }),
+    ...(quarantineUntilServerTimeMs === undefined ? {} : { quarantineUntilServerTimeMs }),
+    ...(recovery ? { recovery } : {}),
+    ...(replayedThroughSequence === undefined ? {} : { replayedThroughSequence }),
+    ...(tailSequence === undefined ? {} : { tailSequence }),
   })
 }
 

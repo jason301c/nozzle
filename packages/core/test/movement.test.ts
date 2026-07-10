@@ -9,6 +9,7 @@ import {
   createMovementOperation,
   drainMovementTail,
   fenceMovementSource,
+  loadMovementOperation,
   type MovementOperation,
   publishMovementRoute,
   recordMovementCopyPage,
@@ -88,6 +89,36 @@ function published(): MovementOperation {
   })
 }
 
+function completedMovement(): MovementOperation {
+  let operation = verifyMovementRuntime(published(), runtimeEvidence)
+  operation = startMovementQuarantine(operation, {
+    serverTimeMs: 1,
+    untilServerTimeMs: 2,
+  })
+  operation = authorizeMovementCleanup(operation, {
+    authorizationChecksum: "authorization",
+    fencingToken: 3,
+    serverTimeMs: 2,
+  })
+  return completeMovement(operation, {
+    captureJournalCompacted: true,
+    destinationVerified: true,
+    sourceApplicationRowsDeleted: true,
+    sourcePartitionFenceRetained: true,
+  })
+}
+
+function persisted(operation: MovementOperation): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(operation)) as Record<string, unknown>
+}
+
+function nested(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("invalid test fixture")
+  }
+  return value as Record<string, unknown>
+}
+
 const runtimeEvidence = {
   destinationAccepts: true,
   directPathPassed: true,
@@ -97,6 +128,269 @@ const runtimeEvidence = {
 } as const
 
 describe("online movement protocol", () => {
+  it("strictly reconstructs durable movement checkpoints and rejects corruption", () => {
+    const rollback = completeMovementRollback(
+      requestMovementRollback(planned(), {
+        destinationReadOnlyVerified: false,
+        destinationWritesObserved: 0,
+      }),
+      {
+        activeRouteEpoch: 7,
+        captureDisabled: true,
+        destinationQuarantined: true,
+        sourceWritableVerified: true,
+      },
+    )
+    const blocked = blockMovement(copying(), {
+      controlSequence: 4,
+      errorChecksum: "error",
+      fencingToken: 2,
+      outcome: "unknown",
+    })
+    const recovered = authorizeMovementRecovery(blocked, {
+      decisionChecksum: "recover",
+      fencingToken: 3,
+    })
+    for (const operation of [planned(), copying(), completedMovement(), rollback, recovered]) {
+      const loaded = loadMovementOperation(persisted(operation))
+      expect(loaded).toEqual(operation)
+      expect(Object.isFrozen(loaded.copy)).toBe(true)
+    }
+    expect(loadMovementOperation(Object.assign(Object.create(null), persisted(planned())))).toEqual(
+      planned(),
+    )
+
+    const malformed: unknown[] = [null, [], { ...persisted(planned()), unknown: true }]
+    for (const candidate of malformed) {
+      expect(() => loadMovementOperation(candidate)).toThrow()
+    }
+
+    const badPlan = persisted(planned())
+    badPlan.operationId = ""
+    expect(() => loadMovementOperation(badPlan)).toThrow("plan is malformed")
+    const contradictoryPlan = persisted(planned())
+    contradictoryPlan.destinationShardId = "shard-a"
+    expect(() => loadMovementOperation(contradictoryPlan)).toThrow("plan invariants")
+    const badPhase = persisted(planned())
+    badPhase.phase = "bad"
+    expect(() => loadMovementOperation(badPhase)).toThrow("phase is invalid")
+
+    const copyFixtures = [
+      null,
+      {},
+      { parents: null, children: nested(persisted(planned()).copy).children },
+      {
+        ...nested(persisted(planned()).copy),
+        parents: { bytesCopied: -1, complete: false, cursor: null, rowsCopied: 0 },
+      },
+      {
+        ...nested(persisted(planned()).copy),
+        parents: { bytesCopied: 0, complete: "no", cursor: null, rowsCopied: 0 },
+      },
+      {
+        ...nested(persisted(planned()).copy),
+        parents: { bytesCopied: 0, complete: false, cursor: 1, rowsCopied: 0 },
+      },
+      {
+        ...nested(persisted(planned()).copy),
+        parents: { bytesCopied: 0, complete: true, cursor: "cursor", rowsCopied: 0 },
+      },
+      {
+        ...nested(persisted(planned()).copy),
+        parents: { bytesCopied: 0, complete: false, cursor: null, extra: true, rowsCopied: 0 },
+      },
+      {
+        children: { bytesCopied: 1, complete: false, cursor: "later", rowsCopied: 1 },
+        parents: { bytesCopied: 0, complete: false, cursor: null, rowsCopied: 0 },
+      },
+    ]
+    for (const copy of copyFixtures) {
+      const fixture = persisted(planned())
+      fixture.copy = copy
+      expect(() => loadMovementOperation(fixture)).toThrow()
+    }
+
+    const partialCapture = persisted(copying())
+    delete partialCapture.captureSchemaChecksum
+    expect(() => loadMovementOperation(partialCapture)).toThrow("capture state")
+    for (const [key, value] of [
+      ["captureSchemaChecksum", ""],
+      ["captureStartSequence", -1],
+      ["replayedThroughSequence", -1],
+      ["replayedThroughSequence", 9],
+    ] as const) {
+      const fixture = persisted(copying())
+      fixture[key] = value
+      expect(() => loadMovementOperation(fixture)).toThrow("capture state")
+    }
+
+    for (const [key, value] of [
+      ["destinationDigest", ""],
+      ["destinationRowCount", -1],
+    ] as const) {
+      const fixture = persisted(destinationWritable())
+      fixture[key] = value
+      expect(() => loadMovementOperation(fixture)).toThrow("destination evidence")
+    }
+    const partialDestination = persisted(destinationWritable())
+    delete partialDestination.destinationDigest
+    expect(() => loadMovementOperation(partialDestination)).toThrow("destination evidence")
+
+    const complete = persisted(completedMovement())
+    for (const [key, value, message] of [
+      ["cleanupAuthorizationChecksum", "", "cleanup authorization"],
+      ["cleanupFencingToken", 0, "cleanup authorization"],
+      ["tailSequence", -1, "tail evidence"],
+      ["tailSequence", 12, "tail evidence"],
+      ["publishedRouteChecksum", "", "route evidence"],
+      ["quarantineUntilServerTimeMs", -1, "quarantine state"],
+    ] as const) {
+      const fixture = { ...complete, [key]: value }
+      expect(() => loadMovementOperation(fixture)).toThrow(message)
+    }
+    const partialCleanup = { ...complete }
+    delete partialCleanup.cleanupAuthorizationChecksum
+    expect(() => loadMovementOperation(partialCleanup)).toThrow("cleanup authorization")
+
+    const blockFixtures = [
+      null,
+      {},
+      {
+        controlSequence: 0,
+        errorChecksum: "error",
+        fencingToken: 1,
+        outcome: "unknown",
+        phase: "copying",
+      },
+      {
+        controlSequence: 1,
+        errorChecksum: "",
+        fencingToken: 1,
+        outcome: "unknown",
+        phase: "copying",
+      },
+      {
+        controlSequence: 1,
+        errorChecksum: "error",
+        fencingToken: 0,
+        outcome: "unknown",
+        phase: "copying",
+      },
+      {
+        controlSequence: 1,
+        errorChecksum: "error",
+        fencingToken: 1,
+        outcome: "bad",
+        phase: "copying",
+      },
+      {
+        controlSequence: 1,
+        errorChecksum: "error",
+        fencingToken: 1,
+        outcome: "unknown",
+        phase: "bad",
+      },
+      {
+        controlSequence: 1,
+        errorChecksum: "error",
+        fencingToken: 1,
+        outcome: "unknown",
+        phase: "copying",
+        extra: true,
+      },
+    ]
+    for (const block of blockFixtures) {
+      const fixture = persisted(copying())
+      fixture.block = block
+      expect(() => loadMovementOperation(fixture)).toThrow("block is malformed")
+    }
+
+    const recoveryFixtures = [
+      { decisionChecksum: "decision", fencingToken: 2 },
+      null,
+      {},
+      { decisionChecksum: "", fencingToken: 3 },
+      { decisionChecksum: "decision", fencingToken: 0 },
+      { decisionChecksum: "decision", fencingToken: 2 },
+      { decisionChecksum: "decision", fencingToken: 3, extra: true },
+    ]
+    for (let index = 0; index < recoveryFixtures.length; index += 1) {
+      const fixture = index === 0 ? persisted(copying()) : persisted(blocked)
+      fixture.recovery = recoveryFixtures[index]
+      expect(() => loadMovementOperation(fixture)).toThrow("recovery authorization")
+    }
+
+    const missingEvidence: readonly [MovementOperation, string, string][] = [
+      [
+        startMovementCapture(planned(), { schemaChecksum: "schema", startSequence: 0 }),
+        "captureSchemaChecksum",
+        "capture evidence",
+      ],
+      [startMovementReplay(copied()), "copy", "completed base copy"],
+      [
+        drainMovementTail(
+          fenceMovementSource(startMovementReplay(copied()), {
+            ownershipChecksum: "owner",
+            sourceFenceEpoch: 8,
+          }),
+          {
+            fromExclusive: 10,
+            sourceReadOnlyVerified: true,
+            tailEmptyVerified: true,
+            throughInclusive: 10,
+          },
+        ),
+        "tailSequence",
+        "drained-tail",
+      ],
+      [destinationWritable(), "destinationDigest", "destination verification"],
+      [published(), "publishedRouteChecksum", "route publication"],
+      [
+        startMovementQuarantine(verifyMovementRuntime(published(), runtimeEvidence), {
+          serverTimeMs: 1,
+          untilServerTimeMs: 2,
+        }),
+        "quarantineUntilServerTimeMs",
+        "quarantine evidence",
+      ],
+      [
+        authorizeMovementCleanup(
+          startMovementQuarantine(verifyMovementRuntime(published(), runtimeEvidence), {
+            serverTimeMs: 1,
+            untilServerTimeMs: 2,
+          }),
+          { authorizationChecksum: "auth", fencingToken: 3, serverTimeMs: 2 },
+        ),
+        "cleanupAuthorizationChecksum",
+        "cleanup authorization",
+      ],
+    ]
+    for (const [operation, key, message] of missingEvidence) {
+      const fixture = persisted(operation)
+      if (key === "copy") {
+        nested(fixture.copy).children = {
+          bytesCopied: 0,
+          complete: false,
+          cursor: null,
+          rowsCopied: 0,
+        }
+      } else if (key === "captureSchemaChecksum") {
+        delete fixture.captureSchemaChecksum
+        delete fixture.captureStartSequence
+        delete fixture.replayedThroughSequence
+      } else if (key === "destinationDigest") {
+        delete fixture.destinationDigest
+        delete fixture.destinationRowCount
+      } else if (key === "cleanupAuthorizationChecksum") {
+        delete fixture.cleanupAuthorizationChecksum
+        delete fixture.cleanupFencingToken
+      } else {
+        delete fixture[key]
+      }
+      expect(() => loadMovementOperation(fixture)).toThrow(message)
+    }
+  })
+
   it("copies in dependency order and converges through fenced cutover and cleanup", () => {
     const created = planned()
     expect(created.requiredTableIds).toEqual(["parents", "children"])
