@@ -8,6 +8,7 @@ import {
   type LeaseProof,
   loadAuditEvent,
   loadOperationRecord,
+  markRunningStepUnknownAfterCrash,
   NozzleError,
   type OperationPlan,
   type OperationRecord,
@@ -144,6 +145,10 @@ export interface ReconcileStoredOperationStepInput extends TransitionIdentity {
   readonly outcome: StepReconciliationOutcome
   readonly reconciliationId: string
   readonly resultChecksum?: string
+}
+
+export interface RecoverStoredOperationStepInput extends TransitionIdentity {
+  readonly recoveryId: string
 }
 
 function configuration(message: string): never {
@@ -901,6 +906,58 @@ export class D1OperationStore {
         return Object.freeze({ disposition: "execute", operation: persisted.operation })
     }
     return intervention("Beginning an operation step exceeded the bounded transition retry budget.")
+  }
+
+  async recoverRunningStep(input: RecoverStoredOperationStepInput): Promise<OperationRecord> {
+    nonEmpty(input.operationId, "Operation ID")
+    nonEmpty(input.actorChecksum, "Transition actor checksum")
+    nonEmpty(input.recoveryId, "Crash recovery ID")
+    const transitionId = transitionIdentity("crash-unknown", [
+      input.operationId,
+      input.stepId,
+      input.recoveryId,
+    ])
+    for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt += 1) {
+      const before = await this.get(input.operationId)
+      if (!before) return resume("The operation does not exist.")
+      const record = before.operation.steps[input.stepId]
+      if (record?.state !== "running") {
+        const receipt = await this.#transition(transitionId)
+        if (!receipt) return markRunningStepUnknownAfterCrash(before.operation, input.stepId)
+        if (
+          receipt.operation_id !== input.operationId ||
+          receipt.step_id !== input.stepId ||
+          receipt.to_record_json !== JSON.stringify(record) ||
+          receipt.fencing_token !== input.proof.fencingToken ||
+          receipt.lease_key !== input.proof.leaseKey ||
+          receipt.holder_id !== input.proof.holderId ||
+          receipt.acquisition_id !== input.proof.acquisitionId
+        ) {
+          return intervention("A crash recovery ID is bound to contradictory durable state.")
+        }
+        return before.operation
+      }
+      const next = markRunningStepUnknownAfterCrash(before.operation, input.stepId)
+      const originalFencingToken = record.fencingToken as number
+      const lastAttemptId = record.lastAttemptId as string
+      await this.#leases.authorizeAt(input.proof)
+      if (input.proof.fencingToken <= originalFencingToken) {
+        return resume("Crash recovery requires a strictly newer lease fencing token.")
+      }
+      const after: LoadedOperation = Object.freeze({ ...before, operation: next })
+      const persisted = await this.#persistTransition({
+        actorChecksum: input.actorChecksum,
+        after,
+        auditEventType: "step.crash.outcome_unknown",
+        auditPayloadChecksum: lastAttemptId,
+        before,
+        proof: input.proof,
+        stepId: input.stepId,
+        transitionId,
+      })
+      if (persisted) return persisted.operation
+    }
+    return intervention("Crash recovery exceeded the bounded transition retry budget.")
   }
 
   async completeStep(input: CompleteStoredOperationStepInput): Promise<OperationRecord> {

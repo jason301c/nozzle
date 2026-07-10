@@ -135,5 +135,59 @@ describe("real workerd operation ledger", () => {
         stepId: "provision",
       }),
     ).resolves.toMatchObject({ steps: { provision: { state: "succeeded" } } })
+
+    const crashedPlan = plans[1]
+    if (!crashedPlan) throw new Error("Crash fixture plan is missing.")
+    await store.beginStep({
+      actorChecksum: "workerd-actor",
+      attemptId: "workerd-crashed-attempt",
+      idempotencyKey: "workerd-step-key-1",
+      observedPreconditionChecksum: "precondition",
+      operationId: crashedPlan.operationId,
+      proof,
+      stepId: "provision",
+    })
+    await leases.release({ proof })
+    const recoveryLease = await leases.acquire({
+      acquisitionId: "workerd-recovery-acquisition",
+      holderId: "workerd-recovery-controller",
+      leaseKey: "workerd:operation",
+      ttlMs: 60_000,
+    })
+    if (!recoveryLease.acquired) throw new Error("Recovery lease acquisition failed.")
+    const recoveryProof = leaseProof(recoveryLease.record)
+    const recovered = await store.recoverRunningStep({
+      actorChecksum: "workerd-recovery-actor",
+      operationId: crashedPlan.operationId,
+      proof: recoveryProof,
+      recoveryId: "workerd-crash-recovery",
+      stepId: "provision",
+    })
+    expect(recovered.steps.provision).toMatchObject({
+      fencingToken: proof.fencingToken,
+      lastAttemptId: "workerd-crashed-attempt",
+      state: "unknown",
+    })
+    const retryable = await store.reconcileStep({
+      actorChecksum: "workerd-recovery-actor",
+      evidenceChecksum: "workerd-proven-absent",
+      operationId: crashedPlan.operationId,
+      outcome: "not_applied",
+      proof: recoveryProof,
+      reconciliationId: "workerd-not-applied",
+      stepId: "provision",
+    })
+    expect(retryable.steps.provision?.state).toBe("retryable_failed")
+    await expect(
+      store.beginStep({
+        actorChecksum: "workerd-recovery-actor",
+        attemptId: "workerd-safe-retry",
+        idempotencyKey: "workerd-step-key-1",
+        observedPreconditionChecksum: "precondition",
+        operationId: crashedPlan.operationId,
+        proof: recoveryProof,
+        stepId: "provision",
+      }),
+    ).resolves.toMatchObject({ disposition: "execute" })
   })
 })

@@ -889,6 +889,177 @@ describe("D1OperationStore", () => {
     })
   })
 
+  it("recovers a crashed running attempt under a newer fence before a safe retry", async () => {
+    const input = planInput({ operationId: "crash-recovery-operation" })
+    const firstStep = input.steps[0]
+    if (!firstStep) throw new Error("Fixture step is missing.")
+    const plan = await sealOperationPlan(
+      { ...input, steps: [{ ...firstStep, retryClassification: "reconcile_first" }] },
+      digest,
+    )
+    await store.create(creationInput(plan))
+    const leases = new D1LeaseStore(database)
+    const first = await leases.acquire({
+      acquisitionId: "crashed-acquisition",
+      holderId: "crashed-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!first.acquired) throw new Error("Fixture lease acquisition failed.")
+    const firstProof = leaseProof(first.record)
+    await expect(
+      store.recoverRunningStep({
+        actorChecksum: "recovery-actor",
+        operationId: plan.operationId,
+        proof: firstProof,
+        recoveryId: "premature-recovery",
+        stepId: "a",
+      }),
+    ).rejects.toThrow(/Only a running step/u)
+    await store.beginStep({
+      actorChecksum: "actor",
+      attemptId: "crashed-attempt",
+      idempotencyKey: "step-a-key",
+      observedPreconditionChecksum: "step-a-pre",
+      operationId: plan.operationId,
+      proof: firstProof,
+      stepId: "a",
+    })
+    await expect(
+      store.recoverRunningStep({
+        actorChecksum: "recovery-actor",
+        operationId: plan.operationId,
+        proof: firstProof,
+        recoveryId: "recovery-1",
+        stepId: "a",
+      }),
+    ).rejects.toThrow(/strictly newer/u)
+
+    await leases.release({ proof: firstProof })
+    const second = await leases.acquire({
+      acquisitionId: "recovery-acquisition",
+      holderId: "recovery-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!second.acquired) throw new Error("Fixture lease reacquisition failed.")
+    const secondProof = leaseProof(second.record)
+    const recovered = await store.recoverRunningStep({
+      actorChecksum: "recovery-actor",
+      operationId: plan.operationId,
+      proof: secondProof,
+      recoveryId: "recovery-1",
+      stepId: "a",
+    })
+    expect(recovered.steps.a).toMatchObject({
+      fencingToken: firstProof.fencingToken,
+      lastAttemptId: "crashed-attempt",
+      state: "unknown",
+    })
+    await expect(
+      store.recoverRunningStep({
+        actorChecksum: "recovery-actor",
+        operationId: plan.operationId,
+        proof: secondProof,
+        recoveryId: "recovery-1",
+        stepId: "a",
+      }),
+    ).resolves.toEqual(recovered)
+    await expect(
+      store.recoverRunningStep({
+        actorChecksum: "recovery-actor",
+        operationId: plan.operationId,
+        proof: firstProof,
+        recoveryId: "recovery-1",
+        stepId: "a",
+      }),
+    ).rejects.toThrow(/contradictory durable state/u)
+    expect(
+      database.database
+        .prepare(
+          `SELECT "fencing_token" FROM "nozzle_operation_transitions"
+           WHERE "transition_id" LIKE '%crash-unknown%'`,
+        )
+        .get(),
+    ).toEqual({ fencing_token: secondProof.fencingToken })
+    await expect(
+      store.beginStep({
+        actorChecksum: "actor",
+        attemptId: "blind-retry",
+        idempotencyKey: "step-a-key",
+        observedPreconditionChecksum: "step-a-pre",
+        operationId: plan.operationId,
+        proof: secondProof,
+        stepId: "a",
+      }),
+    ).resolves.toMatchObject({ disposition: "reconcile" })
+    const notApplied = await store.reconcileStep({
+      actorChecksum: "actor",
+      evidenceChecksum: "proven-absent",
+      operationId: plan.operationId,
+      outcome: "not_applied",
+      proof: secondProof,
+      reconciliationId: "reconciliation-not-applied",
+      stepId: "a",
+    })
+    expect(notApplied.steps.a?.state).toBe("retryable_failed")
+    await expect(
+      store.beginStep({
+        actorChecksum: "actor",
+        attemptId: "safe-retry",
+        idempotencyKey: "step-a-key",
+        observedPreconditionChecksum: "step-a-pre",
+        operationId: plan.operationId,
+        proof: secondProof,
+        stepId: "a",
+      }),
+    ).resolves.toMatchObject({ disposition: "execute" })
+  })
+
+  it("bounds crash-recovery persistence races", async () => {
+    const plan = await sealedPlan({ operationId: "crash-recovery-race" })
+    await store.create(creationInput(plan))
+    const leases = new D1LeaseStore(database)
+    const first = await leases.acquire({
+      acquisitionId: "race-crashed-acquisition",
+      holderId: "race-crashed-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!first.acquired) throw new Error("Fixture lease acquisition failed.")
+    const firstProof = leaseProof(first.record)
+    await store.beginStep({
+      actorChecksum: "actor",
+      attemptId: "race-crashed-attempt",
+      idempotencyKey: "step-a-key",
+      observedPreconditionChecksum: "step-a-pre",
+      operationId: plan.operationId,
+      proof: firstProof,
+      stepId: "a",
+    })
+    await leases.release({ proof: firstProof })
+    const second = await leases.acquire({
+      acquisitionId: "race-recovery-acquisition",
+      holderId: "race-recovery-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!second.acquired) throw new Error("Fixture lease reacquisition failed.")
+    const dropped = new D1OperationStore(
+      new FaultInjectingDatabase(database, { dropTransitionBatch: true }),
+      digest,
+    )
+    await expect(
+      dropped.recoverRunningStep({
+        actorChecksum: "actor",
+        operationId: plan.operationId,
+        proof: leaseProof(second.record),
+        recoveryId: "race-recovery",
+        stepId: "a",
+      }),
+    ).rejects.toThrow(/bounded transition retry budget/u)
+  })
+
   it("persists retryable and permanent failures with their bounded next action", async () => {
     const plan = await sealedPlan({ operationId: "failure-operation" })
     await store.create(creationInput(plan))
@@ -1080,6 +1251,15 @@ describe("D1OperationStore", () => {
         operationId: "missing",
         proof: nonexistentProof,
         resultChecksum: "missing",
+        stepId: "missing",
+      }),
+    ).rejects.toThrow(/does not exist/u)
+    await expect(
+      store.recoverRunningStep({
+        actorChecksum: "actor",
+        operationId: "missing",
+        proof: nonexistentProof,
+        recoveryId: "missing-recovery",
         stepId: "missing",
       }),
     ).rejects.toThrow(/does not exist/u)

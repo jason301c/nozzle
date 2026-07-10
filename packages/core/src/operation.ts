@@ -1132,9 +1132,6 @@ export function beginOperationStep(
   if (request.observedPreconditionChecksum !== planStep.preconditionChecksum) {
     resumeError("The step precondition does not match the sealed operation plan.")
   }
-  if (record.state === "retryable_failed" && planStep.retryClassification === "reconcile_first") {
-    interventionError("The step requires reconciliation before another provider attempt.")
-  }
   assertDependenciesSucceeded(operation, planStep)
   if (planStep.leaseKey !== request.leaseProof.leaseKey) {
     resumeError("The step was invoked under the wrong lease key.")
@@ -1261,25 +1258,35 @@ export function recordStepFailure(
   return updateStep(operation, input.stepId, next)
 }
 
+export function markRunningStepUnknownAfterCrash(
+  operation: OperationRecord,
+  stepId: string,
+): OperationRecord {
+  const record = getStepRecord(operation, stepId)
+  if (record.state !== "running") {
+    resumeError("Only a running step can be recovered as an unknown crash outcome.")
+  }
+  if (!record.activeAttemptId || !record.fencingToken || !record.lastAttemptId) {
+    interventionError("A running step has incomplete crash-recovery metadata.")
+  }
+  const unknown: OperationStepRecord = {
+    ...(record.authorizationChecksum
+      ? { authorizationChecksum: record.authorizationChecksum }
+      : {}),
+    costCounters: record.costCounters,
+    fencingToken: record.fencingToken,
+    lastAttemptId: record.lastAttemptId,
+    progressCounters: record.progressCounters,
+    startedAttempts: record.startedAttempts,
+    state: "unknown",
+  }
+  return updateStep(operation, stepId, unknown)
+}
+
 export function markRunningStepsUnknownAfterCrash(operation: OperationRecord): OperationRecord {
   let next = operation
   for (const [stepId, record] of Object.entries(operation.steps)) {
-    if (record.state !== "running") continue
-    if (!record.activeAttemptId || !record.fencingToken || !record.lastAttemptId) {
-      interventionError("A running step has incomplete crash-recovery metadata.")
-    }
-    const unknown: OperationStepRecord = {
-      ...(record.authorizationChecksum
-        ? { authorizationChecksum: record.authorizationChecksum }
-        : {}),
-      costCounters: record.costCounters,
-      fencingToken: record.fencingToken,
-      lastAttemptId: record.lastAttemptId,
-      progressCounters: record.progressCounters,
-      startedAttempts: record.startedAttempts,
-      state: "unknown",
-    }
-    next = updateStep(next, stepId, unknown)
+    if (record.state === "running") next = markRunningStepUnknownAfterCrash(next, stepId)
   }
   return next
 }

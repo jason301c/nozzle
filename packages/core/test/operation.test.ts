@@ -17,6 +17,7 @@ import {
   loadIrreversibleAuthorization,
   loadOperationPlan,
   markRunningStepsUnknownAfterCrash,
+  markRunningStepUnknownAfterCrash,
   type OperationPlan,
   type OperationPlanInput,
   type OperationRecord,
@@ -757,11 +758,7 @@ describe("operation crash, resume, and idempotency guards", () => {
       })
       expect(failed.steps.one?.state).toBe(expected)
       expect(operationStatus(failed)).toBe(expected === "failed" ? "failed" : "paused")
-      if (retryClassification === "reconcile_first") {
-        expect(() => begin(failed, lease, { attemptId: "attempt-2" })).toThrow(
-          "requires reconciliation",
-        )
-      } else if (retryClassification === "idempotent") {
+      if (retryClassification !== "never") {
         const retried = begin(failed, lease, { attemptId: "attempt-2" }).operation
         const completed = recordStepSuccess(retried, {
           attemptId: "attempt-2",
@@ -869,6 +866,7 @@ describe("operation crash, resume, and idempotency guards", () => {
     expect(() => markRunningStepsUnknownAfterCrash(malformedRunning)).toThrow(
       "incomplete crash-recovery metadata",
     )
+    expect(() => markRunningStepUnknownAfterCrash(operation, "one")).toThrow("Only a running step")
 
     expect(() =>
       recordStepFailure(started, {
