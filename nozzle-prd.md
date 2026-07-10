@@ -808,6 +808,8 @@ Bulk movement, replay, verification, and large backfills MUST run through a user
 
 Direct application topology MUST remain direct; operational leaves are outside its normal query path and MAY be deployed on demand. Administrative leaf RPC MUST require a short-lived operation-scoped capability unavailable to application query Workers. Leaf Workers MUST NOT receive Cloudflare management credentials.
 
+Operational row writes MUST use generated empty administrative views rather than weakening base-table ownership triggers or adding a persistent bypass value to application rows. An administrative view validates a short-lived, bucket-, table-, operation-, mode-, expiry-, use-, and fencing-bound capability, creates a single trigger-local authorization context, performs the base-table upsert or delete, consumes one use, and removes the context within the same SQLite statement. Base-table guards accept a non-writable movement state only while that exact context exists. A failed statement rolls back the data change, capability consumption, and context together; no context may survive a statement. Replay receipts are committed in the same D1 batch as the operational write.
+
 The Cloudflare management API MUST NOT be the default bulk row-transfer mechanism. Any explicit fallback MUST fit a measured rate, duration, cost, row-size, and recovery budget.
 
 ### 16.5 Fenced cutover

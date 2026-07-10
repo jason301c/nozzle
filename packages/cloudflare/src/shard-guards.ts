@@ -86,6 +86,85 @@ FOR EACH ROW
 BEGIN
   SELECT RAISE(ABORT, 'NOZZLE_OWNERSHIP_PERSISTENT');
 END;`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_operation_write_capabilities" (
+  "capability_token" TEXT PRIMARY KEY NOT NULL CHECK (length("capability_token") = 43 AND "capability_token" NOT GLOB '*[^A-Za-z0-9_-]*'),
+  "operation_id" TEXT NOT NULL CHECK (length(trim("operation_id")) > 0),
+  "bucket_id" INTEGER NOT NULL CHECK ("bucket_id" BETWEEN 0 AND 4294967295),
+  "table_id" TEXT NOT NULL CHECK (length(trim("table_id")) > 0),
+  "mode" TEXT NOT NULL CHECK ("mode" IN ('upsert', 'delete', 'cleanup_delete')),
+  "fencing_token" INTEGER NOT NULL CHECK ("fencing_token" >= 1),
+  "expires_at_ms" INTEGER NOT NULL CHECK ("expires_at_ms" >= 0),
+  "remaining_uses" INTEGER NOT NULL CHECK ("remaining_uses" >= 0),
+  "issued_at_ms" INTEGER NOT NULL CHECK ("issued_at_ms" >= 0 AND "expires_at_ms" > "issued_at_ms")
+);`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_operation_capability_insert"
+BEFORE INSERT ON "nozzle_operation_write_capabilities"
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_bucket_ownership" AS "owner"
+  WHERE "owner"."bucket_id" = NEW."bucket_id"
+    AND "owner"."operation_id" = NEW."operation_id"
+    AND "owner"."fencing_token" = NEW."fencing_token"
+    AND ((NEW."mode" IN ('upsert', 'delete')
+      AND "owner"."movement_role" = 'destination'
+      AND "owner"."state" IN ('preparing', 'copying', 'catching_up'))
+      OR (NEW."mode" = 'cleanup_delete'
+        AND "owner"."movement_role" = 'source'
+        AND "owner"."state" = 'quarantined'))
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_OPERATION_CAPABILITY_OWNERSHIP'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_operation_capability_update"
+BEFORE UPDATE ON "nozzle_operation_write_capabilities"
+FOR EACH ROW
+WHEN NEW."capability_token" IS NOT OLD."capability_token"
+  OR NEW."operation_id" IS NOT OLD."operation_id"
+  OR NEW."bucket_id" IS NOT OLD."bucket_id"
+  OR NEW."table_id" IS NOT OLD."table_id"
+  OR NEW."mode" IS NOT OLD."mode"
+  OR NEW."fencing_token" IS NOT OLD."fencing_token"
+  OR NEW."expires_at_ms" IS NOT OLD."expires_at_ms"
+  OR NEW."issued_at_ms" IS NOT OLD."issued_at_ms"
+  OR NEW."remaining_uses" IS NOT OLD."remaining_uses" - 1
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_OPERATION_CAPABILITY_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_operation_capability_delete"
+BEFORE DELETE ON "nozzle_operation_write_capabilities"
+FOR EACH ROW
+WHEN OLD."remaining_uses" > 0
+  AND OLD."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_OPERATION_CAPABILITY_ACTIVE'); END;`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_operation_write_context" (
+  "singleton" INTEGER PRIMARY KEY NOT NULL CHECK ("singleton" = 1),
+  "capability_token" TEXT NOT NULL,
+  "operation_id" TEXT NOT NULL,
+  "bucket_id" INTEGER NOT NULL,
+  "table_id" TEXT NOT NULL,
+  "mode" TEXT NOT NULL CHECK ("mode" IN ('upsert', 'delete', 'cleanup_delete'))
+);`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_operation_context_insert"
+BEFORE INSERT ON "nozzle_operation_write_context"
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_operation_write_capabilities" AS "capability"
+  WHERE "capability"."capability_token" = NEW."capability_token"
+    AND "capability"."operation_id" = NEW."operation_id"
+    AND "capability"."bucket_id" = NEW."bucket_id"
+    AND "capability"."table_id" = NEW."table_id"
+    AND "capability"."mode" = NEW."mode"
+    AND "capability"."remaining_uses" > 0
+    AND "capability"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_OPERATION_CAPABILITY_INVALID'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_operation_context_consume"
+AFTER INSERT ON "nozzle_operation_write_context"
+FOR EACH ROW
+BEGIN
+  UPDATE "nozzle_operation_write_capabilities"
+  SET "remaining_uses" = "remaining_uses" - 1
+  WHERE "capability_token" = NEW."capability_token";
+END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_operation_context_update"
+BEFORE UPDATE ON "nozzle_operation_write_context"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_OPERATION_CONTEXT_IMMUTABLE'); END;`,
   `CREATE TABLE IF NOT EXISTS "nozzle_schema_state" (
   "schema_id" TEXT PRIMARY KEY NOT NULL CHECK (length("schema_id") BETWEEN 1 AND 128),
   "schema_digest" TEXT NOT NULL CHECK (length("schema_digest") = 64 AND "schema_digest" = lower("schema_digest") AND "schema_digest" NOT GLOB '*[^0-9a-f]*'),
@@ -213,6 +292,10 @@ function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`
 }
 
+function quoteLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`
+}
+
 function triggerIdentifier(tableName: string, operation: "delete" | "insert" | "update"): string {
   const bytes = new TextEncoder().encode(tableName)
   let encoded = ""
@@ -249,9 +332,14 @@ function validBucketExpression(reference: "NEW" | "OLD"): string {
   return `typeof(${bucket}) = 'integer' AND ${bucket} BETWEEN 0 AND 4294967295`
 }
 
-function writableOwnershipExpression(reference: "NEW" | "OLD"): string {
+function writableOwnershipExpression(
+  spec: ShardGuardTableSpec,
+  reference: "NEW" | "OLD",
+  modes: readonly ("cleanup_delete" | "delete" | "upsert")[],
+): string {
   const bucket = recordColumn(reference, INTERNAL_BUCKET_COLUMN)
-  return `EXISTS (SELECT 1 FROM "nozzle_bucket_ownership" AS "nozzle_owner" WHERE "nozzle_owner"."bucket_id" = ${bucket} AND "nozzle_owner"."state" = 'writable')`
+  const modeSql = modes.map(quoteLiteral).join(", ")
+  return `(EXISTS (SELECT 1 FROM "nozzle_bucket_ownership" AS "nozzle_owner" WHERE "nozzle_owner"."bucket_id" = ${bucket} AND "nozzle_owner"."state" = 'writable') OR EXISTS (SELECT 1 FROM "nozzle_operation_write_context" AS "nozzle_context" WHERE "nozzle_context"."singleton" = 1 AND "nozzle_context"."bucket_id" = ${bucket} AND "nozzle_context"."table_id" = ${quoteLiteral(spec.tableName)} AND "nozzle_context"."mode" IN (${modeSql})))`
 }
 
 function activeSchemaExpression(): string {
@@ -290,7 +378,7 @@ function insertTrigger(spec: ShardGuardTableSpec): string {
     [`NOT (${validBucketExpression("NEW")})`, "NOZZLE_GUARD_BUCKET_TYPE"],
     [`NOT (${validPartitionExpression(spec, "NEW")})`, "NOZZLE_GUARD_PARTITION_TYPE"],
     [`NOT (${activeSchemaExpression()})`, "NOZZLE_GUARD_SCHEMA"],
-    [`NOT (${writableOwnershipExpression("NEW")})`, "NOZZLE_GUARD_OWNERSHIP"],
+    [`NOT (${writableOwnershipExpression(spec, "NEW", ["upsert"])})`, "NOZZLE_GUARD_OWNERSHIP"],
     [fenceExpression(spec, "NEW"), "NOZZLE_GUARD_PARTITION_FENCE"],
   ]
   return `CREATE TRIGGER ${triggerIdentifier(spec.tableName, "insert")}
@@ -321,8 +409,8 @@ function updateTrigger(spec: ShardGuardTableSpec): string {
       "NOZZLE_GUARD_PARTITION_IMMUTABLE",
     ],
     [`NOT (${activeSchemaExpression()})`, "NOZZLE_GUARD_SCHEMA"],
-    [`NOT (${writableOwnershipExpression("OLD")})`, "NOZZLE_GUARD_OWNERSHIP"],
-    [`NOT (${writableOwnershipExpression("NEW")})`, "NOZZLE_GUARD_OWNERSHIP"],
+    [`NOT (${writableOwnershipExpression(spec, "OLD", ["upsert"])})`, "NOZZLE_GUARD_OWNERSHIP"],
+    [`NOT (${writableOwnershipExpression(spec, "NEW", ["upsert"])})`, "NOZZLE_GUARD_OWNERSHIP"],
     [fenceExpression(spec, "OLD"), "NOZZLE_GUARD_PARTITION_FENCE"],
     [fenceExpression(spec, "NEW"), "NOZZLE_GUARD_PARTITION_FENCE"],
   ]
@@ -339,7 +427,10 @@ function deleteTrigger(spec: ShardGuardTableSpec): string {
     [`NOT (${validBucketExpression("OLD")})`, "NOZZLE_GUARD_BUCKET_TYPE"],
     [`NOT (${validPartitionExpression(spec, "OLD")})`, "NOZZLE_GUARD_PARTITION_TYPE"],
     [`NOT (${activeSchemaExpression()})`, "NOZZLE_GUARD_SCHEMA"],
-    [`NOT (${writableOwnershipExpression("OLD")})`, "NOZZLE_GUARD_OWNERSHIP"],
+    [
+      `NOT (${writableOwnershipExpression(spec, "OLD", ["delete", "cleanup_delete"])})`,
+      "NOZZLE_GUARD_OWNERSHIP",
+    ],
     [fenceExpression(spec, "OLD"), "NOZZLE_GUARD_PARTITION_FENCE"],
   ]
   return `CREATE TRIGGER ${triggerIdentifier(spec.tableName, "delete")}

@@ -1,4 +1,6 @@
 export * from "./drizzle-movement-capture.js"
+export * from "./drizzle-movement-transfer.js"
 export * from "./drizzle-shard-guards.js"
 export * from "./movement-capture.js"
+export * from "./movement-transfer.js"
 export * from "./shard-guards.js"

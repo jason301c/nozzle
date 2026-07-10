@@ -159,7 +159,7 @@ describe("generateShardGuardSql", () => {
     expect(left).toEqual(right)
     expect(left.sql.endsWith("\n")).toBe(true)
     expect(left.tables.map(({ tableName }) => tableName)).toEqual(["alpha", "Beta"])
-    expect(left.statements).toHaveLength(18)
+    expect(left.statements).toHaveLength(26)
     expect(Object.isFrozen(left)).toBe(true)
     expect(Object.isFrozen(left.tables)).toBe(true)
     expect(Object.isFrozen(left.tables[0])).toBe(true)
