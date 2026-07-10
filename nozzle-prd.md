@@ -191,10 +191,12 @@ Every fleet MUST belong to exactly one declared Cloudflare account. Nozzle MAY m
 Auto mode uses:
 
 ```txt
-partition key -> canonical key bytes -> SHA-256 digest -> optional reserved-bucket override -> physical shard
+partition key -> canonical key bytes -> SHA-256 digest -> shared bucket or optional sparse reserved-bucket override -> physical shard
 ```
 
 An override MUST map a partition to a reserved bucket, never directly to a physical shard. The bucket remains the only physical ownership unit.
+
+Shared and reserved buckets use disjoint namespaces. For `bucketBits`, ordinary hashing selects exactly one dense shared-bucket ID in `[0, 2^bucketBits)`. Reserved bucket IDs are allocated sparsely and monotonically in `[2^bucketBits, 2^32)` and therefore can never be selected by ordinary hashing. A reserved ID has an explicit sparse route and local ownership record, is never inferred from its numeric value alone, and is not reused within a fleet after retirement. The virtual-bucket count refers to dense shared buckets; reserved buckets do not require a second dense route table.
 
 Routing identity MUST include:
 
@@ -211,7 +213,7 @@ jurisdiction
 schema compatibility range
 ```
 
-The virtual-bucket count MUST be selected at fleet creation and remain immutable except through an explicit full-fleet repartition operation. The ordinary default is 65,536 (`2^16`) buckets. An explicitly selected high-scale profile MAY use 1,048,576 (`2^20`) buckets only after route-manifest and Worker-memory validation. The selected count MUST be validated against the maximum intended shard count, movement granularity, route-manifest size, Worker memory, and topology target.
+The shared virtual-bucket count MUST be selected at fleet creation and remain immutable except through an explicit full-fleet repartition operation. The ordinary default is 65,536 (`2^16`) shared buckets. An explicitly selected high-scale profile MAY use 1,048,576 (`2^20`) shared buckets only after route-manifest and Worker-memory validation. The selected count and sparse reserved-bucket budget MUST be validated against the maximum intended shard count, movement granularity, route-manifest size, Worker memory, and topology target.
 
 ### 8.3 Canonical partition hashing
 
@@ -228,6 +230,19 @@ The hashing specification MUST define:
 
 Hash version 1 MUST use native SHA-256 over unambiguous length-framed bytes containing a fixed versioned domain separator, stable 32-byte public fleet seed, canonical type tag, and canonical key bytes. Ordinary strings use exact UTF-8 without case folding or Unicode normalization; integers are accepted only when the supported D1 binding mode preserves them exactly; UUIDs require an explicitly declared canonical UUID key type; binary keys preserve exact bytes. Ambiguous, malformed, floating-point, null, array, and object keys MUST be rejected. Bucket selection MUST use the required leading digest bits for the power-of-two bucket space. Route overrides MUST use the full 256-bit digest; a truncated 128-bit fingerprint MAY be used only where a collision cannot affect correctness, such as bounded telemetry. Hashing occurs lazily on first query execution and the scoped client caches the result. Hashing is not a privacy guarantee.
 
+Hash version 1 has the following exact wire contract:
+
+- The SHA-256 preimage begins with the four fixed bytes `4e 5a 48 01` (`NZH` followed by version byte `01`).
+- It then contains four fields in the fixed order domain, fleet seed, key type, and canonical key. Every field is encoded as a one-byte field tag, a four-byte unsigned big-endian byte length, and exactly that many value bytes. Extra, repeated, missing, or reordered fields are invalid.
+- Field tag `01` is the exact UTF-8 bytes of `nozzle.partition.v1`; field tag `02` is exactly 32 public fleet-seed bytes; field tag `03` is exactly one key-type byte; field tag `04` is the canonical key bytes.
+- Key-type byte `01` is an ordinary string, encoded as exact UTF-8 after rejecting unpaired UTF-16 surrogate code units. Empty strings are valid. No normalization, trimming, locale conversion, or case folding occurs.
+- Key-type byte `02` is a signed integer. Version 1 accepts only JavaScript safe integers whose value is preserved exactly by the supported D1 binding path and encodes them as eight-byte two's-complement signed big-endian values. Negative zero, non-integers, unsafe integers, `NaN`, and infinities are invalid. A future exact-integer mode requires a new declared capability and hash version unless it produces these identical bytes.
+- Key-type byte `03` is an explicitly configured UUID. Input MUST use the hyphenated `8-4-4-4-12` hexadecimal form without braces; hexadecimal input is case-insensitive, canonical text is lowercase, and the key bytes are the exact 16 decoded bytes. Other UUID spellings are invalid.
+- Key-type byte `04` is binary and accepts a `Uint8Array`; its exact bytes, including an empty value, are preserved. Other array, view, object, and implicit string encodings are invalid.
+- Fleet seeds are generated with a cryptographically secure random source at fleet creation, stored publicly as unpadded base64url in configuration and manifests, decoded to exactly 32 bytes before hashing, and immutable for the fleet. Fixtures and adopted fleets MAY supply an explicit seed, but invalid lengths are rejected.
+- Version 1 shared-bucket spaces are exactly 16 or 20 bits. Ordinary bucket selection interprets the first four digest bytes as an unsigned big-endian integer and takes its leading configured bucket bits. This yields shared-bucket IDs in `[0, 2^bucketBits)` without modulo bias. It never selects a sparse reserved-bucket ID.
+- Published cross-runtime vectors MUST include the preimage bytes, digest, 16-bit bucket, and 20-bit bucket for every supported type plus rejected-input vectors. Any change to a byte above is a new hash version and requires an explicit full-fleet repartition operation; it is never a configuration-only change.
+
 The same key and hash version MUST produce the same bucket on every supported operating system, runtime, architecture, and package manager.
 
 ### 8.4 Route manifests and cache behavior
@@ -235,6 +250,10 @@ The same key and hash version MUST produce the same bucket on every supported op
 Normal queries MUST NOT read the control database on every request.
 
 Nozzle MUST publish immutable, checksummed route manifests. A manifest MUST contain enough information to resolve a partition to a physical binding or router and MUST be small enough for the supported Worker memory and bundle limits.
+
+Manifest format version 1 stores a dense shared-bucket route table, sorted compact shard descriptors, sorted sparse reserved-bucket route records, and sorted full-digest overrides. Each reserved record contains bucket ID, shard index, route epoch, and ownership state. Every override targets one declared reserved record. Every shard descriptor is referenced by at least one shared or reserved route.
+
+The implementation baseline rejects an encoded manifest above 24 MiB, more than 2 MiB of aggregate shard-descriptor UTF-8 text, more than 65,536 sparse reserved records, or more than 65,536 overrides. Loading copies caller-owned bytes once before the first asynchronous integrity check, verifies and decodes that same immutable copy, and retains bounded copies only. These conservative caps MAY change only with Worker-memory and startup benchmarks, a peak-memory analysis, updated capability evidence, and the decision-change procedure in section 29.7.
 
 Every application and router Worker using a fleet MUST be registered with its deployment identity, protocol and schema ranges, topology version, and destination-reachability attestation. Nozzle-managed deploys register automatically. External deployment pipelines MUST publish the same signed attestation. Cutover MUST block when an active registered caller is missing, incompatible, or cannot reach the destination.
 
@@ -258,12 +277,15 @@ Each local ownership record MUST include:
 
 - bucket ID;
 - route epoch;
-- state such as `preparing`, `copying`, `catching_up`, `writable`, `read_only`, `quarantined`, or `retired`;
+- canonical persisted state `unassigned`, `preparing`, `copying`, `catching_up`, `read_only`, `writable`, `quarantined`, `retired`, or `intervention_required`;
+- movement role `none`, `source`, or `destination`, which describes the operation role without creating a second writable state vocabulary;
 - operation ID responsible for a transition;
 - schema version;
 - last verified checkpoint.
 
 Generated write guards MUST reject a write before mutation when the local shard is not the writable owner. This is the final protection against stale application or router deployments.
+
+Each shard also stores an active schema-identity row and persistent `nozzle_partition_fences` rows containing the full hash-versioned partition digest plus the canonical typed partition value. Every safe statement performs an atomic local ownership, schema-identity, and digest-fence guard. Generated insert, update, and delete triggers independently enforce ownership, schema compatibility, and the typed partition fence from `NEW` or `OLD` row values, so an older client that lacks the current statement guard still fails before mutation. A digest lookup is an optimization and collision-resistant identity check; it does not replace the trigger's type-preserving value comparison.
 
 No valid state may contain two writable owners for one bucket.
 
@@ -296,7 +318,9 @@ Router topology MUST:
 - health-check every generated router and binding;
 - garbage-collect obsolete routers only after route and binding verification.
 
-Router mode requires a real Nozzle Drizzle transport. The safe path MUST carry a versioned structured execution plan, not arbitrary SQL text. The leaf MUST independently validate schema identity, partition, bucket, epoch, query shape, and limits before compiling the plan with the supported Drizzle adapter. The transport MUST implement the supported prepared-statement, typed parameter, result, atomic batch, error, metadata, session, timeout, and cancellation behaviors with a versioned type-preserving wire codec. Unsafe raw SQL is a separate policy-gated capability. A D1 binding is not treated as an object that can simply be returned to the application over RPC.
+Router mode requires a real Nozzle Drizzle transport. The safe path MUST carry a versioned structured execution plan, not arbitrary SQL text. The leaf MUST independently validate schema identity, canonical partition and full digest, bucket, epoch, query shape, and limits before compiling the plan with the supported Drizzle adapter. The transport MUST implement the supported prepared-statement, typed parameter, result, atomic batch, error, metadata, session, timeout, and cancellation behaviors with a versioned type-preserving wire codec. Unsafe raw SQL is a separate policy-gated capability. A D1 binding is not treated as an object that can simply be returned to the application over RPC.
+
+Execution-plan wire format version 1 represents null, boolean, finite supported numbers, and strings as their native JSON types. A BLOB is the frozen tagged object `{ "type": "blob", "hex": "<lowercase-even-length-hex>" }`; no other object is a bound value. Every plan carries the exact 64-character lowercase full partition digest used for its route and fence lookup. Builder-created in-process plans and validated decoded wire plans are separately authenticity-marked and bound to the validated schema registry before compilation, so a structurally similar caller object cannot bypass schema, scope, value, or limit validation. The compiler restores BLOBs to `Uint8Array` D1 bindings. Any change to these representations requires a new execution-plan version and direct/router equivalence tests.
 
 ### 8.8 Control-database schema
 
@@ -381,6 +405,8 @@ await db.batch([
   db.insert(events).values(event),
 ])
 ```
+
+The compact beginner field `mode` is an alias for placement mode only. The canonical advanced shape uses `placement.mode` and `topology.mode` as separate concepts. Supplying both `mode` and `placement.mode` is valid only when they are identical; disagreement MUST fail configuration validation. Runtime topology MUST never be inferred from a placement-mode value.
 
 Additional APIs include:
 
@@ -658,7 +684,7 @@ On the first shard failure, the default policy MUST:
 
 1. stop scheduling new migration waves;
 2. allow already accepted provider operations to finish or cancel only where cancellation is documented as safe;
-3. record every shard as `pending`, `running`, `applied`, `retryable_failed`, `blocked_failed`, or `unknown`;
+3. record an apply state for every shard as `pending`, `running`, `applied`, `retryable_failed`, `blocked_failed`, or `unknown`, and record verification independently as `pending`, `verified`, `failed`, or `unknown`;
 4. keep the fleet in a visible `mixed_blocked` state;
 5. refuse any contract/destructive phase or global schema-version activation;
 6. retry only failures classified as transient when the migration step is proven idempotent;
@@ -670,6 +696,22 @@ The configurable failure budget defaults to zero. A non-zero budget may control 
 Successful shards remain on the additive, backward-compatible schema while recovery occurs. Application and router compatibility ranges MUST support both old and new shard versions during this state.
 
 Automatic rollback of successful shards is prohibited unless the migration declares and tests a safe reverse operation and no incompatible writes have occurred. Time Travel is destructive and rewinds data, so it MUST NOT be used as an automatic fleet rollback. Forward recovery is the default.
+
+The required-shard set MUST be an immutable membership snapshot sealed into the operation plan before the first provider mutation. It includes every non-retired shard that owns application data, is referenced by an active or safety-window route, or is required by the migration policy. A shard provisioned or adopted after that snapshot MUST remain at a schema compatible with the active fleet barrier and MUST NOT receive ownership until a later migration operation proves it converged. Quarantine does not remove a shard from an already sealed required set. Retirement may remove one only through a separate completed operation that proves it has no data, route, binding, backup, or recovery obligation and records the exceptional membership decision in both operation ledgers.
+
+The scheduler MUST persist a single monotonic halt event with the operation fencing token and control-database sequence. After observing that event, no controller may submit another shard application from a later wave. Provider work durably recorded as accepted before the halt may finish and MUST be reconciled; work merely selected or held in memory is not accepted work.
+
+Migration artifact identity is immutable. A schema version and artifact checksum pair MUST never be reused for different SQL or a different canonical target schema. A corrected artifact is either byte-identical to the sealed artifact or is a new forward migration with a new identity. It MAY recover already successful and failed shards through different idempotent steps only when every path proves the same canonical target schema and compatible migration-ledger history.
+
+Every contract or destructive artifact MUST be safe while contracted and uncontracted required shards coexist. Before its first canary, all active application and router versions MUST have stopped depending on the removed behavior, and the target versions MUST work against both schemas. If that mixed state cannot be proven, the contract phase MUST be rejected; a cross-shard atomic contraction is not available.
+
+Safe reverse execution requires machine-observable evidence, not an operator assertion, that no incompatible write capability was active and no incompatible write was accepted after the forward barrier. The evidence MUST bind registered caller attestations, schema write-capability versions, route epochs, shard migration ledgers, and the forward operation interval. Without complete evidence, recovery proceeds forward.
+
+An `unknown` shard MUST be reconciled by inspecting its canonical schema, immutable migration-ledger checksum, required Nozzle triggers and indexes, and post-migration smoke verification. It becomes applied and verified only when every target check passes; it becomes pending-repair only when an idempotent, non-destructive repair is proven safe; otherwise it becomes intervention-required. Nozzle MUST NOT blindly re-execute an unknown table rebuild, destructive artifact, or non-idempotent backfill.
+
+Retryability is the conjunction of provider failure classification and artifact-step repeatability. A transient provider error alone never authorizes retry when the step's effect cannot be safely observed or repeated.
+
+Migration success has one exact oracle: every shard in the sealed required set has the target canonical schema, the target immutable ledger checksum, and a passing post-migration verification; no required shard is pending, running, failed, or unknown; every active application and router compatibility range includes the target; and the fleet schema barrier advances atomically only after those conditions hold. A failure budget changes scheduling pressure only and never this success oracle.
 
 ### 15.4 Application, router, and schema rollout
 
@@ -1062,6 +1104,10 @@ The unscoped npm name `nozzle` is already registered by an unrelated project. No
 
 The package names and boundaries MAY change before release if namespace ownership or a smaller public API requires it, but all required runtime, router, controller, telemetry, dashboard, and test functionality MUST be publicly available. The installed CLI binary SHOULD remain `nozzle` if the final name is cleared.
 
+The current implementation compatibility baseline is exact and deliberately narrow: Node.js 22 and 24 LTS, TypeScript 5.9.3 for the repository toolchain, Drizzle ORM 0.45.2, Wrangler 4.110.0, Workers types 5.20260710.1, Vitest 4.1.10, and `@cloudflare/vitest-pool-workers` 0.18.4. These versions are implementation inputs, not a release claim: every declared Node.js, operating-system, architecture, package-manager, Workers-runtime, authentication, topology, and D1 combination still requires the complete compatibility evidence in section 25.22. A version is added, removed, or ranged only through an explicit compatibility decision and passing compile, local-runtime, generated-artifact, and remote-D1 probes. Unsupported versions fail installation or `doctor` rather than running optimistically.
+
+Third-party declaration files are checked through the supported public import and type-fixture matrix; the repository MAY use TypeScript `skipLibCheck` to avoid type-checking unrelated optional database drivers bundled inside Drizzle. Nozzle's own source, emitted declarations, public type fixtures, and packed-package consumer projects MUST remain strictly checked without hiding errors through `any`, unsafe double casts, or skipped fixtures.
+
 Generated artifacts include:
 
 - Wrangler JSONC configuration or deterministic generated overlays;
@@ -1174,6 +1220,8 @@ Testing is a release-defining product feature. Nozzle is not complete because it
 ### 25.1 Test principles
 
 - Every public guarantee MUST have one or more named tests and a documented oracle.
+- Every normative requirement, numbered acceptance criterion, non-negotiable invariant, and release-blocking proof obligation MUST have a stable evidence identifier declared in this file and cited by its tests. The release verifier MUST reject unknown identifiers, uncovered identifiers, source-only evidence where packed-artifact evidence is required, stale or skipped evidence, commit or artifact hash mismatches, remote-only claims backed only by simulation, and a non-empty remote-resource cleanup ledger.
+- The machine-readable acceptance report MUST bind each evidence identifier to test identity, source commit, package and generated-artifact checksums, capability snapshot, topology, runtime versions, deterministic seed where applicable, result-artifact checksums, remote-resource ledger, and verified cleanup result. Generated evidence remains an output of this contract and MUST NOT become a competing product source of truth.
 - Safety-critical behavior MUST be tested as invariants across generated states, not only example cases.
 - Every persisted state-machine transition MUST have success, retry, duplicate, crash-before, crash-after, and recovery coverage.
 - Every discovered defect MUST receive a regression test before it is considered fixed.
@@ -1268,12 +1316,14 @@ unassigned
 preparing
 copying
 catching_up
-source_read_only
-destination_writable
+read_only
+writable
 quarantined
 retired
 intervention_required
 ```
+
+`source` and `destination` are recorded as movement roles rather than encoded into ownership state names. Only canonical state `writable` authorizes application mutation.
 
 Illegal transitions MUST be tested and rejected.
 
@@ -1928,7 +1978,7 @@ No distributed system is literally failure-proof. For Nozzle, bulletproof means:
 12. Bucket-space size is immutable after fleet creation: 65,536 by default or 1,048,576 for a verified high-scale profile.
 13. Auto mode uses a stable bucket directory. Adding a shard never remaps data without an explicit movement operation.
 14. A tenant override maps the full digest to an unused reserved bucket, never directly to a shard.
-15. Route manifests use a dense bucket-to-shard table, compact shard descriptors, sorted full-digest overrides, versioning, and integrity checks.
+15. Route manifests use a dense shared-bucket-to-shard table, compact shard descriptors, sorted sparse reserved-bucket routes in the disjoint reserved namespace, sorted full-digest overrides, versioning, and integrity checks.
 16. Default auto placement is a deterministic constrained greedy planner with stable tie-breaking and an operator-readable score breakdown.
 17. A more complex planner is allowed only after published benchmarks show material benefit and differential tests preserve the reference invariants.
 

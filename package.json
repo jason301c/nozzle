@@ -5,11 +5,33 @@
   "description": "Open-source Drizzle-native sharding and fleet management for Cloudflare D1",
   "type": "module",
   "scripts": {
-    "cf:whoami": "wrangler whoami"
+    "build": "tsc -b",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:safety && pnpm test:coverage",
+    "cf:whoami": "wrangler whoami",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "lint": "biome lint .",
+    "test": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:run": "vitest run",
+    "test:safety": "vitest run --config vitest.safety.config.ts --coverage",
+    "typecheck": "tsc -b && tsc -p tsconfig.test.json"
   },
   "license": "UNLICENSED",
+  "engines": {
+    "node": "^22.0.0 || ^24.0.0"
+  },
   "packageManager": "pnpm@10.33.0",
   "devDependencies": {
+    "@biomejs/biome": "2.5.3",
+    "@cloudflare/vitest-pool-workers": "0.18.4",
+    "@cloudflare/workers-types": "5.20260710.1",
+    "@types/node": "24.13.3",
+    "@vitest/coverage-v8": "4.1.10",
+    "fast-check": "4.9.0",
+    "tsx": "4.23.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10",
     "wrangler": "4.110.0"
   }
 }

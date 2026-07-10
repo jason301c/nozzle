@@ -1,0 +1,6 @@
+packages:
+  - "packages/*"
+  - "apps/*"
+
+catalog:
+  drizzle-orm: 0.45.2
