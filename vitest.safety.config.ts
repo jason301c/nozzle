@@ -22,6 +22,7 @@ export default defineConfig({
         "packages/control/src/provider-attempt-store.ts",
         "packages/control/src/resource-store.ts",
         "packages/control/src/saga-attempt-store.ts",
+        "packages/control/src/saga-coordinator-store.ts",
         "packages/control/src/saga-handler.ts",
         "packages/control/src/saga-input.ts",
         "packages/control/src/saga-plan.ts",

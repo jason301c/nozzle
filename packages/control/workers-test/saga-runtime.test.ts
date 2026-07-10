@@ -9,6 +9,7 @@ import { beforeAll, describe, expect, it } from "vitest"
 import { D1LeaseStore } from "../src/lease-store.js"
 import { D1OperationStore, operationTransitionIdentity } from "../src/operation-store.js"
 import { D1SagaAttemptStore, sagaActionInputChecksum } from "../src/saga-attempt-store.js"
+import { D1SagaCoordinatorStore } from "../src/saga-coordinator-store.js"
 import { invokeSagaEffectHandler } from "../src/saga-handler.js"
 import { loadSagaInvocationInput, sealSagaInvocationInput } from "../src/saga-input.js"
 import { sealSagaOperationPlan } from "../src/saga-plan.js"
@@ -151,6 +152,176 @@ describe("real workerd D1 saga projection", () => {
         timeoutMs: 1_000,
       }),
     ).resolves.toEqual({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" })
+  })
+
+  it("atomically couples saga initialization and action begin in real D1", async () => {
+    const operationId = "workerd-coordinator-operation"
+    const sagaId = "workerd-coordinator-saga"
+    const leaseKey = `saga:${sagaId}`
+    const forwardAction = {
+      actionId: "workerd.coordinator.forward",
+      artifactChecksum: "a".repeat(64),
+      version: 1,
+    }
+    const forwardObservation = {
+      actionId: "workerd.coordinator.observe-forward",
+      artifactChecksum: "b".repeat(64),
+      version: 1,
+    }
+    const compensationAction = {
+      actionId: "workerd.coordinator.compensate",
+      artifactChecksum: "c".repeat(64),
+      version: 1,
+    }
+    const compensationObservation = {
+      actionId: "workerd.coordinator.observe-compensation",
+      artifactChecksum: "d".repeat(64),
+      version: 1,
+    }
+    const registry = await sealSagaHandlerRegistry(
+      [
+        {
+          handler: () => ({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" }),
+          kind: "effect",
+          reference: forwardAction,
+        },
+        {
+          handler: () => ({ evidenceJson: "{}", outputJson: "{}", state: "applied" }),
+          kind: "observation",
+          reference: forwardObservation,
+        },
+        {
+          handler: () => ({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" }),
+          kind: "effect",
+          reference: compensationAction,
+        },
+        {
+          handler: () => ({ evidenceJson: "{}", outputJson: "{}", state: "applied" }),
+          kind: "observation",
+          reference: compensationObservation,
+        },
+      ],
+      digest,
+    )
+    const descriptor = await sealSagaDescriptor(
+      {
+        descriptorId: "workerd-coordinator",
+        steps: [
+          {
+            authorizationPolicyChecksum: null,
+            baseRetryDelayMs: 10,
+            compensationAction,
+            compensationObservation,
+            forwardAction,
+            forwardObservation,
+            inputSchemaChecksum: "1".repeat(64),
+            irreversible: false,
+            maxAttempts: 3,
+            maxRetryDelayMs: 100,
+            outputSchemaChecksum: "2".repeat(64),
+            stepId: "write",
+            timeoutMs: 1_000,
+          },
+        ],
+        version: 1,
+      },
+      digest,
+    )
+    const invocation = await sealSagaInvocationInput(
+      {
+        descriptor,
+        inputJson: '{"request":"coordinated"}',
+        sagaId,
+        stepInputJsons: { write: '{"value":42}' },
+      },
+      digest,
+    )
+    const capabilitySnapshotJson = '{"runtime":"workerd-coordinator-v1"}'
+    const plan = await sealSagaOperationPlan(
+      {
+        capabilitySnapshotChecksum: await digest(new TextEncoder().encode(capabilitySnapshotJson)),
+        descriptor,
+        inputChecksum: invocation.inputChecksum,
+        leaseKey,
+        operationId,
+        operationIdempotencyKey: "workerd-coordinator-operation-key",
+        registry,
+        sagaId,
+        stepInputChecksums: invocation.stepInputChecksums,
+      },
+      digest,
+    )
+    const operations = new D1OperationStore(env.DB, digest)
+    const leases = new D1LeaseStore(env.DB)
+    const coordinator = new D1SagaCoordinatorStore(env.DB, digest)
+    await operations.create({
+      actorChecksum: "workerd-coordinator-actor",
+      capabilitySnapshotJson,
+      environmentId: "workerd-coordinator",
+      idempotencyScope: "workerd-coordinator",
+      inputJson: invocation.operationInputJson,
+      plan,
+      requiredShardIds: ["workerd-coordinator-shard"],
+    })
+    const acquired = await leases.acquire({
+      acquisitionId: "workerd-coordinator-acquisition",
+      holderId: "workerd-coordinator-controller",
+      leaseKey,
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Coordinator lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+    const initAttemptId = `${sagaId}:init:1`
+    const initPlan = plan.steps.find((step) => step.stepId === SAGA_INIT_OPERATION_STEP_ID)
+    if (initPlan === undefined) throw new Error("Coordinator init plan is missing.")
+    await operations.beginStep({
+      actorChecksum: "workerd-coordinator-actor",
+      attemptId: initAttemptId,
+      idempotencyKey: initPlan.idempotencyKey,
+      observedPreconditionChecksum: initPlan.preconditionChecksum,
+      operationId,
+      proof,
+      stepId: initPlan.stepId,
+    })
+    const initialized = await coordinator.initializeSaga({
+      actorChecksum: "workerd-coordinator-actor",
+      attemptId: initAttemptId,
+      deadlineAtMs: 8_000_000_000_000_000,
+      descriptor,
+      evidenceChecksum: "workerd-coordinator-init-evidence",
+      idempotencyKey: "workerd-coordinator-saga-key",
+      inputChecksum: invocation.inputChecksum,
+      observedPostconditionChecksum: initPlan.postconditionChecksum,
+      operationId,
+      proof,
+      resultChecksum: "workerd-coordinator-init-result",
+      sagaId,
+      stepInputChecksums: invocation.stepInputChecksums,
+    })
+    const actionAttemptId = `${sagaId}:write:forward:1`
+    const begun = await coordinator.beginAction({
+      actorChecksum: "workerd-coordinator-actor",
+      attemptId: actionAttemptId,
+      operationId,
+      phase: "forward",
+      proof,
+      sagaId,
+      stepId: "write",
+    })
+    expect(initialized).toMatchObject({ stateVersion: 0, status: "planned" })
+    expect(begun).toMatchObject({ disposition: "execute" })
+    const counts = await env.DB.prepare(
+      `SELECT
+        (SELECT count(*) FROM "nozzle_operation_effects"
+         WHERE "resource_kind" = 'saga' AND "resource_id" = ?1) AS "effects",
+        (SELECT "state_version" FROM "nozzle_sagas" WHERE "saga_id" = ?1) AS "saga_version",
+        (SELECT json_extract("record_json", '$.startedAttempts')
+         FROM "nozzle_operation_steps"
+         WHERE "operation_id" = ?2 AND "step_id" = ?3) AS "operation_attempts"`,
+    )
+      .bind(sagaId, operationId, sagaActionOperationStepId("write", "forward"))
+      .first<{ effects: number; operation_attempts: number; saga_version: number }>()
+    expect(counts).toEqual({ effects: 2, operation_attempts: 1, saga_version: 1 })
   })
 
   it("atomically advances a saga only through exact fenced operation transitions", async () => {
