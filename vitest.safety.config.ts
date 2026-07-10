@@ -13,6 +13,7 @@ export default defineConfig({
         "packages/cloudflare/src/movement-transfer.ts",
         "packages/cloudflare/src/provider-http.ts",
         "packages/cloudflare/src/provider.ts",
+        "packages/cloudflare/src/saga-d1.ts",
         "packages/cloudflare/src/shard-guards.ts",
         "packages/control/src/lease-store.ts",
         "packages/control/src/migration-store.ts",
