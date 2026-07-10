@@ -222,21 +222,26 @@ function interventionError(message: string): never {
   throw new NozzleError("OperationInterventionRequiredError", message)
 }
 
-function assertWellFormedString(value: string, label: string): void {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    configurationError(`${label} must be non-empty.`)
-  }
+function isWellFormedUtf16(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index)
     if (code >= 0xd800 && code <= 0xdbff) {
       const next = value.charCodeAt(index + 1)
-      if (!(next >= 0xdc00 && next <= 0xdfff)) {
-        configurationError(`${label} cannot contain unpaired UTF-16 surrogates.`)
-      }
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false
       index += 1
     } else if (code >= 0xdc00 && code <= 0xdfff) {
-      configurationError(`${label} cannot contain unpaired UTF-16 surrogates.`)
+      return false
     }
+  }
+  return true
+}
+
+function assertWellFormedString(value: string, label: string): void {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    configurationError(`${label} must be non-empty.`)
+  }
+  if (!isWellFormedUtf16(value)) {
+    configurationError(`${label} cannot contain unpaired UTF-16 surrogates.`)
   }
 }
 
@@ -496,6 +501,208 @@ export function createOperationRecord(plan: OperationPlan): OperationRecord {
   }
   const steps: Record<string, OperationStepRecord> = {}
   for (const step of plan.steps) steps[step.stepId] = initialStep()
+  return Object.freeze({ plan, steps: Object.freeze(steps) })
+}
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function persistedInvariant(condition: boolean, message: string): asserts condition {
+  if (!condition) interventionError(message)
+}
+
+function persistedOptionalString(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined
+  persistedInvariant(
+    typeof value === "string" && value.trim().length > 0 && isWellFormedUtf16(value),
+    `${label} is malformed.`,
+  )
+  return value
+}
+
+function loadPersistedCounters(value: unknown, label: string): Readonly<Record<string, number>> {
+  persistedInvariant(plainRecord(value), `${label} are malformed.`)
+  const counters: Record<string, number> = {}
+  for (const key of Object.keys(value).sort()) {
+    persistedInvariant(
+      key.trim().length > 0 && isWellFormedUtf16(key),
+      `${label} contain an empty name.`,
+    )
+    const counter = value[key]
+    persistedInvariant(
+      typeof counter === "number" && Number.isSafeInteger(counter) && counter >= 0,
+      `${label} contain a malformed value.`,
+    )
+    counters[key] = counter
+  }
+  return Object.freeze(counters)
+}
+
+const PERSISTED_STEP_RECORD_KEYS = new Set([
+  "activeAttemptId",
+  "authorizationChecksum",
+  "costCounters",
+  "errorChecksum",
+  "fencingToken",
+  "lastAttemptId",
+  "progressCounters",
+  "reconciliationEvidenceChecksum",
+  "resultChecksum",
+  "startedAttempts",
+  "state",
+])
+
+function loadPersistedStepRecord(value: unknown, planStep: OperationStepPlan): OperationStepRecord {
+  persistedInvariant(plainRecord(value), "A persisted operation step record is malformed.")
+  persistedInvariant(
+    Object.keys(value).every((key) => PERSISTED_STEP_RECORD_KEYS.has(key)),
+    "A persisted operation step record contains unknown fields.",
+  )
+  persistedInvariant(
+    typeof value.state === "string" &&
+      (OPERATION_STEP_STATES as readonly string[]).includes(value.state),
+    "A persisted operation step state is unsupported.",
+  )
+  persistedInvariant(
+    typeof value.startedAttempts === "number" &&
+      Number.isSafeInteger(value.startedAttempts) &&
+      value.startedAttempts >= 0,
+    "A persisted operation attempt count is malformed.",
+  )
+  const activeAttemptId = persistedOptionalString(value.activeAttemptId, "Active attempt ID")
+  const authorizationChecksum = persistedOptionalString(
+    value.authorizationChecksum,
+    "Authorization checksum",
+  )
+  const errorChecksum = persistedOptionalString(value.errorChecksum, "Step error checksum")
+  const lastAttemptId = persistedOptionalString(value.lastAttemptId, "Last attempt ID")
+  const reconciliationEvidenceChecksum = persistedOptionalString(
+    value.reconciliationEvidenceChecksum,
+    "Reconciliation evidence checksum",
+  )
+  const resultChecksum = persistedOptionalString(value.resultChecksum, "Step result checksum")
+  const fencingToken = value.fencingToken
+  persistedInvariant(
+    fencingToken === undefined ||
+      (typeof fencingToken === "number" && Number.isSafeInteger(fencingToken) && fencingToken >= 1),
+    "A persisted operation fencing token is malformed.",
+  )
+  const costCounters = loadPersistedCounters(value.costCounters, "Persisted cost counters")
+  const progressCounters = loadPersistedCounters(
+    value.progressCounters,
+    "Persisted progress counters",
+  )
+  const state = value.state as OperationStepState
+  const pending = state === "pending"
+  persistedInvariant(
+    pending === (value.startedAttempts === 0),
+    "Persisted pending state contradicts the attempt count.",
+  )
+  persistedInvariant(
+    pending === (lastAttemptId === undefined) && pending === (fencingToken === undefined),
+    "Persisted attempt identity is incomplete or unexpected.",
+  )
+  persistedInvariant(
+    (state === "running") === (activeAttemptId !== undefined),
+    "Persisted active-attempt state is inconsistent.",
+  )
+  if (state === "running") {
+    persistedInvariant(
+      activeAttemptId === lastAttemptId,
+      "Persisted active and last attempt identities disagree.",
+    )
+  }
+  persistedInvariant(
+    (state === "succeeded") === (resultChecksum !== undefined),
+    "Persisted result state is inconsistent.",
+  )
+  persistedInvariant(
+    reconciliationEvidenceChecksum === undefined ||
+      state === "succeeded" ||
+      state === "retryable_failed" ||
+      state === "failed" ||
+      state === "intervention_required",
+    "Persisted reconciliation evidence is attached to an invalid state.",
+  )
+  persistedInvariant(
+    errorChecksum === undefined ||
+      state === "unknown" ||
+      state === "retryable_failed" ||
+      state === "failed" ||
+      state === "succeeded" ||
+      state === "intervention_required",
+    "Persisted error evidence is attached to an invalid state.",
+  )
+  if (state === "retryable_failed" || state === "failed") {
+    persistedInvariant(
+      errorChecksum !== undefined || reconciliationEvidenceChecksum !== undefined,
+      "Persisted failed state has no failure or reconciliation evidence.",
+    )
+  }
+  if (state === "intervention_required") {
+    persistedInvariant(
+      reconciliationEvidenceChecksum !== undefined,
+      "Persisted intervention state has no reconciliation evidence.",
+    )
+  }
+  if (planStep.checkpoint === "reversible") {
+    persistedInvariant(
+      authorizationChecksum === undefined,
+      "A reversible step persisted irreversible authorization.",
+    )
+  } else {
+    persistedInvariant(
+      pending === (authorizationChecksum === undefined),
+      "Persisted irreversible authorization state is inconsistent.",
+    )
+  }
+  if (pending) {
+    persistedInvariant(
+      Object.keys(costCounters).length === 0 && Object.keys(progressCounters).length === 0,
+      "A pending step persisted progress or cost counters.",
+    )
+  }
+  return Object.freeze({
+    ...(activeAttemptId === undefined ? {} : { activeAttemptId }),
+    ...(authorizationChecksum === undefined ? {} : { authorizationChecksum }),
+    costCounters,
+    ...(errorChecksum === undefined ? {} : { errorChecksum }),
+    ...(fencingToken === undefined ? {} : { fencingToken }),
+    ...(lastAttemptId === undefined ? {} : { lastAttemptId }),
+    progressCounters,
+    ...(reconciliationEvidenceChecksum === undefined ? {} : { reconciliationEvidenceChecksum }),
+    ...(resultChecksum === undefined ? {} : { resultChecksum }),
+    startedAttempts: value.startedAttempts,
+    state,
+  })
+}
+
+export async function loadOperationRecord(
+  candidate: unknown,
+  digest: DigestFunction,
+): Promise<OperationRecord> {
+  persistedInvariant(plainRecord(candidate), "The persisted operation record is malformed.")
+  persistedInvariant(
+    Object.keys(candidate).every((key) => key === "plan" || key === "steps"),
+    "The persisted operation record contains unknown fields.",
+  )
+  persistedInvariant(plainRecord(candidate.plan), "The persisted operation plan is malformed.")
+  persistedInvariant(plainRecord(candidate.steps), "The persisted operation steps are malformed.")
+  const plan = await loadOperationPlan(candidate.plan as unknown as OperationPlan, digest)
+  const expectedStepIds = plan.steps.map((step) => step.stepId)
+  const persistedStepIds = Object.keys(candidate.steps).sort()
+  persistedInvariant(
+    expectedStepIds.length === persistedStepIds.length &&
+      expectedStepIds.every((stepId, index) => stepId === persistedStepIds[index]),
+    "Persisted operation step membership does not match the immutable plan.",
+  )
+  const steps: Record<string, OperationStepRecord> = {}
+  for (const planStep of plan.steps) {
+    steps[planStep.stepId] = loadPersistedStepRecord(candidate.steps[planStep.stepId], planStep)
+  }
   return Object.freeze({ plan, steps: Object.freeze(steps) })
 }
 
