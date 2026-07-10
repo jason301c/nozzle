@@ -166,6 +166,7 @@ interface TransitionFaults {
   readonly hideAuditAfterBatch?: boolean
   readonly hideCurrentAfterBatch?: boolean
   readonly hideOperationAfterBatch?: boolean
+  readonly providerAttemptRow?: unknown
   readonly transitionRow?: unknown
   readonly throwTransitionBatch?: boolean
 }
@@ -189,6 +190,12 @@ class FaultInjectingDatabase implements TransactionalControlDatabase {
   }
 
   prepare(sql: string): ControlStatement {
+    if (
+      sql.includes('FROM "nozzle_provider_attempts" AS "attempt"') &&
+      Object.hasOwn(this.#faults, "providerAttemptRow")
+    ) {
+      return new ScriptedStatement(sql, { first: () => this.#faults.providerAttemptRow })
+    }
     if (
       sql.includes('FROM "nozzle_operation_transitions" WHERE "transition_id"') &&
       Object.hasOwn(this.#faults, "transitionRow")
@@ -1088,7 +1095,7 @@ describe("D1OperationStore", () => {
       database.database
         .prepare(
           `SELECT "fencing_token" FROM "nozzle_operation_transitions"
-           WHERE "transition_id" LIKE '%crash-unknown%'`,
+           WHERE "transition_id" LIKE '%crash-recovered%'`,
         )
         .get(),
     ).toEqual({ fencing_token: secondProof.fencingToken })
@@ -1168,6 +1175,112 @@ describe("D1OperationStore", () => {
         stepId: "a",
       }),
     ).rejects.toThrow(/bounded transition retry budget/u)
+  })
+
+  it("proves a provider step was not dispatched when no acceptance receipt exists", async () => {
+    const input = planInput({ operationId: "undispatched-provider-operation" })
+    const firstStep = input.steps[0]
+    if (!firstStep) throw new Error("Fixture step is missing.")
+    const plan = await sealTestPlan({
+      ...input,
+      steps: [{ ...firstStep, effectProtocol: "provider_receipt" }],
+    })
+    await store.create(creationInput(plan))
+    const leases = new D1LeaseStore(database)
+    const first = await leases.acquire({
+      acquisitionId: "undispatched-acquisition",
+      holderId: "undispatched-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!first.acquired) throw new Error("Fixture lease acquisition failed.")
+    const firstProof = leaseProof(first.record)
+    await store.beginStep({
+      actorChecksum: "actor",
+      attemptId: "undispatched-attempt",
+      idempotencyKey: "step-a-key",
+      observedPreconditionChecksum: "step-a-pre",
+      operationId: plan.operationId,
+      proof: firstProof,
+      stepId: "a",
+    })
+    await leases.release({ proof: firstProof })
+    const second = await leases.acquire({
+      acquisitionId: "undispatched-recovery-acquisition",
+      holderId: "undispatched-recovery-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!second.acquired) throw new Error("Fixture lease reacquisition failed.")
+    const secondProof = leaseProof(second.record)
+    for (const [providerAttemptRow, message] of [
+      [
+        {
+          acceptance_checksum: "accepted",
+          attempt_id: "undispatched-attempt",
+          operation_id: null,
+          state: null,
+          step_id: "a",
+        },
+        /recovery evidence is malformed/u,
+      ],
+      [
+        {
+          acceptance_checksum: "accepted",
+          attempt_id: "undispatched-attempt",
+          operation_id: "different-operation",
+          state: null,
+          step_id: "a",
+        },
+        /belongs to a different step/u,
+      ],
+    ] as const) {
+      const faulted = new D1OperationStore(
+        new FaultInjectingDatabase(database, { providerAttemptRow }),
+        digest,
+      )
+      await expect(
+        faulted.recoverRunningStep({
+          actorChecksum: "recovery-actor",
+          operationId: plan.operationId,
+          proof: secondProof,
+          recoveryId: "faulted-recovery",
+          stepId: "a",
+        }),
+      ).rejects.toThrow(message)
+    }
+    const recovered = await store.recoverRunningStep({
+      actorChecksum: "recovery-actor",
+      operationId: plan.operationId,
+      proof: secondProof,
+      recoveryId: "undispatched-recovery",
+      stepId: "a",
+    })
+    expect(recovered.steps.a).toMatchObject({
+      fencingToken: firstProof.fencingToken,
+      lastAttemptId: "undispatched-attempt",
+      state: "retryable_failed",
+    })
+    await expect(
+      store.beginStep({
+        actorChecksum: "recovery-actor",
+        attemptId: "first-physical-attempt",
+        idempotencyKey: "step-a-key",
+        observedPreconditionChecksum: "step-a-pre",
+        operationId: plan.operationId,
+        proof: secondProof,
+        stepId: "a",
+      }),
+    ).resolves.toMatchObject({ disposition: "execute" })
+    const audit = database.database
+      .prepare(
+        `SELECT "event_json" FROM "nozzle_audit_log"
+         WHERE "operation_id" = ? ORDER BY "sequence" DESC LIMIT 2`,
+      )
+      .all(plan.operationId) as { event_json: string }[]
+    expect(audit.map((row) => JSON.parse(row.event_json).eventType)).toContain(
+      "step.crash.not_dispatched",
+    )
   })
 
   it("persists retryable and permanent failures with their bounded next action", async () => {

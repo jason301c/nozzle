@@ -8,6 +8,7 @@ import {
   type LeaseProof,
   loadAuditEvent,
   loadOperationRecord,
+  markRunningStepNotDispatchedAfterCrash,
   markRunningStepUnknownAfterCrash,
   NozzleError,
   type OperationPlan,
@@ -29,6 +30,7 @@ const MAX_CREATE_ATTEMPTS = 16
 const MAX_TRANSITION_ATTEMPTS = 16
 const MAX_OPERATION_PAYLOAD_BYTES = 1024 * 1024
 const SERVER_TIME_SQL = `CAST(unixepoch('subsec') * 1000 AS INTEGER)`
+const PROVIDER_ATTEMPT_OUTCOME_STATES = new Set<unknown>([null, "confirmed", "rejected", "unknown"])
 
 interface OperationRow {
   readonly capability_snapshot_checksum: string
@@ -83,6 +85,14 @@ interface TransitionRow {
   readonly to_operation_status: string
   readonly to_record_json: string
   readonly transition_id: string
+}
+
+interface ProviderAttemptPresenceRow {
+  readonly acceptance_checksum: string
+  readonly attempt_id: string
+  readonly operation_id: string
+  readonly state: string | null
+  readonly step_id: string
 }
 
 export interface LoadedOperation {
@@ -353,6 +363,33 @@ export class D1OperationStore {
       row.input_checksum.trim() === ""
     ) {
       return intervention("Persisted operation idempotency state is malformed.")
+    }
+    return Object.freeze(row)
+  }
+
+  async #providerAttempt(attemptId: string): Promise<ProviderAttemptPresenceRow | undefined> {
+    const row = await this.#database
+      .prepare(
+        `SELECT "attempt"."attempt_id", "attempt"."operation_id", "attempt"."step_id",
+                "attempt"."acceptance_checksum", "outcome"."state"
+         FROM "nozzle_provider_attempts" AS "attempt"
+         LEFT JOIN "nozzle_provider_attempt_outcomes" AS "outcome" USING ("attempt_id")
+         WHERE "attempt"."attempt_id" = ?1`,
+      )
+      .bind(attemptId)
+      .first<ProviderAttemptPresenceRow>()
+    if (row === null) return undefined
+    if (
+      row.attempt_id !== attemptId ||
+      typeof row.operation_id !== "string" ||
+      row.operation_id.trim() === "" ||
+      typeof row.step_id !== "string" ||
+      row.step_id.trim() === "" ||
+      typeof row.acceptance_checksum !== "string" ||
+      row.acceptance_checksum.trim() === "" ||
+      !PROVIDER_ATTEMPT_OUTCOME_STATES.has(row.state)
+    ) {
+      return intervention("Persisted provider-attempt recovery evidence is malformed.")
     }
     return Object.freeze(row)
   }
@@ -1005,7 +1042,7 @@ export class D1OperationStore {
     nonEmpty(input.operationId, "Operation ID")
     nonEmpty(input.actorChecksum, "Transition actor checksum")
     nonEmpty(input.recoveryId, "Crash recovery ID")
-    const transitionId = transitionIdentity("crash-unknown", [
+    const transitionId = transitionIdentity("crash-recovered", [
       input.operationId,
       input.stepId,
       input.recoveryId,
@@ -1030,19 +1067,55 @@ export class D1OperationStore {
         }
         return before.operation
       }
-      const next = markRunningStepUnknownAfterCrash(before.operation, input.stepId)
+      const unknown = markRunningStepUnknownAfterCrash(before.operation, input.stepId)
       const originalFencingToken = record.fencingToken as number
+      const activeAttemptId = record.activeAttemptId as string
       const lastAttemptId = record.lastAttemptId as string
       await this.#leases.authorizeAt(input.proof)
       if (input.proof.fencingToken <= originalFencingToken) {
         return resume("Crash recovery requires a strictly newer lease fencing token.")
       }
+      const planStep = before.operation.plan.steps.find(
+        (candidate) => candidate.stepId === input.stepId,
+      ) as OperationStepPlan
+      const providerAttempt =
+        planStep.effectProtocol === "provider_receipt"
+          ? await this.#providerAttempt(activeAttemptId)
+          : undefined
+      if (
+        providerAttempt !== undefined &&
+        (providerAttempt.operation_id !== input.operationId ||
+          providerAttempt.step_id !== input.stepId)
+      ) {
+        return intervention("Provider-attempt recovery evidence belongs to a different step.")
+      }
+      const notDispatched =
+        planStep.effectProtocol === "provider_receipt" && providerAttempt === undefined
+      let next = unknown
+      if (notDispatched) {
+        const absenceEvidenceChecksum = await this.#digest(
+          new TextEncoder().encode(
+            transitionIdentity("provider-not-dispatched-evidence", [
+              input.operationId,
+              input.stepId,
+              activeAttemptId,
+              input.proof.fencingToken.toString(10),
+            ]),
+          ),
+        )
+        nonEmpty(absenceEvidenceChecksum, "Provider dispatch-absence evidence checksum")
+        next = markRunningStepNotDispatchedAfterCrash(
+          before.operation,
+          input.stepId,
+          absenceEvidenceChecksum,
+        )
+      }
       const after: LoadedOperation = Object.freeze({ ...before, operation: next })
       const persisted = await this.#persistTransition({
         actorChecksum: input.actorChecksum,
         after,
-        auditEventType: "step.crash.outcome_unknown",
-        auditPayloadChecksum: lastAttemptId,
+        auditEventType: notDispatched ? "step.crash.not_dispatched" : "step.crash.outcome_unknown",
+        auditPayloadChecksum: providerAttempt?.acceptance_checksum ?? lastAttemptId,
         before,
         proof: input.proof,
         stepId: input.stepId,

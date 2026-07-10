@@ -43,6 +43,7 @@ describe("real workerd provider receipts", () => {
           {
             checkpoint: "reversible",
             dependsOn: [],
+            effectProtocol: "provider_receipt",
             idempotencyKey: "workerd-provider-step-key",
             inputChecksum: "workerd-provider-step-input",
             leaseKey: "workerd:provider",
@@ -111,5 +112,22 @@ describe("real workerd provider receipts", () => {
          (SELECT count(*) FROM "nozzle_provider_attempt_outcomes") AS "outcomes"`,
     ).first<{ attempts: number; outcomes: number }>()
     expect(counts).toEqual({ attempts: 1, outcomes: 1 })
+    await leases.release({ proof })
+    const recoveryLease = await leases.acquire({
+      acquisitionId: "workerd-provider-recovery-acquisition",
+      holderId: "workerd-provider-recovery-controller",
+      leaseKey: "workerd:provider",
+      ttlMs: 60_000,
+    })
+    if (!recoveryLease.acquired) throw new Error("Recovery lease acquisition failed.")
+    await expect(
+      operations.recoverRunningStep({
+        actorChecksum: "workerd-provider-recovery-actor",
+        operationId: plan.operationId,
+        proof: leaseProof(recoveryLease.record),
+        recoveryId: "workerd-provider-recovery",
+        stepId: "provider-call",
+      }),
+    ).resolves.toMatchObject({ steps: { "provider-call": { state: "unknown" } } })
   })
 })

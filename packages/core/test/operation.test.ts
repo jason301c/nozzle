@@ -16,6 +16,7 @@ import {
   leaseProof,
   loadIrreversibleAuthorization,
   loadOperationPlan,
+  markRunningStepNotDispatchedAfterCrash,
   markRunningStepsUnknownAfterCrash,
   markRunningStepUnknownAfterCrash,
   type OperationPlan,
@@ -150,7 +151,7 @@ describe("immutable operation plans", () => {
     const noDependencies = { ...step("standalone") }
     delete noDependencies.dependsOn
     await expect(sealOperationPlan(planInput([noDependencies]), digest)).resolves.toMatchObject({
-      steps: [{ dependsOn: [] }],
+      steps: [{ dependsOn: [], effectProtocol: "opaque" }],
     })
   })
 
@@ -190,6 +191,7 @@ describe("immutable operation plans", () => {
     planInput([step("a", { dependsOn: ["b", "b"] }), step("b")]),
     planInput([step("a", { checkpoint: "bad" as "reversible" })]),
     planInput([step("a", { retryClassification: "bad" as "never" })]),
+    planInput([step("a", { effectProtocol: "bad" as "opaque" })]),
     planInput([step("", {})]),
     planInput([step("a", { recoveryInstructions: "" })]),
   ])("rejects malformed or ambiguous plan input", async (input) => {
@@ -714,6 +716,15 @@ describe("operation crash, resume, and idempotency guards", () => {
     const lease = acquire()
     const operation = createOperationRecord(await plan([step("a"), step("b"), step("c")]))
     const runningA = begin(operation, lease, { stepId: "a" }).operation
+    const notDispatched = markRunningStepNotDispatchedAfterCrash(
+      runningA,
+      "a",
+      "provider-receipt-absent",
+    )
+    expect(notDispatched.steps.a?.state).toBe("retryable_failed")
+    expect(
+      begin(notDispatched, lease, { attemptId: "provider-attempt-2", stepId: "a" }).disposition,
+    ).toBe("execute")
     const runningBoth = begin(runningA, lease, { stepId: "b" }).operation
     const crashed = markRunningStepsUnknownAfterCrash(runningBoth)
     expect(crashed.steps.a?.state).toBe("unknown")

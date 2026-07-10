@@ -189,6 +189,7 @@ describe("D1ProviderAttemptStore", () => {
           {
             checkpoint: "reversible",
             dependsOn: [],
+            effectProtocol: "provider_receipt",
             idempotencyKey: `step-key-${suffix}`,
             inputChecksum: `step-input-${suffix}`,
             leaseKey,
@@ -370,6 +371,15 @@ describe("D1ProviderAttemptStore", () => {
       }),
     ).rejects.toThrow(/different lease owner/u)
     await expect(store.get(fixture.attemptId)).resolves.toMatchObject({ state: "accepted" })
+    await expect(
+      operations.recoverRunningStep({
+        actorChecksum: "recovery-actor",
+        operationId: fixture.plan.operationId,
+        proof: leaseProof(newer.record),
+        recoveryId: "accepted-recovery",
+        stepId: "provider-call",
+      }),
+    ).resolves.toMatchObject({ steps: { "provider-call": { state: "unknown" } } })
   })
 
   it("requires an accepted running step and validates bounded structured evidence", async () => {

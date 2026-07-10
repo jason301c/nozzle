@@ -19,11 +19,13 @@ export const OPERATION_STEP_STATES = [
 export type OperationStepState = (typeof OPERATION_STEP_STATES)[number]
 export type RetryClassification = "idempotent" | "never" | "reconcile_first"
 export type CheckpointKind = "irreversible" | "reversible"
+export type EffectProtocol = "opaque" | "provider_receipt"
 export type DigestFunction = (input: Uint8Array) => Promise<string> | string
 
 export interface OperationStepPlanInput {
   readonly checkpoint: CheckpointKind
   readonly dependsOn?: readonly string[]
+  readonly effectProtocol?: EffectProtocol
   readonly idempotencyKey: string
   readonly inputChecksum: string
   readonly leaseKey: string
@@ -45,6 +47,7 @@ export interface OperationPlanInput {
 
 export interface OperationStepPlan extends OperationStepPlanInput {
   readonly dependsOn: readonly string[]
+  readonly effectProtocol: EffectProtocol
 }
 
 export interface OperationPlan {
@@ -277,12 +280,16 @@ function normalizeStep(step: OperationStepPlanInput): OperationStepPlan {
   if (!(["idempotent", "never", "reconcile_first"] as const).includes(step.retryClassification)) {
     configurationError("Step retry classification is invalid.")
   }
+  const effectProtocol = step.effectProtocol ?? "opaque"
+  if (!(["opaque", "provider_receipt"] as const).includes(effectProtocol)) {
+    configurationError("Step effect protocol is invalid.")
+  }
   const dependsOn = [...new Set(step.dependsOn ?? [])].sort()
   if (dependsOn.length !== (step.dependsOn ?? []).length || dependsOn.includes("")) {
     configurationError("Step dependencies must be unique and non-empty.")
   }
   for (const dependency of dependsOn) assertWellFormedString(dependency, "Step dependency")
-  return Object.freeze({ ...step, dependsOn: Object.freeze(dependsOn) })
+  return Object.freeze({ ...step, dependsOn: Object.freeze(dependsOn), effectProtocol })
 }
 
 function normalizePlan(input: OperationPlanInput): Omit<OperationPlan, "planChecksum"> {
@@ -377,6 +384,7 @@ function planChecksumValues(plan: Omit<OperationPlan, "planChecksum">): readonly
       step.leaseKey,
       step.preconditionChecksum,
       step.postconditionChecksum,
+      step.effectProtocol,
       step.retryClassification,
       step.checkpoint,
       step.recoveryInstructions,
@@ -1258,9 +1266,10 @@ export function recordStepFailure(
   return updateStep(operation, input.stepId, next)
 }
 
-export function markRunningStepUnknownAfterCrash(
+function recoverRunningStepAfterCrash(
   operation: OperationRecord,
   stepId: string,
+  state: "retryable_failed" | "unknown",
 ): OperationRecord {
   const record = getStepRecord(operation, stepId)
   if (record.state !== "running") {
@@ -1269,7 +1278,7 @@ export function markRunningStepUnknownAfterCrash(
   if (!record.activeAttemptId || !record.fencingToken || !record.lastAttemptId) {
     interventionError("A running step has incomplete crash-recovery metadata.")
   }
-  const unknown: OperationStepRecord = {
+  const recovered: OperationStepRecord = {
     ...(record.authorizationChecksum
       ? { authorizationChecksum: record.authorizationChecksum }
       : {}),
@@ -1278,9 +1287,31 @@ export function markRunningStepUnknownAfterCrash(
     lastAttemptId: record.lastAttemptId,
     progressCounters: record.progressCounters,
     startedAttempts: record.startedAttempts,
-    state: "unknown",
+    state,
   }
-  return updateStep(operation, stepId, unknown)
+  return updateStep(operation, stepId, recovered)
+}
+
+export function markRunningStepNotDispatchedAfterCrash(
+  operation: OperationRecord,
+  stepId: string,
+  evidenceChecksum: string,
+): OperationRecord {
+  assertWellFormedString(evidenceChecksum, "Provider dispatch-absence evidence checksum")
+  const recovered = recoverRunningStepAfterCrash(operation, stepId, "retryable_failed")
+  const record = getStepRecord(recovered, stepId)
+  return updateStep(
+    recovered,
+    stepId,
+    Object.freeze({ ...record, reconciliationEvidenceChecksum: evidenceChecksum }),
+  )
+}
+
+export function markRunningStepUnknownAfterCrash(
+  operation: OperationRecord,
+  stepId: string,
+): OperationRecord {
+  return recoverRunningStepAfterCrash(operation, stepId, "unknown")
 }
 
 export function markRunningStepsUnknownAfterCrash(operation: OperationRecord): OperationRecord {

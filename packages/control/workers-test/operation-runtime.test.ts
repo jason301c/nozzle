@@ -44,6 +44,7 @@ describe("real workerd operation ledger", () => {
               {
                 checkpoint: "reversible",
                 dependsOn: [],
+                effectProtocol: "provider_receipt",
                 idempotencyKey: `workerd-step-key-${index}`,
                 inputChecksum: `workerd-step-input-${index}`,
                 leaseKey: "workerd:operation",
@@ -174,18 +175,8 @@ describe("real workerd operation ledger", () => {
     expect(recovered.steps.provision).toMatchObject({
       fencingToken: proof.fencingToken,
       lastAttemptId: "workerd-crashed-attempt",
-      state: "unknown",
+      state: "retryable_failed",
     })
-    const retryable = await store.reconcileStep({
-      actorChecksum: "workerd-recovery-actor",
-      evidenceChecksum: "workerd-proven-absent",
-      operationId: crashedPlan.operationId,
-      outcome: "not_applied",
-      proof: recoveryProof,
-      reconciliationId: "workerd-not-applied",
-      stepId: "provision",
-    })
-    expect(retryable.steps.provision?.state).toBe("retryable_failed")
     await expect(
       store.beginStep({
         actorChecksum: "workerd-recovery-actor",
