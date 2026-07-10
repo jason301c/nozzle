@@ -176,11 +176,13 @@ describe("D1ProviderAttemptStore", () => {
 
   const startAttempt = async (suffix: string) => {
     const leaseKey = `provider:${suffix}`
+    const inputJson = JSON.stringify({ operation: `provider-${suffix}` })
+    const capabilitySnapshotJson = JSON.stringify({ target: "cloudflare-d1" })
     const plan = await sealOperationPlan(
       {
-        capabilitySnapshotChecksum: `capabilities-${suffix}`,
+        capabilitySnapshotChecksum: await digest(new TextEncoder().encode(capabilitySnapshotJson)),
         idempotencyKey: `operation-key-${suffix}`,
-        inputChecksum: `operation-input-${suffix}`,
+        inputChecksum: await digest(new TextEncoder().encode(inputJson)),
         operationId: `operation-${suffix}`,
         operationType: "provider-test",
         steps: [
@@ -202,8 +204,10 @@ describe("D1ProviderAttemptStore", () => {
     )
     await operations.create({
       actorChecksum: "creation-actor",
+      capabilitySnapshotJson,
       environmentId: "production",
       idempotencyScope: `scope-${suffix}`,
+      inputJson,
       plan,
       requiredShardIds: [],
     })

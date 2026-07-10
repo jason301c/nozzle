@@ -27,15 +27,18 @@ import { D1LeaseStore } from "./lease-store.js"
 
 const MAX_CREATE_ATTEMPTS = 16
 const MAX_TRANSITION_ATTEMPTS = 16
+const MAX_OPERATION_PAYLOAD_BYTES = 1024 * 1024
 const SERVER_TIME_SQL = `CAST(unixepoch('subsec') * 1000 AS INTEGER)`
 
 interface OperationRow {
   readonly capability_snapshot_checksum: string
+  readonly capability_snapshot_json: string
   readonly created_at_ms: number
   readonly environment_id: string
   readonly idempotency_key: string
   readonly idempotency_scope: string
   readonly input_checksum: string
+  readonly input_json: string
   readonly operation_id: string
   readonly operation_type: string
   readonly plan_checksum: string
@@ -83,8 +86,10 @@ interface TransitionRow {
 }
 
 export interface LoadedOperation {
+  readonly capabilitySnapshotJson: string
   readonly environmentId: string
   readonly idempotencyScope: string
+  readonly inputJson: string
   readonly operation: OperationRecord
   readonly requiredShardIds: readonly string[]
 }
@@ -95,8 +100,10 @@ export interface OperationCreationResult extends LoadedOperation {
 
 export interface CreateOperationInput {
   readonly actorChecksum: string
+  readonly capabilitySnapshotJson: string
   readonly environmentId: string
   readonly idempotencyScope: string
+  readonly inputJson: string
   readonly plan: OperationPlan
   readonly requiredShardIds: readonly string[]
 }
@@ -176,6 +183,46 @@ function parseJson(value: unknown, label: string): unknown {
   } catch {
     return intervention(`${label} is not valid JSON.`)
   }
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue)
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>
+    const output: Record<string, unknown> = {}
+    for (const key of Object.keys(record).sort()) output[key] = canonicalJsonValue(record[key])
+    return output
+  }
+  return value
+}
+
+function canonicalJson(value: unknown, label: string, persisted: boolean): string {
+  const fail = persisted ? intervention : configuration
+  if (typeof value !== "string" || value.length === 0) return fail(`${label} must be JSON text.`)
+  if (new TextEncoder().encode(value).byteLength > MAX_OPERATION_PAYLOAD_BYTES) {
+    return fail(`${label} exceeds the one MiB operation payload limit.`)
+  }
+  let decoded: unknown
+  try {
+    decoded = JSON.parse(value) as unknown
+  } catch {
+    return fail(`${label} is not valid JSON.`)
+  }
+  return JSON.stringify(canonicalJsonValue(decoded)) as string
+}
+
+async function checksumJson(
+  digest: DigestFunction,
+  json: string,
+  label: string,
+  persisted: boolean,
+): Promise<string> {
+  const checksum = await digest(new TextEncoder().encode(json))
+  const fail = persisted ? intervention : configuration
+  if (typeof checksum !== "string" || checksum.trim().length === 0) {
+    return fail(`${label} checksum is malformed.`)
+  }
+  return checksum
 }
 
 function canonicalRequiredShards(input: readonly string[]): readonly string[] {
@@ -315,8 +362,9 @@ export class D1OperationStore {
     const row = await this.#database
       .prepare(
         `SELECT "operation_id", "environment_id", "operation_type", "idempotency_scope",
-                "idempotency_key", "input_checksum", "plan_checksum", "plan_json",
-                "capability_snapshot_checksum", "required_shards_json", "status",
+                "idempotency_key", "input_checksum", "input_json", "plan_checksum", "plan_json",
+                "capability_snapshot_checksum", "capability_snapshot_json",
+                "required_shards_json", "status",
                 "created_at_ms", "updated_at_ms"
          FROM "nozzle_operations" WHERE "operation_id" = ?1`,
       )
@@ -365,12 +413,30 @@ export class D1OperationStore {
       { plan: parseJson(row.plan_json, "Persisted operation plan"), steps },
       this.#digest,
     )
+    const inputJson = canonicalJson(row.input_json, "Persisted operation input", true)
+    const capabilitySnapshotJson = canonicalJson(
+      row.capability_snapshot_json,
+      "Persisted capability snapshot",
+      true,
+    )
+    if (inputJson !== row.input_json || capabilitySnapshotJson !== row.capability_snapshot_json) {
+      return intervention("Persisted operation payload JSON is not canonical.")
+    }
+    const inputChecksum = await checksumJson(this.#digest, inputJson, "Operation input", true)
+    const capabilitySnapshotChecksum = await checksumJson(
+      this.#digest,
+      capabilitySnapshotJson,
+      "Capability snapshot",
+      true,
+    )
     if (
       row.operation_type !== operation.plan.operationType ||
       row.idempotency_key !== operation.plan.idempotencyKey ||
       row.input_checksum !== operation.plan.inputChecksum ||
       row.plan_checksum !== operation.plan.planChecksum ||
       row.capability_snapshot_checksum !== operation.plan.capabilitySnapshotChecksum ||
+      inputChecksum !== operation.plan.inputChecksum ||
+      capabilitySnapshotChecksum !== operation.plan.capabilitySnapshotChecksum ||
       row.status !== operationStatus(operation)
     ) {
       return intervention("Persisted operation columns contradict the verified operation record.")
@@ -395,8 +461,10 @@ export class D1OperationStore {
       parseJson(row.required_shards_json, "Persisted required shard membership"),
     )
     return Object.freeze({
+      capabilitySnapshotJson,
       environmentId: row.environment_id,
       idempotencyScope: row.idempotency_scope,
+      inputJson,
       operation,
       requiredShardIds,
     })
@@ -411,6 +479,9 @@ export class D1OperationStore {
     if (
       loaded.environmentId !== input.environmentId ||
       loaded.idempotencyScope !== input.idempotencyScope ||
+      loaded.inputJson !== canonicalJson(input.inputJson, "Operation input", false) ||
+      loaded.capabilitySnapshotJson !==
+        canonicalJson(input.capabilitySnapshotJson, "Capability snapshot", false) ||
       !sameStrings(loaded.requiredShardIds, requiredShardIds)
     ) {
       return resume("The operation ID is already bound to a different target or shard set.")
@@ -433,6 +504,25 @@ export class D1OperationStore {
     nonEmpty(input.environmentId, "Environment ID")
     nonEmpty(input.idempotencyScope, "Idempotency scope")
     nonEmpty(input.actorChecksum, "Operation actor checksum")
+    const inputJson = canonicalJson(input.inputJson, "Operation input", false)
+    const capabilitySnapshotJson = canonicalJson(
+      input.capabilitySnapshotJson,
+      "Capability snapshot",
+      false,
+    )
+    const inputChecksum = await checksumJson(this.#digest, inputJson, "Operation input", false)
+    const capabilitySnapshotChecksum = await checksumJson(
+      this.#digest,
+      capabilitySnapshotJson,
+      "Capability snapshot",
+      false,
+    )
+    if (
+      inputChecksum !== input.plan.inputChecksum ||
+      capabilitySnapshotChecksum !== input.plan.capabilitySnapshotChecksum
+    ) {
+      return configuration("Operation payload checksums do not match the sealed plan.")
+    }
     const requiredShardIds = canonicalRequiredShards(input.requiredShardIds)
     const initial = createOperationRecord(input.plan)
 
@@ -482,10 +572,11 @@ export class D1OperationStore {
           .prepare(
             `INSERT INTO "nozzle_operations"
              ("operation_id", "environment_id", "operation_type", "idempotency_scope",
-              "idempotency_key", "input_checksum", "plan_checksum", "plan_json",
-              "capability_snapshot_checksum", "required_shards_json", "status",
+              "idempotency_key", "input_checksum", "input_json", "plan_checksum", "plan_json",
+              "capability_snapshot_checksum", "capability_snapshot_json",
+              "required_shards_json", "status",
               "created_at_ms", "updated_at_ms")
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'planned',
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'planned',
                      ${SERVER_TIME_SQL}, ${SERVER_TIME_SQL})
              ON CONFLICT ("operation_id") DO NOTHING`,
           )
@@ -496,9 +587,11 @@ export class D1OperationStore {
             input.idempotencyScope,
             input.plan.idempotencyKey,
             input.plan.inputChecksum,
+            inputJson,
             input.plan.planChecksum,
             JSON.stringify(input.plan),
             input.plan.capabilitySnapshotChecksum,
+            capabilitySnapshotJson,
             JSON.stringify(requiredShardIds),
           ),
         ...input.plan.steps.map((planStep) =>

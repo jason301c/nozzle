@@ -3,6 +3,7 @@ import {
   appendAuditEvent,
   type DigestFunction,
   leaseProof,
+  type OperationPlan,
   type OperationPlanInput,
   sealIrreversibleAuthorization,
   sealOperationPlan,
@@ -262,17 +263,50 @@ function planInput(
 }
 
 async function sealedPlan(input: Parameters<typeof planInput>[0] = {}) {
-  return sealOperationPlan(planInput(input), digest)
+  return sealTestPlan(planInput(input))
+}
+
+const payloads = new WeakMap<
+  OperationPlan,
+  { readonly capabilitySnapshotJson: string; readonly inputJson: string }
+>()
+
+async function checksumText(value: string): Promise<string> {
+  return digest(new TextEncoder().encode(value)) as Promise<string>
+}
+
+async function sealTestPlan(
+  input: OperationPlanInput,
+  custom: { readonly capabilitySnapshotJson?: string; readonly inputJson?: string } = {},
+): Promise<OperationPlan> {
+  const inputJson = custom.inputJson ?? JSON.stringify({ input: input.inputChecksum })
+  const capabilitySnapshotJson =
+    custom.capabilitySnapshotJson ??
+    JSON.stringify({ capabilitySnapshot: input.capabilitySnapshotChecksum })
+  const plan = await sealOperationPlan(
+    {
+      ...input,
+      capabilitySnapshotChecksum: await checksumText(capabilitySnapshotJson),
+      inputChecksum: await checksumText(inputJson),
+    },
+    digest,
+  )
+  payloads.set(plan, { capabilitySnapshotJson, inputJson })
+  return plan
 }
 
 function creationInput(
   plan: Awaited<ReturnType<typeof sealedPlan>>,
   overrides: Record<string, unknown> = {},
 ) {
+  const payload = payloads.get(plan)
+  if (!payload) throw new Error("Fixture operation payload is missing.")
   return {
     actorChecksum: "actor-checksum",
+    capabilitySnapshotJson: payload.capabilitySnapshotJson,
     environmentId: "production",
     idempotencyScope: "fleet-a",
+    inputJson: payload.inputJson,
     plan,
     requiredShardIds: ["shard-b", "shard-a"],
     ...overrides,
@@ -343,8 +377,10 @@ describe("D1OperationStore", () => {
     expect(Object.isFrozen(created)).toBe(true)
     expect(Object.isFrozen(created.requiredShardIds)).toBe(true)
     await expect(store.get(plan.operationId)).resolves.toEqual({
+      capabilitySnapshotJson: created.capabilitySnapshotJson,
       environmentId: created.environmentId,
       idempotencyScope: created.idempotencyScope,
+      inputJson: created.inputJson,
       operation: created.operation,
       requiredShardIds: created.requiredShardIds,
     })
@@ -359,6 +395,80 @@ describe("D1OperationStore", () => {
     expect(
       database.database.prepare(`SELECT count(*) AS "count" FROM "nozzle_idempotency_keys"`).get(),
     ).toEqual({ count: 1 })
+  })
+
+  it("persists canonical reconstructible input and capability snapshots", async () => {
+    const inputJson = '{"items":[3,{"a":1,"z":2}],"mode":"provision"}'
+    const capabilitySnapshotJson = '{"features":{"d1":true},"revision":1}'
+    const plan = await sealTestPlan(planInput({ operationId: "payload-operation" }), {
+      capabilitySnapshotJson,
+      inputJson,
+    })
+    const created = await store.create(
+      creationInput(plan, {
+        capabilitySnapshotJson: ' { "revision": 1, "features": { "d1": true } } ',
+        inputJson: ' { "mode": "provision", "items": [3, { "z": 2, "a": 1 }] } ',
+      }),
+    )
+    expect(created).toMatchObject({ capabilitySnapshotJson, inputJson })
+    expect(
+      database.database
+        .prepare(
+          `SELECT "input_json", "capability_snapshot_json" FROM "nozzle_operations"
+           WHERE "operation_id" = ?`,
+        )
+        .get(plan.operationId),
+    ).toEqual({ capability_snapshot_json: capabilitySnapshotJson, input_json: inputJson })
+  })
+
+  it("rejects invalid, oversized, mismatched, or unhashable operation payloads", async () => {
+    const plan = await sealedPlan({ operationId: "invalid-payload-operation" })
+    for (const inputJson of [null, "", "{", JSON.stringify("x".repeat(1024 * 1024 + 1))]) {
+      await expect(store.create(creationInput(plan, { inputJson }))).rejects.toThrow(
+        /JSON text|valid JSON|one MiB/u,
+      )
+    }
+    await expect(store.create(creationInput(plan, { inputJson: "{}" }))).rejects.toThrow(
+      /payload checksums do not match/u,
+    )
+    const invalidDigest = new D1OperationStore(database, async () => "")
+    await expect(invalidDigest.create(creationInput(plan))).rejects.toThrow(
+      /checksum is malformed/u,
+    )
+  })
+
+  it("fails closed when persisted operation payloads lose canonical integrity", async () => {
+    const plan = await sealedPlan({ operationId: "corrupt-payload-operation" })
+    await store.create(creationInput(plan))
+    database.database.exec('DROP TRIGGER "nozzle_control_operation_plan_update";')
+    database.database
+      .prepare(`UPDATE "nozzle_operations" SET "input_json" = ? WHERE "operation_id" = ?`)
+      .run('{ "input": "operation-input" }', plan.operationId)
+    await expect(store.get(plan.operationId)).rejects.toThrow(/not canonical/u)
+
+    database.database.exec("PRAGMA ignore_check_constraints = ON;")
+    database.database
+      .prepare(`UPDATE "nozzle_operations" SET "input_json" = ? WHERE "operation_id" = ?`)
+      .run("not-json", plan.operationId)
+    await expect(store.get(plan.operationId)).rejects.toThrow(/not valid JSON/u)
+    database.database
+      .prepare(`UPDATE "nozzle_operations" SET "input_json" = ? WHERE "operation_id" = ?`)
+      .run(JSON.stringify("x".repeat(1024 * 1024 + 1)), plan.operationId)
+    await expect(store.get(plan.operationId)).rejects.toThrow(/one MiB/u)
+    database.database
+      .prepare(`UPDATE "nozzle_operations" SET "input_json" = '{}' WHERE "operation_id" = ?`)
+      .run(plan.operationId)
+    await expect(store.get(plan.operationId)).rejects.toThrow(/contradict the verified/u)
+
+    const emptyJsonDigest: DigestFunction = async (value) => {
+      if (value[0] === 0x7b) return ""
+      return digest(value)
+    }
+    const invalidDigest = new D1OperationStore(database, emptyJsonDigest)
+    database.database
+      .prepare(`UPDATE "nozzle_operations" SET "input_json" = ? WHERE "operation_id" = ?`)
+      .run('{"input":"operation-input"}', plan.operationId)
+    await expect(invalidDigest.get(plan.operationId)).rejects.toThrow(/checksum is malformed/u)
   })
 
   it("serializes concurrent creations into one valid per-environment audit chain", async () => {
@@ -893,10 +1003,10 @@ describe("D1OperationStore", () => {
     const input = planInput({ operationId: "crash-recovery-operation" })
     const firstStep = input.steps[0]
     if (!firstStep) throw new Error("Fixture step is missing.")
-    const plan = await sealOperationPlan(
-      { ...input, steps: [{ ...firstStep, retryClassification: "reconcile_first" }] },
-      digest,
-    )
+    const plan = await sealTestPlan({
+      ...input,
+      steps: [{ ...firstStep, retryClassification: "reconcile_first" }],
+    })
     await store.create(creationInput(plan))
     const leases = new D1LeaseStore(database)
     const first = await leases.acquire({
@@ -1128,18 +1238,15 @@ describe("D1OperationStore", () => {
   it("accepts sealed authorization for an irreversible stored step", async () => {
     const baseStep = planInput().steps[0]
     if (!baseStep) throw new Error("Fixture step is missing.")
-    const plan = await sealOperationPlan(
-      {
-        ...planInput({ operationId: "irreversible-operation" }),
-        steps: [
-          {
-            ...baseStep,
-            checkpoint: "irreversible",
-          },
-        ],
-      },
-      digest,
-    )
+    const plan = await sealTestPlan({
+      ...planInput({ operationId: "irreversible-operation" }),
+      steps: [
+        {
+          ...baseStep,
+          checkpoint: "irreversible",
+        },
+      ],
+    })
     await store.create(creationInput(plan))
     const leases = new D1LeaseStore(database)
     const acquired = await leases.acquire({

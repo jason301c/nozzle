@@ -192,9 +192,11 @@ ON CONFLICT ("singleton") DO NOTHING;`,
   "idempotency_scope" TEXT NOT NULL CHECK (length(trim("idempotency_scope")) > 0),
   "idempotency_key" TEXT NOT NULL CHECK (length(trim("idempotency_key")) > 0),
   "input_checksum" TEXT NOT NULL CHECK (length(trim("input_checksum")) > 0),
+  "input_json" TEXT NOT NULL CHECK (json_valid("input_json")),
   "plan_checksum" TEXT NOT NULL CHECK (length(trim("plan_checksum")) > 0),
   "plan_json" TEXT NOT NULL CHECK (json_valid("plan_json")),
   "capability_snapshot_checksum" TEXT NOT NULL,
+  "capability_snapshot_json" TEXT NOT NULL CHECK (json_valid("capability_snapshot_json")),
   "required_shards_json" TEXT NOT NULL CHECK (json_valid("required_shards_json")),
   "status" TEXT NOT NULL CHECK ("status" IN ('planned', 'running', 'paused', 'reconciling', 'failed', 'intervention_required', 'succeeded')),
   "created_at_ms" INTEGER NOT NULL CHECK ("created_at_ms" >= 0),
@@ -345,9 +347,11 @@ WHEN NEW."operation_id" IS NOT OLD."operation_id"
   OR NEW."idempotency_scope" IS NOT OLD."idempotency_scope"
   OR NEW."idempotency_key" IS NOT OLD."idempotency_key"
   OR NEW."input_checksum" IS NOT OLD."input_checksum"
+  OR NEW."input_json" IS NOT OLD."input_json"
   OR NEW."plan_checksum" IS NOT OLD."plan_checksum"
   OR NEW."plan_json" IS NOT OLD."plan_json"
   OR NEW."capability_snapshot_checksum" IS NOT OLD."capability_snapshot_checksum"
+  OR NEW."capability_snapshot_json" IS NOT OLD."capability_snapshot_json"
   OR NEW."required_shards_json" IS NOT OLD."required_shards_json"
   OR NEW."created_at_ms" IS NOT OLD."created_at_ms"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IMMUTABLE_OPERATION_PLAN'); END;`,

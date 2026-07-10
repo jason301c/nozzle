@@ -128,10 +128,11 @@ describe("control D1 schema", () => {
         .prepare(
           `INSERT INTO "nozzle_operations"
            ("operation_id", "environment_id", "operation_type", "idempotency_scope",
-            "idempotency_key", "input_checksum", "plan_checksum", "plan_json",
-            "capability_snapshot_checksum", "required_shards_json", "status", "created_at_ms", "updated_at_ms")
+            "idempotency_key", "input_checksum", "input_json", "plan_checksum", "plan_json",
+            "capability_snapshot_checksum", "capability_snapshot_json", "required_shards_json",
+            "status", "created_at_ms", "updated_at_ms")
            VALUES ('operation-a', 'production', 'migration', 'fleet-a', 'idempotency-a',
-             'input-a', 'plan-a', '{}', 'capability-a', '[]', 'planned', 1, 1)`,
+             'input-a', '{}', 'plan-a', '{}', 'capability-a', '{}', '[]', 'planned', 1, 1)`,
         )
         .run()
       database
@@ -196,6 +197,16 @@ describe("control D1 schema", () => {
           )
           .run(),
       ).toThrow("NOZZLE_CONTROL_IMMUTABLE_OPERATION_PLAN")
+      for (const column of ["input_json", "capability_snapshot_json"]) {
+        expect(() =>
+          database
+            .prepare(
+              `UPDATE "nozzle_operations" SET "${column}" = '{"rewritten":true}'
+               WHERE "operation_id" = 'operation-a'`,
+            )
+            .run(),
+        ).toThrow("NOZZLE_CONTROL_IMMUTABLE_OPERATION_PLAN")
+      }
       expect(() =>
         database
           .prepare(

@@ -30,11 +30,13 @@ describe("real workerd provider receipts", () => {
     const operations = new D1OperationStore(env.DB, digest)
     const leases = new D1LeaseStore(env.DB)
     const receipts = new D1ProviderAttemptStore(env.DB, digest)
+    const inputJson = JSON.stringify({ operation: "provider-test" })
+    const capabilitySnapshotJson = JSON.stringify({ provider: "cloudflare-d1" })
     const plan = await sealOperationPlan(
       {
-        capabilitySnapshotChecksum: "workerd-provider-capabilities",
+        capabilitySnapshotChecksum: await digest(new TextEncoder().encode(capabilitySnapshotJson)),
         idempotencyKey: "workerd-provider-operation-key",
-        inputChecksum: "workerd-provider-operation-input",
+        inputChecksum: await digest(new TextEncoder().encode(inputJson)),
         operationId: "workerd-provider-operation",
         operationType: "provider-test",
         steps: [
@@ -56,8 +58,10 @@ describe("real workerd provider receipts", () => {
     )
     await operations.create({
       actorChecksum: "workerd-provider-actor",
+      capabilitySnapshotJson,
       environmentId: "workerd-provider",
       idempotencyScope: "workerd-provider-scope",
+      inputJson,
       plan,
       requiredShardIds: [],
     })

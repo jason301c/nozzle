@@ -27,13 +27,17 @@ beforeAll(async () => {
 describe("real workerd operation ledger", () => {
   it("atomically creates concurrent operations with exact replay and a valid audit chain", async () => {
     const store = new D1OperationStore(env.DB, digest)
+    const capabilitySnapshotJson = JSON.stringify({ provider: "cloudflare-d1" })
+    const inputJson = (index: number) => JSON.stringify({ operation: `workerd-${index}` })
     const plans = await Promise.all(
-      Array.from({ length: 4 }, (_, index) =>
+      Array.from({ length: 4 }, async (_, index) =>
         sealOperationPlan(
           {
-            capabilitySnapshotChecksum: "capabilities-v1",
+            capabilitySnapshotChecksum: await digest(
+              new TextEncoder().encode(capabilitySnapshotJson),
+            ),
             idempotencyKey: `workerd-key-${index}`,
-            inputChecksum: `workerd-input-${index}`,
+            inputChecksum: await digest(new TextEncoder().encode(inputJson(index))),
             operationId: `workerd-operation-${index}`,
             operationType: "workerd-test",
             steps: [
@@ -56,11 +60,13 @@ describe("real workerd operation ledger", () => {
       ),
     )
     const created = await Promise.all(
-      plans.map((plan) =>
+      plans.map((plan, index) =>
         store.create({
           actorChecksum: "workerd-actor",
+          capabilitySnapshotJson,
           environmentId: "workerd",
           idempotencyScope: "fleet-workerd",
+          inputJson: inputJson(index),
           plan,
           requiredShardIds: ["shard-b", "shard-a"],
         }),
@@ -72,8 +78,10 @@ describe("real workerd operation ledger", () => {
     await expect(
       store.create({
         actorChecksum: "workerd-actor",
+        capabilitySnapshotJson,
         environmentId: "workerd",
         idempotencyScope: "fleet-workerd",
+        inputJson: inputJson(0),
         plan: firstPlan,
         requiredShardIds: ["shard-a", "shard-b"],
       }),
