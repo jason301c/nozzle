@@ -15,9 +15,7 @@ export interface D1PreparedStatementLike {
 }
 
 export interface D1DatabaseLike {
-  batch<T = Record<string, unknown>>(
-    statements: readonly D1PreparedStatementLike[],
-  ): Promise<readonly D1ResultLike<T>[]>
+  batch(statements: readonly D1PreparedStatementLike[]): Promise<readonly D1ResultLike[]>
   prepare(sql: string): D1PreparedStatementLike
 }
 
@@ -80,6 +78,14 @@ export async function executeDirect<T = Record<string, unknown>>(
   database: D1DatabaseLike,
   plan: ExecutionPlan,
 ): Promise<D1ResultLike | readonly T[]> {
+  const data = await executeDirectRaw(database, plan)
+  return plan.operation === "select" ? decodeD1Result<T>(plan, data) : decodeD1Result(plan, data)
+}
+
+export async function executeDirectRaw(
+  database: D1DatabaseLike,
+  plan: ExecutionPlan,
+): Promise<D1ResultLike> {
   const compiled = compilePlan(plan)
   const statements = [compiled.authorization, compiled.data].map((statement) =>
     database.prepare(statement.sql).bind(...statement.params),
@@ -95,5 +101,5 @@ export async function executeDirect<T = Record<string, unknown>>(
   if (!data) {
     throw new NozzleError("ShardUnavailableError", "D1 returned an incomplete batch result.")
   }
-  return plan.operation === "select" ? decodeD1Result<T>(plan, data) : decodeD1Result(plan, data)
+  return data
 }

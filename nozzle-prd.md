@@ -323,6 +323,8 @@ Router mode requires a real Nozzle Drizzle transport. The safe path MUST carry a
 
 Execution-plan wire format version 1 represents null, boolean, finite supported numbers, and strings as their native JSON types. A BLOB is the frozen tagged object `{ "type": "blob", "hex": "<lowercase-even-length-hex>" }`; no other object is a bound value. Every plan carries the exact 64-character lowercase full partition digest used for its route and fence lookup. Builder-created in-process plans and validated decoded wire plans are separately authenticity-marked and bound to the validated schema registry before compilation, so a structurally similar caller object cannot bypass schema, scope, value, or limit validation. The compiler restores BLOBs to `Uint8Array` D1 bindings. Any change to these representations requires a new execution-plan version and direct/router equivalence tests.
 
+Router result wire format version 1 carries raw D1 rows so the caller's independently compiled schema registry performs the same Drizzle result decoding as direct mode. Native D1 BLOB results, including the byte-array form returned by workerd, are normalized to the same lowercase tagged-hex representation; other object values are rejected. A single response is capped at 16 MiB of decoded value data, 10,000 rows, 256 columns per row, and 2 MiB per string or BLOB. An atomic router batch is capped at 49 data plans so one independent authorization statement plus the data statements remain bounded. These caps intentionally remain below the current 32 MiB Workers RPC serialization limit and may change only through section 29.7.
+
 ### 8.8 Control-database schema
 
 The control database MUST include versioned equivalents of:
@@ -542,7 +544,7 @@ type NozzleSessionToken = {
 }
 ```
 
-Tokens MUST be integrity-protected, versioned, bounded in size, and safe to reject.
+Tokens MUST be integrity-protected, versioned, bounded in size, and safe to reject. Version 1 uses the `nz1` envelope, deterministic JSON fields, HMAC-SHA-256 with a non-extractable key or at least 32 bytes of key material, an 8 KiB total token cap, 255-byte fleet and shard identifiers, and a 4 KiB bookmark cap. Token contents are opaque protocol state, not an encryption or confidentiality boundary.
 
 If a bucket moves after a token is issued, Nozzle MUST detect the old shard and epoch, establish an appropriately fresh destination session, and return a replacement token. A source bookmark MUST NOT be passed blindly to a different D1 database.
 
@@ -2099,6 +2101,7 @@ This PRD is based on current public documentation and MUST be revalidated during
 - [Cloudflare API rate limits](https://developers.cloudflare.com/fundamentals/api/reference/limits/)
 - [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
 - [Cloudflare Service bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/)
+- [Cloudflare Workers RPC](https://developers.cloudflare.com/workers/runtime-apis/rpc/)
 - [Cloudflare Workflows limits](https://developers.cloudflare.com/workflows/reference/limits/)
 - [Cloudflare Queues delivery guarantees](https://developers.cloudflare.com/queues/reference/delivery-guarantees/)
 - [Cloudflare Workers testing](https://developers.cloudflare.com/workers/testing/vitest-integration/)

@@ -149,20 +149,49 @@ export class DeleteQuery<TTable extends AnySQLiteTable> extends Query<D1ResultLi
 export interface ScopedDatabaseOptions<TPartitionKey extends string> {
   readonly partitionKey: TPartitionKey
   readonly registry: SchemaRegistry
-  readonly resolveDatabase: (shardId: string) => D1DatabaseLike
   readonly resolveRoute: () => Promise<ScopedRoute>
   readonly schemaId: string
 }
 
+export interface ScopedPlanTransport {
+  batch(plans: readonly ExecutionPlan[]): Promise<readonly D1ResultLike[]>
+  execute(plan: ExecutionPlan): Promise<D1ResultLike>
+}
+
+export type ScopedDatabaseConnectionOptions<TPartitionKey extends string> =
+  ScopedDatabaseOptions<TPartitionKey> &
+    (
+      | {
+          readonly resolveDatabase: (shardId: string) => D1DatabaseLike
+          readonly transport?: never
+        }
+      | {
+          readonly resolveDatabase?: never
+          readonly transport: ScopedPlanTransport
+        }
+    )
+
 export class ScopedDatabase<TPartitionKey extends string> {
-  readonly #options: ScopedDatabaseOptions<TPartitionKey>
+  readonly #options: ScopedDatabaseConnectionOptions<TPartitionKey>
   #route: Promise<ScopedRoute> | undefined
 
-  constructor(options: ScopedDatabaseOptions<TPartitionKey>) {
+  constructor(options: ScopedDatabaseConnectionOptions<TPartitionKey>) {
     if (options.partitionKey !== options.registry.partitionKey) {
       throw new NozzleError(
         "ConfigurationError",
         "The scoped database partition key does not match its schema registry.",
+      )
+    }
+    const direct = typeof options.resolveDatabase === "function"
+    const routed =
+      typeof options.transport === "object" &&
+      options.transport !== null &&
+      typeof options.transport.execute === "function" &&
+      typeof options.transport.batch === "function"
+    if (direct === routed) {
+      throw new NozzleError(
+        "ConfigurationError",
+        "A scoped database requires exactly one direct database resolver or routed transport.",
       )
     }
     this.#options = options
@@ -174,10 +203,14 @@ export class ScopedDatabase<TPartitionKey extends string> {
   }
 
   async #executeSelect<TResult>(plan: SelectPlan): Promise<readonly TResult[]> {
+    if (this.#options.transport) {
+      return decodeD1Result<TResult>(plan, await this.#options.transport.execute(plan))
+    }
     return executeDirect<TResult>(this.#options.resolveDatabase(plan.shardId), plan)
   }
 
   async #executeMutation(plan: MutationPlan): Promise<D1ResultLike> {
+    if (this.#options.transport) return this.#options.transport.execute(plan)
     return executeDirect(this.#options.resolveDatabase(plan.shardId), plan)
   }
 
@@ -297,27 +330,39 @@ export class ScopedDatabase<TPartitionKey extends string> {
       )
     }
 
-    const compiled = plans.map(compilePlan)
-    const database = this.#options.resolveDatabase(first.shardId)
-    const statements = [compiled[0]?.authorization, ...compiled.map((entry) => entry.data)]
-      .filter((statement) => statement !== undefined)
-      .map((statement) => database.prepare(statement.sql).bind(...statement.params))
-    const results = await database.batch(statements)
-    const authorization = results[0]
-    if (authorization?.results.length !== 1) {
-      throw new NozzleError("StaleRouteRejectedError", "Shard ownership rejected the batch route.")
-    }
-    if (results.length !== plans.length + 1) {
-      throw new NozzleError("ShardUnavailableError", "D1 returned an incomplete batch result.")
+    let dataResults: readonly D1ResultLike[]
+    if (this.#options.transport) {
+      dataResults = await this.#options.transport.batch(plans)
+      if (dataResults.length !== plans.length) {
+        throw new NozzleError("ShardUnavailableError", "The router returned an incomplete batch.")
+      }
+    } else {
+      const compiled = plans.map(compilePlan)
+      const database = this.#options.resolveDatabase(first.shardId)
+      const statements = [compiled[0]?.authorization, ...compiled.map((entry) => entry.data)]
+        .filter((statement) => statement !== undefined)
+        .map((statement) => database.prepare(statement.sql).bind(...statement.params))
+      const results = await database.batch(statements)
+      const authorization = results[0]
+      if (authorization?.results.length !== 1) {
+        throw new NozzleError(
+          "StaleRouteRejectedError",
+          "Shard ownership rejected the batch route.",
+        )
+      }
+      if (results.length !== plans.length + 1) {
+        throw new NozzleError("ShardUnavailableError", "D1 returned an incomplete batch result.")
+      }
+      dataResults = results.slice(1)
     }
     return plans.map((plan, index) =>
-      decodeD1Result(plan, results[index + 1] as D1ResultLike),
+      decodeD1Result(plan, dataResults[index] as D1ResultLike),
     ) as ScopedBatchResult<TQueries>
   }
 }
 
 export function createScopedDatabase<TPartitionKey extends string>(
-  options: ScopedDatabaseOptions<TPartitionKey>,
+  options: ScopedDatabaseConnectionOptions<TPartitionKey>,
 ): ScopedDatabase<TPartitionKey> {
   return new ScopedDatabase(options)
 }

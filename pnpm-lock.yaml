@@ -69,6 +69,22 @@ importers:
         specifier: 'catalog:'
         version: 0.45.2(@cloudflare/workers-types@5.20260710.1)
 
+  packages/router:
+    dependencies:
+      '@nozzle/core':
+        specifier: workspace:*
+        version: link:../core
+      '@nozzle/drizzle':
+        specifier: workspace:*
+        version: link:../drizzle
+    devDependencies:
+      '@nozzle/cloudflare':
+        specifier: workspace:*
+        version: link:../cloudflare
+      drizzle-orm:
+        specifier: 'catalog:'
+        version: 0.45.2(@cloudflare/workers-types@5.20260710.1)
+
 packages:
 
   '@babel/helper-string-parser@7.29.7':

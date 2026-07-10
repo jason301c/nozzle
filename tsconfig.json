@@ -3,6 +3,7 @@
   "references": [
     { "path": "./packages/core" },
     { "path": "./packages/drizzle" },
-    { "path": "./packages/cloudflare" }
+    { "path": "./packages/cloudflare" },
+    { "path": "./packages/router" }
   ]
 }

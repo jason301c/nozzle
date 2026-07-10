@@ -7,6 +7,7 @@ export const NOZZLE_ERROR_CODES = [
   "ShardUnavailableError",
   "RouteVersionConflictError",
   "StaleRouteRejectedError",
+  "SessionTokenInvalidError",
   "SchemaDriftError",
   "CapacityGuardError",
   "JurisdictionViolationError",
@@ -120,6 +121,11 @@ const ERROR_DEFINITIONS: Readonly<Record<NozzleErrorCode, ErrorDefinition>> = {
   StaleRouteRejectedError: {
     family: "route",
     remediation: "Refresh the route manifest and safely retry the pre-mutation rejection.",
+    retryable: true,
+  },
+  SessionTokenInvalidError: {
+    family: "route",
+    remediation: "Discard the token, resolve the current route, and establish a new session.",
     retryable: true,
   },
   TenantScopeRequiredError: {

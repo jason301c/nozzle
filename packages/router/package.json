@@ -1,0 +1,26 @@
+{
+  "name": "@nozzle/router",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Versioned safe Worker RPC transport and route-aware sessions for Nozzle",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@nozzle/core": "workspace:*",
+    "@nozzle/drizzle": "workspace:*"
+  },
+  "devDependencies": {
+    "@nozzle/cloudflare": "workspace:*",
+    "drizzle-orm": "catalog:"
+  }
+}
