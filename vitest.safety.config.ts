@@ -11,6 +11,7 @@ export default defineConfig({
         "packages/control/src/migration-store.ts",
         "packages/core/src/hash.ts",
         "packages/core/src/migration.ts",
+        "packages/core/src/movement.ts",
         "packages/core/src/operation.ts",
         "packages/core/src/ownership.ts",
         "packages/core/src/routes.ts",
