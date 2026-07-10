@@ -365,6 +365,20 @@ describe("control D1 schema", () => {
       expect(() =>
         database.prepare(`UPDATE "nozzle_sagas" SET "status" = 'running'`).run(),
       ).toThrow("NOZZLE_CONTROL_SAGA_EFFECT_REQUIRED")
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO "nozzle_saga_action_attempts"
+             ("attempt_id", "saga_id", "operation_id", "operation_step_id", "saga_step_id",
+              "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
+              "acceptance_checksum", "lease_key", "holder_id", "acquisition_id", "fencing_token",
+              "accepted_at_ms")
+             VALUES ('attempt-a', 'saga-a', 'operation-saga', 'saga:a:forward', 'a', 'forward',
+               'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'acceptance',
+               'saga:lease', 'controller', 'acquisition', 1, 1)`,
+          )
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_SAGA_ATTEMPT_FENCED")
       database
         .prepare(
           `INSERT INTO "nozzle_operation_transitions"
@@ -406,10 +420,11 @@ describe("control D1 schema", () => {
           `INSERT INTO "nozzle_saga_action_attempts"
            ("attempt_id", "saga_id", "operation_id", "operation_step_id", "saga_step_id",
             "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
-            "lease_key", "holder_id", "acquisition_id", "fencing_token", "accepted_at_ms")
+            "acceptance_checksum", "lease_key", "holder_id", "acquisition_id", "fencing_token",
+            "accepted_at_ms")
            VALUES ('attempt-a', 'saga-a', 'operation-saga', 'saga:a:forward', 'a', 'forward',
-             'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'saga:lease',
-             'controller', 'acquisition', 1, 2)`,
+             'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'acceptance',
+             'saga:lease', 'controller', 'acquisition', 1, 2)`,
         )
         .run()
       database
@@ -532,10 +547,11 @@ describe("control D1 schema", () => {
             `INSERT INTO "nozzle_saga_action_attempts"
              ("attempt_id", "saga_id", "operation_id", "operation_step_id", "saga_step_id",
               "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
-              "lease_key", "holder_id", "acquisition_id", "fencing_token", "accepted_at_ms")
+              "acceptance_checksum", "lease_key", "holder_id", "acquisition_id", "fencing_token",
+              "accepted_at_ms")
              VALUES ('fenced', 'saga-a', 'operation-saga', 'saga:a:forward', 'a', 'forward',
-               'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'saga:lease',
-               'controller', 'acquisition', 2, 1)`,
+               'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'acceptance',
+               'saga:lease', 'controller', 'acquisition', 2, 1)`,
           )
           .run(),
       ).toThrow("NOZZLE_CONTROL_SAGA_ATTEMPT_FENCED")

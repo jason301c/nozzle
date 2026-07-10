@@ -8,6 +8,7 @@ import {
 import { beforeAll, describe, expect, it } from "vitest"
 import { D1LeaseStore } from "../src/lease-store.js"
 import { D1OperationStore, operationTransitionIdentity } from "../src/operation-store.js"
+import { D1SagaAttemptStore, sagaActionInputChecksum } from "../src/saga-attempt-store.js"
 import {
   D1SagaStore,
   SAGA_INIT_OPERATION_STEP_ID,
@@ -43,6 +44,7 @@ describe("real workerd D1 saga projection", () => {
     const writeOperationStepId = sagaActionOperationStepId("write", "forward")
     const capabilitySnapshotJson = JSON.stringify({ runtime: "workerd-saga-v1" })
     const inputJson = JSON.stringify({ sagaId })
+    const writeInputJson = '{"partition":"tenant-a","value":7}'
     const plan = await sealOperationPlan(
       {
         capabilitySnapshotChecksum: await digest(new TextEncoder().encode(capabilitySnapshotJson)),
@@ -69,6 +71,7 @@ describe("real workerd D1 saga projection", () => {
     const operations = new D1OperationStore(env.DB, digest)
     const leases = new D1LeaseStore(env.DB)
     const sagas = new D1SagaStore(env.DB, digest)
+    const attempts = new D1SagaAttemptStore(env.DB, digest)
     await operations.create({
       actorChecksum: "workerd-saga-actor",
       capabilitySnapshotJson,
@@ -172,7 +175,7 @@ describe("real workerd D1 saga projection", () => {
       inputChecksum: "workerd-saga:input",
       sagaId,
       serverTimeMs: 1_000,
-      stepInputChecksums: { write: "workerd-saga:write:input" },
+      stepInputChecksums: { write: await sagaActionInputChecksum(writeInputJson, digest) },
     })
 
     const writeAttempt = "workerd-saga:write:attempt"
@@ -197,13 +200,30 @@ describe("real workerd D1 saga projection", () => {
         stepId: "write",
       })
     ).saga
+    const accepted = await attempts.accept({
+      attemptId: writeAttempt,
+      inputJson: writeInputJson,
+      phase: "forward",
+      proof,
+      purpose: "effect",
+      sagaId,
+      sagaStepId: "write",
+    })
+    const outcome = await attempts.complete({
+      attemptId: writeAttempt,
+      evidenceJson: '{"source":"workerd"}',
+      outputJson: '{"written":true}',
+      proof,
+      state: "confirmed",
+    })
+    if (outcome.state !== "confirmed") throw new Error("Expected confirmed saga action receipt.")
     await operations.completeStep({
       actorChecksum: "workerd-saga-actor",
       attemptId: writeAttempt,
       observedPostconditionChecksum: `workerd-saga:${writeOperationStepId}:postcondition`,
       operationId,
       proof,
-      resultChecksum: "workerd-saga:write:result",
+      resultChecksum: outcome.outcomeChecksum,
       stepId: writeOperationStepId,
     })
     saga = await sagas.recordActionSuccess({
@@ -213,9 +233,9 @@ describe("real workerd D1 saga projection", () => {
         writeOperationStepId,
         operationTransitionIdentity("succeeded", [operationId, writeOperationStepId, writeAttempt]),
       ),
-      evidenceChecksum: "workerd-saga:write:outcome",
+      evidenceChecksum: outcome.outcomeChecksum,
       phase: "forward",
-      resultChecksum: "workerd-saga:write:result",
+      resultChecksum: outcome.outputChecksum,
       sagaId,
       serverTimeMs: 1_002,
       stepId: "write",
@@ -227,10 +247,14 @@ describe("real workerd D1 saga projection", () => {
       `SELECT
          (SELECT count(*) FROM "nozzle_sagas" WHERE "saga_id" = ?1) AS "sagas",
          (SELECT count(*) FROM "nozzle_operation_effects"
-          WHERE "resource_kind" = 'saga' AND "resource_id" = ?1) AS "effects"`,
+          WHERE "resource_kind" = 'saga' AND "resource_id" = ?1) AS "effects",
+         (SELECT count(*) FROM "nozzle_saga_action_attempts"
+          WHERE "saga_id" = ?1) AS "attempts",
+         (SELECT count(*) FROM "nozzle_saga_action_attempt_outcomes") AS "outcomes"`,
     )
       .bind(sagaId)
-      .first<{ effects: number; sagas: number }>()
-    expect(counts).toEqual({ effects: 3, sagas: 1 })
+      .first<{ attempts: number; effects: number; outcomes: number; sagas: number }>()
+    expect(accepted.state).toBe("accepted")
+    expect(counts).toEqual({ attempts: 1, effects: 3, outcomes: 1, sagas: 1 })
   })
 })

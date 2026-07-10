@@ -942,6 +942,8 @@ Every D1 saga action writes its shard-local idempotency and result receipt atomi
 
 Each saga projection version and its operation-effect receipt commit in one Control D1 batch and reference one exact immutable operation-transition ID under the active fence. Canonical operation step IDs are `saga:init`, `saga:termination`, and `saga:<phase>:<descriptor-step-id>`. The projection store rejects a transition whose step, state, or attempt identity does not match the requested saga transition. Action receipt acceptance additionally requires both the matching canonical operation-step state and the matching saga action state, so an operation transition alone cannot authorize dispatch. Saga action operation steps are declared independently in the generic plan because a failed forward must not make compensation ineligible through ordinary success-only dependency edges; the sealed serial saga state machine remains the eligibility oracle.
 
+Control-plane saga attempt receipts are append-only dispatch and observation evidence; they do not replace the shard-local receipt that a D1 application mutation commits atomically with its data change. Attempt inputs, evidence, outputs, and errors are canonical JSON capped at one MiB, with domain-separated payload, acceptance, and outcome checksums. The acceptance receipt binds the exact descriptor action key, saga and operation identity, phase, purpose, idempotency key, payload, and lease fence. An accepted attempt without a terminal outcome remains accepted evidence of possible dispatch and is recovered as unknown; absence of an acceptance receipt is the only Control-plane proof that dispatch did not occur.
+
 ## 18. Backup, restore, and deletion
 
 ### 18.1 Recovery objectives
@@ -2096,6 +2098,7 @@ No distributed system is literally failure-proof. For Nozzle, bulletproof means:
 56. Fan-out execution preflights every sealed budget, uses bounded per-shard buffer shares, cancels unnecessary work, ignores late responses, and treats actual usage drift above budget as failure.
 57. Fan-out reducers run in canonical shard order; exact integer aggregation and deterministic compensated floating aggregation are distinct public contracts.
 58. Every saga projection is an exactly fenced materialization of a named canonical operation transition; action dispatch requires agreement between the operation step and saga projection, and serial or reverse-compensation eligibility comes only from the sealed saga state machine.
+59. Saga action inputs and outcomes use append-only, domain-separated Control receipts; those receipts prove dispatch history but never substitute for the shard-local atomic mutation receipt required of D1 action adapters.
 
 ### 29.4 Mechanisms intentionally rejected
 
