@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest"
 import type { DigestFunction } from "../src/operation.js"
 import { loadSagaDescriptor, sealSagaDescriptor } from "../src/saga.js"
+import {
+  beginSagaAction,
+  createSagaRecord,
+  nextSagaCommand,
+  recordSagaActionSuccess,
+  sagaCommitment,
+} from "../src/saga-state.js"
 
 const digest: DigestFunction = async (input) => {
   const owned = new Uint8Array(input.byteLength)
@@ -44,5 +51,33 @@ describe("saga descriptors in workerd", () => {
     await expect(loadSagaDescriptor(structuredClone(descriptor), digest)).resolves.toEqual(
       descriptor,
     )
+
+    let saga = createSagaRecord({
+      deadlineAtMs: 10_000,
+      descriptor,
+      idempotencyKey: "request-1",
+      inputChecksum: "input",
+      sagaId: "saga-1",
+      serverTimeMs: 1_000,
+      stepInputChecksums: { reserve: "reserve-input" },
+    })
+    const command = nextSagaCommand(saga, 1_000)
+    if (command.kind !== "execute") throw new Error("expected execute command")
+    const decision = beginSagaAction(saga, {
+      attemptId: "attempt-1",
+      idempotencyKey: command.idempotencyKey,
+      phase: "forward",
+      serverTimeMs: 1_000,
+      stepId: "reserve",
+    })
+    saga = recordSagaActionSuccess(decision.saga, {
+      attemptId: "attempt-1",
+      phase: "forward",
+      resultChecksum: "result",
+      serverTimeMs: 1_001,
+      stepId: "reserve",
+    })
+    expect(saga.status).toBe("succeeded")
+    expect(sagaCommitment(saga)).toBe("complete")
   })
 })

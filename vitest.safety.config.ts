@@ -29,6 +29,7 @@ export default defineConfig({
         "packages/core/src/resource.ts",
         "packages/core/src/routes.ts",
         "packages/core/src/saga.ts",
+        "packages/core/src/saga-state.ts",
         "packages/drizzle/src/plan.ts",
         "packages/router/src/leaf.ts",
         "packages/router/src/fanout.ts",
