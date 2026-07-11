@@ -3402,7 +3402,7 @@ describe("D1SagaCoordinatorStore", () => {
                 WHERE "transition_id" = ?1
               )) AS "audits"`,
         )
-        .get(transitionId),
+        .get({ "?1": transitionId }),
     ).toEqual({ audits: 1, effects: 1, transitions: 1 })
   })
 
