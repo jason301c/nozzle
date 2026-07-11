@@ -2,12 +2,17 @@ import { env } from "cloudflare:workers"
 import {
   type DigestFunction,
   leaseProof,
+  sealIrreversibleAuthorization,
   sealOperationPlan,
   sealSagaDescriptor,
 } from "@nozzle/core"
 import { beforeAll, describe, expect, it } from "vitest"
 import { D1LeaseStore } from "../src/lease-store.js"
-import { D1OperationStore, operationTransitionIdentity } from "../src/operation-store.js"
+import {
+  D1OperationStore,
+  operationStepRecordJson,
+  operationTransitionIdentity,
+} from "../src/operation-store.js"
 import { D1SagaAttemptStore, sagaActionInputChecksum } from "../src/saga-attempt-store.js"
 import { D1SagaCoordinatorStore } from "../src/saga-coordinator-store.js"
 import { invokeSagaEffectHandler } from "../src/saga-handler.js"
@@ -21,13 +26,18 @@ import {
   type SagaEffectContext,
   sagaActionOperationStepId,
 } from "../src/saga-store.js"
-import { CONTROL_SCHEMA_STATEMENTS, CONTROL_SCHEMA_VERSION_ONE_STATEMENTS } from "../src/schema.js"
+import {
+  CONTROL_SCHEMA_STATEMENTS,
+  CONTROL_SCHEMA_VERSION_ONE_STATEMENTS,
+  CONTROL_SCHEMA_VERSION_TWO_STATEMENTS,
+} from "../src/schema.js"
 
 declare global {
   namespace Cloudflare {
     interface Env {
       DB: D1Database
       UPGRADE_DB: D1Database
+      V1_UPGRADE_DB: D1Database
     }
   }
 }
@@ -46,12 +56,12 @@ beforeAll(async () => {
 describe("real workerd D1 saga projection", () => {
   it("upgrades and reruns the complete historical version-one schema artifact", async () => {
     for (const statement of CONTROL_SCHEMA_VERSION_ONE_STATEMENTS) {
-      await env.UPGRADE_DB.prepare(statement).run()
+      await env.V1_UPGRADE_DB.prepare(statement).run()
     }
-    const beforeIdentity = await env.UPGRADE_DB.prepare(
+    const beforeIdentity = await env.V1_UPGRADE_DB.prepare(
       `SELECT "schema_version", "installed_at_ms" FROM "nozzle_control_meta"`,
     ).first()
-    const legacyGuards = await env.UPGRADE_DB.prepare(
+    const legacyGuards = await env.V1_UPGRADE_DB.prepare(
       `SELECT "name" FROM "sqlite_schema"
        WHERE "type" = 'trigger'
          AND "name" IN ('nozzle_control_saga_attempt_insert',
@@ -61,6 +71,59 @@ describe("real workerd D1 saga projection", () => {
     expect(legacyGuards.results).toEqual([
       { name: "nozzle_control_saga_attempt_insert" },
       { name: "nozzle_control_saga_outcome_insert" },
+    ])
+    for (const statement of CONTROL_SCHEMA_STATEMENTS) {
+      await env.V1_UPGRADE_DB.prepare(statement).run()
+    }
+    for (const statement of CONTROL_SCHEMA_STATEMENTS) {
+      await env.V1_UPGRADE_DB.prepare(statement).run()
+    }
+
+    const identity = await env.V1_UPGRADE_DB.prepare(
+      `SELECT "schema_version", "installed_at_ms" FROM "nozzle_control_meta"`,
+    ).first()
+    const versions = await env.V1_UPGRADE_DB.prepare(
+      `SELECT "schema_version" FROM "nozzle_control_schema_versions"
+       ORDER BY "schema_version"`,
+    ).all()
+    const replacementGuards = await env.V1_UPGRADE_DB.prepare(
+      `SELECT "name" FROM "sqlite_schema"
+       WHERE "type" = 'trigger'
+         AND "name" IN ('nozzle_control_saga_attempt_insert',
+                        'nozzle_control_saga_attempt_insert_v2',
+                        'nozzle_control_saga_outcome_insert',
+                        'nozzle_control_saga_outcome_insert_v2')
+       ORDER BY "name"`,
+    ).all()
+    expect(identity).toEqual(beforeIdentity)
+    expect(versions.results).toEqual([
+      { schema_version: 1 },
+      { schema_version: 2 },
+      { schema_version: 3 },
+    ])
+    expect(replacementGuards.results).toEqual([
+      { name: "nozzle_control_saga_attempt_insert_v2" },
+      { name: "nozzle_control_saga_outcome_insert_v2" },
+    ])
+  })
+
+  it("upgrades and reruns the complete historical version-two schema artifact", async () => {
+    for (const statement of CONTROL_SCHEMA_VERSION_TWO_STATEMENTS) {
+      await env.UPGRADE_DB.prepare(statement).run()
+    }
+    const beforeIdentity = await env.UPGRADE_DB.prepare(
+      `SELECT "schema_version", "installed_at_ms" FROM "nozzle_control_meta"`,
+    ).first()
+    const versionTwoGuards = await env.UPGRADE_DB.prepare(
+      `SELECT "name" FROM "sqlite_schema"
+       WHERE "type" = 'trigger'
+         AND "name" IN ('nozzle_control_saga_attempt_insert_v2',
+                        'nozzle_control_saga_outcome_insert_v2')
+       ORDER BY "name"`,
+    ).all()
+    expect(versionTwoGuards.results).toEqual([
+      { name: "nozzle_control_saga_attempt_insert_v2" },
+      { name: "nozzle_control_saga_outcome_insert_v2" },
     ])
     for (const statement of CONTROL_SCHEMA_STATEMENTS) {
       await env.UPGRADE_DB.prepare(statement).run()
@@ -87,12 +150,38 @@ describe("real workerd D1 saga projection", () => {
                         'nozzle_control_saga_protocol_binding_insert_v2',
                         'nozzle_control_saga_protocol_action_insert_v2',
                         'nozzle_control_saga_protocol_observation_insert_v2',
-                        'nozzle_control_saga_protocol_compensation_insert_v2')
+                        'nozzle_control_saga_protocol_compensation_insert_v2',
+                        'nozzle_control_irreversible_authorization_body_unpublished_v3',
+                        'nozzle_control_irreversible_authorization_body_shape_v3',
+                        'nozzle_control_irreversible_authorization_body_plan_v3',
+                        'nozzle_control_irreversible_authorization_body_fence_v3',
+                        'nozzle_control_irreversible_authorization_dispatch_v3',
+                        'nozzle_control_irreversible_authorization_retry_v3',
+                        'nozzle_control_irreversible_authorization_preserve_v3',
+                        'nozzle_control_irreversible_authorization_receipt_insert_v3',
+                        'nozzle_control_irreversible_authorization_receipt_classify_v3',
+                        'nozzle_control_irreversible_saga_attempt_v3',
+                        'nozzle_control_irreversible_provider_attempt_v3')
        ORDER BY "name"`,
     ).all()
     expect(identity).toEqual(beforeIdentity)
-    expect(versions.results).toEqual([{ schema_version: 1 }, { schema_version: 2 }])
+    expect(versions.results).toEqual([
+      { schema_version: 1 },
+      { schema_version: 2 },
+      { schema_version: 3 },
+    ])
     expect(replacementGuards.results).toEqual([
+      { name: "nozzle_control_irreversible_authorization_body_fence_v3" },
+      { name: "nozzle_control_irreversible_authorization_body_plan_v3" },
+      { name: "nozzle_control_irreversible_authorization_body_shape_v3" },
+      { name: "nozzle_control_irreversible_authorization_body_unpublished_v3" },
+      { name: "nozzle_control_irreversible_authorization_dispatch_v3" },
+      { name: "nozzle_control_irreversible_authorization_preserve_v3" },
+      { name: "nozzle_control_irreversible_authorization_receipt_classify_v3" },
+      { name: "nozzle_control_irreversible_authorization_receipt_insert_v3" },
+      { name: "nozzle_control_irreversible_authorization_retry_v3" },
+      { name: "nozzle_control_irreversible_provider_attempt_v3" },
+      { name: "nozzle_control_irreversible_saga_attempt_v3" },
       { name: "nozzle_control_saga_attempt_insert_v2" },
       { name: "nozzle_control_saga_outcome_insert_v2" },
       { name: "nozzle_control_saga_protocol_action_insert_v2" },
@@ -213,6 +302,238 @@ describe("real workerd D1 saga projection", () => {
         timeoutMs: 1_000,
       }),
     ).resolves.toEqual({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" })
+  })
+
+  it("begins an authorized irreversible saga action with the real trigger receipt", async () => {
+    const operationId = "workerd-irreversible-saga-operation"
+    const sagaId = "workerd-irreversible-saga"
+    const sagaStepId = "commit"
+    const operationStepId = sagaActionOperationStepId(sagaStepId, "forward")
+    const attemptId = `${sagaId}:${sagaStepId}:forward:1`
+    const leaseKey = `saga:${sagaId}`
+    const actorChecksum = "workerd-irreversible-saga-actor"
+    const forwardAction = {
+      actionId: "workerd.irreversible-saga.commit",
+      artifactChecksum: "8".repeat(64),
+      version: 1,
+    }
+    const forwardObservation = {
+      actionId: "workerd.irreversible-saga.observe-commit",
+      artifactChecksum: "9".repeat(64),
+      version: 1,
+    }
+    const registry = await sealSagaHandlerRegistry(
+      [
+        {
+          handler: () => ({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" }),
+          kind: "effect",
+          reference: forwardAction,
+        },
+        {
+          handler: () => ({ evidenceJson: "{}", outputJson: "{}", state: "applied" }),
+          kind: "observation",
+          reference: forwardObservation,
+        },
+      ],
+      digest,
+    )
+    const descriptor = await sealSagaDescriptor(
+      {
+        descriptorId: "workerd-irreversible-saga",
+        steps: [
+          {
+            authorizationPolicyChecksum: "a".repeat(64),
+            baseRetryDelayMs: 10,
+            compensationAction: null,
+            compensationObservation: null,
+            forwardAction,
+            forwardObservation,
+            inputSchemaChecksum: "b".repeat(64),
+            irreversible: true,
+            maxAttempts: 3,
+            maxRetryDelayMs: 100,
+            outputSchemaChecksum: "c".repeat(64),
+            stepId: sagaStepId,
+            timeoutMs: 1_000,
+          },
+        ],
+        version: 1,
+      },
+      digest,
+    )
+    const invocation = await sealSagaInvocationInput(
+      {
+        descriptor,
+        inputJson: '{"request":"commit"}',
+        sagaId,
+        stepInputJsons: { [sagaStepId]: '{"resource":"workerd"}' },
+      },
+      digest,
+    )
+    const capabilitySnapshotJson = '{"runtime":"workerd-irreversible-saga-v1"}'
+    const plan = await sealSagaOperationPlan(
+      {
+        capabilitySnapshotChecksum: await digest(new TextEncoder().encode(capabilitySnapshotJson)),
+        descriptor,
+        inputChecksum: invocation.inputChecksum,
+        leaseKey,
+        operationId,
+        operationIdempotencyKey: "workerd-irreversible-saga-operation-key",
+        registry,
+        sagaId,
+        stepInputChecksums: invocation.stepInputChecksums,
+      },
+      digest,
+    )
+    const operations = new D1OperationStore(env.DB, digest)
+    const leases = new D1LeaseStore(env.DB)
+    const attempts = new D1SagaAttemptStore(env.DB, digest)
+    const coordinator = new D1SagaCoordinatorStore(env.DB, digest)
+    await operations.create({
+      actorChecksum,
+      capabilitySnapshotJson,
+      environmentId: "workerd-irreversible-saga",
+      idempotencyScope: "workerd-irreversible-saga",
+      inputJson: invocation.operationInputJson,
+      plan,
+      requiredShardIds: ["workerd-irreversible-saga-shard"],
+    })
+    const acquired = await leases.acquire({
+      acquisitionId: "workerd-irreversible-saga-acquisition",
+      holderId: "workerd-irreversible-saga-controller",
+      leaseKey,
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Irreversible saga lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+    const initPlan = plan.steps.find((step) => step.stepId === SAGA_INIT_OPERATION_STEP_ID)
+    if (initPlan === undefined) throw new Error("Irreversible saga init plan is missing.")
+    const initAttemptId = `${sagaId}:init:1`
+    await operations.beginStep({
+      actorChecksum,
+      attemptId: initAttemptId,
+      idempotencyKey: initPlan.idempotencyKey,
+      observedPreconditionChecksum: initPlan.preconditionChecksum,
+      operationId,
+      proof,
+      stepId: initPlan.stepId,
+    })
+    await coordinator.initializeSaga({
+      actorChecksum,
+      attemptId: initAttemptId,
+      deadlineAtMs: 8_000_000_000_000_000,
+      descriptor,
+      evidenceChecksum: "workerd-irreversible-saga-init-evidence",
+      idempotencyKey: "workerd-irreversible-saga-key",
+      inputChecksum: invocation.inputChecksum,
+      observedPostconditionChecksum: initPlan.postconditionChecksum,
+      operationId,
+      proof,
+      resultChecksum: "workerd-irreversible-saga-init-result",
+      sagaId,
+      stepInputChecksums: invocation.stepInputChecksums,
+    })
+    const authorized = await leases.authorizeAt(proof)
+    const authorization = await sealIrreversibleAuthorization(
+      plan,
+      {
+        actorChecksum,
+        authorizationId: "workerd-irreversible-saga-authorization",
+        decisionChecksum: "workerd-irreversible-saga-approved",
+        lease: authorized.record,
+        leaseProof: proof,
+        sealedAtServerTimeMs: authorized.serverTimeMs,
+        stepId: operationStepId,
+      },
+      digest,
+    )
+    const actionInput = {
+      actorChecksum,
+      attemptId,
+      operationId,
+      phase: "forward" as const,
+      proof,
+      sagaId,
+      stepId: sagaStepId,
+    }
+    const begun = await coordinator.beginAction({
+      ...actionInput,
+      irreversibleAuthorization: authorization,
+    })
+    expect(begun).toMatchObject({ disposition: "execute" })
+
+    const transitionId = operationTransitionIdentity("accepted", [
+      operationId,
+      operationStepId,
+      attemptId,
+    ])
+    const durable = await env.DB.prepare(
+      `SELECT "transition"."created_at_ms", "transition"."to_record_json",
+              "step"."record_json", "receipt"."transition_id",
+              "receipt"."authorization_id", "receipt"."authorization_checksum",
+              "receipt"."protocol_version", "receipt"."classified_at_ms"
+       FROM "nozzle_operation_transitions" AS "transition"
+       JOIN "nozzle_operation_steps" AS "step"
+         ON "step"."operation_id" = "transition"."operation_id"
+        AND "step"."step_id" = "transition"."step_id"
+       JOIN "nozzle_irreversible_authorization_receipts" AS "receipt"
+         ON "receipt"."transition_id" = "transition"."transition_id"
+       WHERE "transition"."transition_id" = ?1`,
+    )
+      .bind(transitionId)
+      .first<{
+        authorization_checksum: string
+        authorization_id: string
+        classified_at_ms: number
+        created_at_ms: number
+        protocol_version: number
+        record_json: string
+        to_record_json: string
+        transition_id: string
+      }>()
+    if (durable === null) throw new Error("Irreversible saga authorization receipt is missing.")
+    const current = await operations.get(operationId)
+    const currentStep = current?.operation.steps[operationStepId]
+    if (currentStep === undefined) throw new Error("Irreversible saga operation step is missing.")
+    const currentRecordJson = operationStepRecordJson(currentStep)
+    expect(currentStep.irreversibleAuthorization).toEqual(authorization)
+    expect(currentStep).toMatchObject({
+      authorizationChecksum: authorization.authorizationChecksum,
+      state: "running",
+    })
+    expect(durable).toEqual({
+      authorization_checksum: authorization.authorizationChecksum,
+      authorization_id: authorization.authorizationId,
+      classified_at_ms: durable.created_at_ms,
+      created_at_ms: durable.created_at_ms,
+      protocol_version: 2,
+      record_json: currentRecordJson,
+      to_record_json: currentRecordJson,
+      transition_id: transitionId,
+    })
+
+    const restarted = new D1SagaCoordinatorStore(env.DB, digest)
+    await expect(restarted.beginAction(actionInput)).resolves.toEqual({
+      disposition: "in_progress",
+      saga: begun.saga,
+    })
+    await expect(
+      attempts.accept({
+        attemptId,
+        inputJson: invocation.stepInputJsons[sagaStepId] as string,
+        phase: "forward",
+        proof,
+        purpose: "effect",
+        sagaId,
+        sagaStepId,
+      }),
+    ).resolves.toMatchObject({
+      attemptId,
+      operationId,
+      operationStepId,
+      protocolVersion: 2,
+      state: "accepted",
+    })
   })
 
   it("atomically couples an observed unknown action across both real D1 ledgers", async () => {

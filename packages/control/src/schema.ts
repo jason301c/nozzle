@@ -1,4 +1,4 @@
-export const CONTROL_SCHEMA_VERSION = 2 as const
+export const CONTROL_SCHEMA_VERSION = 3 as const
 
 export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_audit_log",
@@ -10,6 +10,7 @@ export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_d1_resources",
   "nozzle_fleets",
   "nozzle_idempotency_keys",
+  "nozzle_irreversible_authorization_receipts",
   "nozzle_leases",
   "nozzle_migrations",
   "nozzle_operation_effects",
@@ -45,6 +46,391 @@ WHERE COALESCE((
   SELECT "sql" FROM "sqlite_schema" WHERE "type" = 'trigger' AND "name" = '${name}'
 ), '') <> '${expected}';`
 }
+
+function tableInstallStatement(definition: string): string {
+  return `${definition.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")};`
+}
+
+function tableDefinitionGuard(definition: string): string {
+  const nameEnd = definition.indexOf('"', 'CREATE TABLE "'.length)
+  const name = definition.slice('CREATE TABLE "'.length, nameEnd)
+  const expected = definition.replaceAll("'", "''")
+  return `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE COALESCE((
+  SELECT "sql" FROM "sqlite_schema" WHERE "type" = 'table' AND "name" = '${name}'
+), '') <> '${expected}';`
+}
+
+const SCHEMA_SERVER_TIME_SQL = `CAST(unixepoch('subsec') * 1000 AS INTEGER)`
+
+function irreversibleDispatchBinding(transition: string, step: string): string {
+  return `json_extract(${step}."plan_json", '$.checkpoint') = 'irreversible'
+    AND json_extract(${step}."plan_json", '$.stepId') = ${step}."step_id"
+    AND json_extract(${step}."plan_json", '$.idempotencyKey') = ${step}."idempotency_key"
+    AND json_extract(${step}."plan_json", '$.leaseKey') = ${step}."lease_key"
+    AND ${step}."operation_id" = ${transition}."operation_id"
+    AND ${step}."step_id" = ${transition}."step_id"
+    AND ${step}."lease_key" = ${transition}."lease_key"
+    AND (
+      (
+        json_extract(${transition}."from_record_json", '$.state') = 'pending'
+        AND json_type(${transition}."from_record_json", '$.authorizationChecksum') IS NULL
+        AND json_type(
+          ${transition}."from_record_json", '$.irreversibleAuthorization'
+        ) IS NULL
+      )
+      OR (
+        json_extract(${transition}."from_record_json", '$.state') = 'retryable_failed'
+        AND json_type(
+          ${transition}."from_record_json", '$.authorizationChecksum'
+        ) = 'text'
+        AND length(trim(json_extract(
+          ${transition}."from_record_json", '$.authorizationChecksum'
+        ))) > 0
+        AND json_extract(${step}."plan_json", '$.retryClassification')
+          IN ('idempotent', 'reconcile_first')
+      )
+    )
+    AND json_extract(${transition}."to_record_json", '$.state') = 'running'`
+}
+
+function irreversibleProtocolTwoDispatchBinding(transition: string, step: string): string {
+  return `${irreversibleDispatchBinding(transition, step)}
+    AND (
+      json_extract(${transition}."from_record_json", '$.state') = 'pending'
+      OR json_type(
+        ${transition}."from_record_json", '$.irreversibleAuthorization'
+      ) = 'object'
+    )`
+}
+
+function irreversibleAuthorizationShapeBinding(transition: string): string {
+  const body = `json_extract(${transition}."to_record_json", '$.irreversibleAuthorization')`
+  const field = (name: string): string =>
+    `json_extract(${transition}."to_record_json", '$.irreversibleAuthorization.${name}')`
+  const fieldType = (name: string): string =>
+    `json_type(${transition}."to_record_json", '$.irreversibleAuthorization.${name}')`
+  return `json_type(${transition}."to_record_json", '$.irreversibleAuthorization') = 'object'
+    AND length(CAST(${body} AS BLOB)) <= 65536
+    AND (
+      SELECT count(*) = 14
+        AND count(DISTINCT "key") = 14
+        AND sum(CASE WHEN "key" IN (
+          'actorChecksum', 'authorizationChecksum', 'authorizationId', 'decisionChecksum',
+          'fencingToken', 'holderId', 'leaseAcquisitionId', 'leaseKey', 'operationId',
+          'planChecksum', 'sealedAtServerTimeMs', 'schemaVersion', 'stepId',
+          'stepInputChecksum'
+        ) THEN 1 ELSE 0 END) = 14
+      FROM json_each(${body})
+    )
+    AND ${fieldType("schemaVersion")} = 'integer'
+    AND ${field("schemaVersion")} = 1
+    AND ${fieldType("fencingToken")} = 'integer'
+    AND ${field("fencingToken")} BETWEEN 1 AND 9007199254740991
+    AND ${fieldType("sealedAtServerTimeMs")} = 'integer'
+    AND ${field("sealedAtServerTimeMs")} BETWEEN 0 AND 9007199254740991
+    AND ${[
+      "actorChecksum",
+      "authorizationChecksum",
+      "authorizationId",
+      "decisionChecksum",
+      "holderId",
+      "leaseAcquisitionId",
+      "leaseKey",
+      "operationId",
+      "planChecksum",
+      "stepId",
+      "stepInputChecksum",
+    ]
+      .map((name) => `${fieldType(name)} = 'text' AND length(trim(${field(name)})) > 0`)
+      .join("\n    AND ")}`
+}
+
+function irreversibleAuthorizationPlanBinding(
+  transition: string,
+  operation: string,
+  step: string,
+): string {
+  const field = (name: string): string =>
+    `json_extract(${transition}."to_record_json", '$.irreversibleAuthorization.${name}')`
+  return `${irreversibleDispatchBinding(transition, step)}
+    AND ${field("operationId")} = ${transition}."operation_id"
+    AND ${field("operationId")} = ${operation}."operation_id"
+    AND ${field("planChecksum")} = ${operation}."plan_checksum"
+    AND json_extract(${operation}."plan_json", '$.operationId') =
+      ${operation}."operation_id"
+    AND json_extract(${operation}."plan_json", '$.planChecksum') =
+      ${operation}."plan_checksum"
+    AND EXISTS (
+      SELECT 1 FROM json_each(json_extract(${operation}."plan_json", '$.steps')) AS "plan_step"
+      WHERE json_extract("plan_step"."value", '$.stepId') = ${step}."step_id"
+        AND json("plan_step"."value") = json(${step}."plan_json")
+    )
+    AND ${field("stepId")} = ${transition}."step_id"
+    AND ${field("stepId")} = ${step}."step_id"
+    AND ${field("stepInputChecksum")} =
+      json_extract(${step}."plan_json", '$.inputChecksum')
+    AND ${field("leaseKey")} = ${transition}."lease_key"
+    AND ${field("leaseKey")} = ${step}."lease_key"`
+}
+
+function irreversibleAuthorizationFenceBinding(transition: string): string {
+  const field = (name: string): string =>
+    `json_extract(${transition}."to_record_json", '$.irreversibleAuthorization.${name}')`
+  return `json_type(${transition}."to_record_json", '$.authorizationChecksum') = 'text'
+    AND json_extract(${transition}."to_record_json", '$.authorizationChecksum') =
+      ${field("authorizationChecksum")}
+    AND ${field("holderId")} = ${transition}."holder_id"
+    AND ${field("leaseAcquisitionId")} = ${transition}."acquisition_id"
+    AND ${field("fencingToken")} = ${transition}."fencing_token"
+    AND ${field("sealedAtServerTimeMs")} <= ${SCHEMA_SERVER_TIME_SQL}`
+}
+
+const IRREVERSIBLE_AUTHORIZATION_RECEIPT_TABLE_DEFINITION = `CREATE TABLE "nozzle_irreversible_authorization_receipts" (
+  "transition_id" TEXT PRIMARY KEY NOT NULL
+    REFERENCES "nozzle_operation_transitions" ("transition_id"),
+  "authorization_id" TEXT CHECK (
+    "authorization_id" IS NULL OR length(trim("authorization_id")) > 0
+  ),
+  "authorization_checksum" TEXT NOT NULL CHECK (
+    length(trim("authorization_checksum")) > 0
+  ),
+  "protocol_version" INTEGER NOT NULL CHECK ("protocol_version" IN (1, 2)),
+  "classified_at_ms" INTEGER NOT NULL CHECK ("classified_at_ms" >= 0),
+  CHECK (("protocol_version" = 1 AND "authorization_id" IS NULL)
+    OR ("protocol_version" = 2 AND "authorization_id" IS NOT NULL))
+)`
+
+const IRREVERSIBLE_AUTHORIZATION_BODY_UNPUBLISHED_V3_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_authorization_body_unpublished_v3"
+BEFORE INSERT ON "nozzle_operation_transitions"
+WHEN json_type(NEW."to_record_json", '$.irreversibleAuthorization') IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 3
+  )
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_FENCED'); END`
+
+const IRREVERSIBLE_AUTHORIZATION_BODY_SHAPE_V3_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_authorization_body_shape_v3"
+BEFORE INSERT ON "nozzle_operation_transitions"
+WHEN json_type(NEW."to_record_json", '$.irreversibleAuthorization') IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM "nozzle_operation_steps" AS "step"
+    WHERE ${irreversibleDispatchBinding("NEW", '"step"')}
+  )
+  AND NOT COALESCE((${irreversibleAuthorizationShapeBinding("NEW")}), 0)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_FENCED'); END`
+
+const IRREVERSIBLE_AUTHORIZATION_BODY_PLAN_V3_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_authorization_body_plan_v3"
+BEFORE INSERT ON "nozzle_operation_transitions"
+WHEN json_type(NEW."to_record_json", '$.irreversibleAuthorization') IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM "nozzle_operation_steps" AS "step"
+    WHERE ${irreversibleDispatchBinding("NEW", '"step"')}
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM "nozzle_operations" AS "operation"
+    JOIN "nozzle_operation_steps" AS "step"
+      ON "step"."operation_id" = "operation"."operation_id"
+    WHERE ${irreversibleAuthorizationPlanBinding("NEW", '"operation"', '"step"')}
+  )
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_FENCED'); END`
+
+const IRREVERSIBLE_AUTHORIZATION_BODY_FENCE_V3_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_authorization_body_fence_v3"
+BEFORE INSERT ON "nozzle_operation_transitions"
+WHEN json_type(NEW."to_record_json", '$.irreversibleAuthorization') IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM "nozzle_operation_steps" AS "step"
+    WHERE ${irreversibleDispatchBinding("NEW", '"step"')}
+  )
+  AND NOT COALESCE((${irreversibleAuthorizationFenceBinding("NEW")}), 0)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_FENCED'); END`
+
+const IRREVERSIBLE_AUTHORIZATION_DISPATCH_V3_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_authorization_dispatch_v3"
+BEFORE INSERT ON "nozzle_operation_transitions"
+WHEN EXISTS (
+  SELECT 1 FROM "nozzle_operation_steps" AS "step"
+  WHERE ${irreversibleDispatchBinding("NEW", '"step"')}
+)
+AND (
+  json_type(NEW."to_record_json", '$.authorizationChecksum') IS NOT 'text'
+  OR length(trim(json_extract(NEW."to_record_json", '$.authorizationChecksum'))) = 0
+  OR (
+    EXISTS (SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 3)
+    AND json_type(NEW."to_record_json", '$.irreversibleAuthorization') IS NOT 'object'
+  )
+  OR (
+    EXISTS (SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 3)
+    AND json_extract(NEW."from_record_json", '$.state') = 'retryable_failed'
+    AND json_type(
+      NEW."from_record_json", '$.irreversibleAuthorization'
+    ) IS NOT 'object'
+  )
+  OR (
+    NOT EXISTS (SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 3)
+    AND json_type(NEW."to_record_json", '$.irreversibleAuthorization') IS NOT NULL
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_REQUIRED'); END`
+
+const IRREVERSIBLE_AUTHORIZATION_RETRY_V3_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_authorization_retry_v3"
+BEFORE INSERT ON "nozzle_operation_transitions"
+WHEN EXISTS (
+  SELECT 1 FROM "nozzle_operation_steps" AS "step"
+  WHERE "step"."operation_id" = NEW."operation_id"
+    AND "step"."step_id" = NEW."step_id"
+    AND "step"."lease_key" = NEW."lease_key"
+    AND json_extract("step"."plan_json", '$.checkpoint') = 'irreversible'
+    AND json_extract("step"."plan_json", '$.retryClassification') = 'never'
+    AND json_extract(NEW."from_record_json", '$.state') = 'retryable_failed'
+    AND json_extract(NEW."to_record_json", '$.state') = 'running'
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_RETRY_FORBIDDEN'); END`
+
+const IRREVERSIBLE_AUTHORIZATION_PRESERVE_V3_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_authorization_preserve_v3"
+BEFORE INSERT ON "nozzle_operation_transitions"
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_operation_steps" AS "step"
+  WHERE ${irreversibleDispatchBinding("NEW", '"step"')}
+)
+AND (
+  json_extract(NEW."to_record_json", '$.authorizationChecksum') IS NOT
+    json_extract(NEW."from_record_json", '$.authorizationChecksum')
+  OR json_extract(NEW."to_record_json", '$.irreversibleAuthorization') IS NOT
+    json_extract(NEW."from_record_json", '$.irreversibleAuthorization')
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_NOT_PRESERVED'); END`
+
+const IRREVERSIBLE_AUTHORIZATION_RECEIPT_INSERT_V3_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_authorization_receipt_insert_v3"
+BEFORE INSERT ON "nozzle_irreversible_authorization_receipts"
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_operation_transitions" AS "transition"
+  JOIN "nozzle_operation_steps" AS "step"
+    ON "step"."operation_id" = "transition"."operation_id"
+   AND "step"."step_id" = "transition"."step_id"
+  WHERE "transition"."transition_id" = NEW."transition_id"
+    AND NEW."authorization_checksum" =
+      json_extract("transition"."to_record_json", '$.authorizationChecksum')
+    AND NEW."classified_at_ms" = "transition"."created_at_ms"
+    AND (
+      (
+        NEW."protocol_version" = 1
+        AND NEW."authorization_id" IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 3
+        )
+        AND ${irreversibleDispatchBinding('"transition"', '"step"')}
+      )
+      OR (
+        NEW."protocol_version" = 2
+        AND EXISTS (
+          SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 3
+        )
+        AND NEW."authorization_id" = json_extract(
+          "transition"."to_record_json", '$.irreversibleAuthorization.authorizationId'
+        )
+        AND json_type(
+          "transition"."to_record_json", '$.irreversibleAuthorization'
+        ) = 'object'
+        AND ${irreversibleProtocolTwoDispatchBinding('"transition"', '"step"')}
+      )
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_RECEIPT_FENCED'); END`
+
+const IRREVERSIBLE_AUTHORIZATION_RECEIPT_UPDATE_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_authorization_receipt_update"
+BEFORE UPDATE ON "nozzle_irreversible_authorization_receipts"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_RECEIPT_IMMUTABLE'); END`
+
+const IRREVERSIBLE_AUTHORIZATION_RECEIPT_DELETE_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_authorization_receipt_delete"
+BEFORE DELETE ON "nozzle_irreversible_authorization_receipts"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_RECEIPT_IMMUTABLE'); END`
+
+const IRREVERSIBLE_AUTHORIZATION_RECEIPT_CLASSIFY_V3_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_authorization_receipt_classify_v3"
+AFTER INSERT ON "nozzle_operation_transitions"
+WHEN EXISTS (
+  SELECT 1 FROM "nozzle_operation_steps" AS "step"
+  WHERE ${irreversibleDispatchBinding("NEW", '"step"')}
+)
+BEGIN
+  INSERT INTO "nozzle_irreversible_authorization_receipts"
+    ("transition_id", "authorization_id", "authorization_checksum", "protocol_version",
+     "classified_at_ms")
+  VALUES (
+    NEW."transition_id",
+    CASE WHEN EXISTS (
+      SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 3
+    ) THEN json_extract(
+      NEW."to_record_json", '$.irreversibleAuthorization.authorizationId'
+    ) ELSE NULL END,
+    json_extract(NEW."to_record_json", '$.authorizationChecksum'),
+    CASE WHEN EXISTS (
+      SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 3
+    ) THEN 2 ELSE 1 END,
+    NEW."created_at_ms"
+  );
+END`
+
+const IRREVERSIBLE_SAGA_ATTEMPT_V3_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_saga_attempt_v3"
+BEFORE INSERT ON "nozzle_saga_action_attempts"
+WHEN NEW."purpose" = 'effect'
+  AND EXISTS (
+    SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 3
+  )
+  AND EXISTS (
+    SELECT 1 FROM "nozzle_operation_steps" AS "step"
+    WHERE "step"."operation_id" = NEW."operation_id"
+      AND "step"."step_id" = NEW."operation_step_id"
+      AND json_extract("step"."plan_json", '$.checkpoint') = 'irreversible'
+      AND "step"."state" = 'running'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM "nozzle_operation_steps" AS "step"
+    JOIN "nozzle_operation_transitions" AS "transition"
+      ON "transition"."operation_id" = "step"."operation_id"
+     AND "transition"."step_id" = "step"."step_id"
+     AND "transition"."to_record_json" = "step"."record_json"
+    JOIN "nozzle_irreversible_authorization_receipts" AS "receipt"
+      ON "receipt"."transition_id" = "transition"."transition_id"
+    WHERE "step"."operation_id" = NEW."operation_id"
+      AND "step"."step_id" = NEW."operation_step_id"
+      AND "receipt"."protocol_version" = 2
+      AND "receipt"."authorization_checksum" =
+        json_extract("step"."record_json", '$.authorizationChecksum')
+  )
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_RECEIPT_REQUIRED'); END`
+
+const IRREVERSIBLE_PROVIDER_ATTEMPT_V3_DEFINITION = `CREATE TRIGGER "nozzle_control_irreversible_provider_attempt_v3"
+BEFORE INSERT ON "nozzle_provider_attempts"
+WHEN NEW."purpose" = 'effect'
+  AND EXISTS (
+    SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 3
+  )
+  AND EXISTS (
+    SELECT 1 FROM "nozzle_operation_steps" AS "step"
+    WHERE "step"."operation_id" = NEW."operation_id"
+      AND "step"."step_id" = NEW."step_id"
+      AND json_extract("step"."plan_json", '$.checkpoint') = 'irreversible'
+      AND "step"."state" = 'running'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM "nozzle_operation_steps" AS "step"
+    JOIN "nozzle_operation_transitions" AS "transition"
+      ON "transition"."operation_id" = "step"."operation_id"
+     AND "transition"."step_id" = "step"."step_id"
+     AND "transition"."to_record_json" = "step"."record_json"
+    JOIN "nozzle_irreversible_authorization_receipts" AS "receipt"
+      ON "receipt"."transition_id" = "transition"."transition_id"
+    WHERE "step"."operation_id" = NEW."operation_id"
+      AND "step"."step_id" = NEW."step_id"
+      AND "receipt"."protocol_version" = 2
+      AND "receipt"."authorization_checksum" =
+        json_extract("step"."record_json", '$.authorizationChecksum')
+  )
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_RECEIPT_REQUIRED'); END`
 
 const SAGA_ATTEMPT_V2_BINDING = `EXISTS (
   SELECT 1
@@ -579,7 +965,7 @@ ON CONFLICT ("schema_version") DO NOTHING;`,
   `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
 SELECT 0, 0
 WHERE EXISTS (
-  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 2
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 3
 );`,
   `INSERT INTO "nozzle_control_meta" ("schema_version", "installed_at_ms")
 VALUES (1, CAST(unixepoch('subsec') * 1000 AS INTEGER))
@@ -1508,7 +1894,178 @@ END;`,
   `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
 VALUES (2, CAST(unixepoch('subsec') * 1000 AS INTEGER))
 ON CONFLICT ("schema_version") DO NOTHING;`,
+  tableInstallStatement(IRREVERSIBLE_AUTHORIZATION_RECEIPT_TABLE_DEFINITION),
+  tableDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_RECEIPT_TABLE_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_AUTHORIZATION_RECEIPT_UPDATE_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_RECEIPT_UPDATE_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_AUTHORIZATION_RECEIPT_DELETE_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_RECEIPT_DELETE_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_AUTHORIZATION_BODY_UNPUBLISHED_V3_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_BODY_UNPUBLISHED_V3_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_AUTHORIZATION_BODY_SHAPE_V3_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_BODY_SHAPE_V3_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_AUTHORIZATION_BODY_PLAN_V3_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_BODY_PLAN_V3_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_AUTHORIZATION_BODY_FENCE_V3_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_BODY_FENCE_V3_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_AUTHORIZATION_DISPATCH_V3_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_DISPATCH_V3_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_AUTHORIZATION_RETRY_V3_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_RETRY_V3_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_AUTHORIZATION_PRESERVE_V3_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_PRESERVE_V3_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_AUTHORIZATION_RECEIPT_INSERT_V3_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_RECEIPT_INSERT_V3_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_SAGA_ATTEMPT_V3_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_SAGA_ATTEMPT_V3_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_PROVIDER_ATTEMPT_V3_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_PROVIDER_ATTEMPT_V3_DEFINITION),
+  triggerInstallStatement(IRREVERSIBLE_AUTHORIZATION_RECEIPT_CLASSIFY_V3_DEFINITION),
+  triggerDefinitionGuard(IRREVERSIBLE_AUTHORIZATION_RECEIPT_CLASSIFY_V3_DEFINITION),
+  `INSERT INTO "nozzle_irreversible_authorization_receipts"
+  ("transition_id", "authorization_id", "authorization_checksum", "protocol_version",
+   "classified_at_ms")
+SELECT "transition"."transition_id", NULL,
+       json_extract("transition"."to_record_json", '$.authorizationChecksum'), 1,
+       "transition"."created_at_ms"
+FROM "nozzle_operation_transitions" AS "transition"
+JOIN "nozzle_operation_steps" AS "step"
+  ON "step"."operation_id" = "transition"."operation_id"
+ AND "step"."step_id" = "transition"."step_id"
+WHERE ${irreversibleDispatchBinding('"transition"', '"step"')}
+  AND NOT EXISTS (
+    SELECT 1 FROM "nozzle_irreversible_authorization_receipts" AS "existing"
+    WHERE "existing"."transition_id" = "transition"."transition_id"
+  )
+ON CONFLICT ("transition_id") DO NOTHING;`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE EXISTS (
+  SELECT 1
+  FROM "nozzle_irreversible_authorization_receipts" AS "receipt"
+  LEFT JOIN "nozzle_operation_transitions" AS "transition"
+    ON "transition"."transition_id" = "receipt"."transition_id"
+  LEFT JOIN "nozzle_operations" AS "operation"
+    ON "operation"."operation_id" = "transition"."operation_id"
+  LEFT JOIN "nozzle_operation_steps" AS "step"
+    ON "step"."operation_id" = "transition"."operation_id"
+   AND "step"."step_id" = "transition"."step_id"
+  WHERE "transition"."transition_id" IS NULL
+    OR "receipt"."authorization_checksum" IS NOT
+      json_extract("transition"."to_record_json", '$.authorizationChecksum')
+    OR "receipt"."classified_at_ms" IS NOT "transition"."created_at_ms"
+    OR (
+      "receipt"."protocol_version" = 1
+      AND (
+        "receipt"."authorization_id" IS NOT NULL
+        OR NOT COALESCE((${irreversibleDispatchBinding('"transition"', '"step"')}), 0)
+      )
+    )
+    OR (
+      "receipt"."protocol_version" = 2
+      AND (
+        "receipt"."authorization_id" IS NOT json_extract(
+          "transition"."to_record_json", '$.irreversibleAuthorization.authorizationId'
+        )
+        OR json_type(
+          "transition"."to_record_json", '$.irreversibleAuthorization'
+        ) IS NOT 'object'
+        OR NOT COALESCE((
+          ${irreversibleProtocolTwoDispatchBinding('"transition"', '"step"')}
+        ), 0)
+      )
+    )
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE EXISTS (
+  SELECT 1
+  FROM "nozzle_irreversible_authorization_receipts" AS "receipt"
+  JOIN "nozzle_operation_transitions" AS "transition"
+    ON "transition"."transition_id" = "receipt"."transition_id"
+  WHERE "receipt"."protocol_version" = 2
+    AND NOT COALESCE((${irreversibleAuthorizationShapeBinding('"transition"')}), 0)
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE EXISTS (
+  SELECT 1
+  FROM "nozzle_irreversible_authorization_receipts" AS "receipt"
+  JOIN "nozzle_operation_transitions" AS "transition"
+    ON "transition"."transition_id" = "receipt"."transition_id"
+  JOIN "nozzle_operations" AS "operation"
+    ON "operation"."operation_id" = "transition"."operation_id"
+  JOIN "nozzle_operation_steps" AS "step"
+    ON "step"."operation_id" = "transition"."operation_id"
+   AND "step"."step_id" = "transition"."step_id"
+  WHERE "receipt"."protocol_version" = 2
+    AND NOT COALESCE((${irreversibleAuthorizationPlanBinding(
+      '"transition"',
+      '"operation"',
+      '"step"',
+    )}), 0)
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE EXISTS (
+  SELECT 1
+  FROM "nozzle_irreversible_authorization_receipts" AS "receipt"
+  JOIN "nozzle_operation_transitions" AS "transition"
+    ON "transition"."transition_id" = "receipt"."transition_id"
+  WHERE "receipt"."protocol_version" = 2
+    AND NOT COALESCE((${irreversibleAuthorizationFenceBinding('"transition"')}), 0)
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 3
+)
+AND EXISTS (
+  SELECT 1 FROM "nozzle_irreversible_authorization_receipts"
+  WHERE "protocol_version" = 2
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE EXISTS (
+  SELECT 1
+  FROM "nozzle_operation_transitions" AS "transition"
+  JOIN "nozzle_operation_steps" AS "step"
+    ON "step"."operation_id" = "transition"."operation_id"
+   AND "step"."step_id" = "transition"."step_id"
+  LEFT JOIN "nozzle_irreversible_authorization_receipts" AS "receipt"
+    ON "receipt"."transition_id" = "transition"."transition_id"
+  WHERE ${irreversibleDispatchBinding('"transition"', '"step"')}
+    AND "receipt"."transition_id" IS NULL
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`,
 ])
+
+const CONTROL_SCHEMA_VERSION_TWO_PUBLICATION = `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (2, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`
+
+function versionTwoArtifactStatement(statement: string): string {
+  return statement.includes(
+    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 3',
+  )
+    ? statement.replace('WHERE "schema_version" > 3', 'WHERE "schema_version" > 2')
+    : statement
+}
+
+const versionTwoPublicationIndex = CONTROL_SCHEMA_STATEMENTS.indexOf(
+  CONTROL_SCHEMA_VERSION_TWO_PUBLICATION,
+)
+
+export const CONTROL_SCHEMA_VERSION_TWO_STATEMENTS = Object.freeze(
+  CONTROL_SCHEMA_STATEMENTS.slice(0, versionTwoPublicationIndex + 1).map(
+    versionTwoArtifactStatement,
+  ),
+)
+
+export const CONTROL_SCHEMA_VERSION_TWO_ARTIFACT_SHA256 =
+  "962e6e62174590d666ec75a3c111c2a92298fbf2996e3dadd5f9b6a7739b4909" as const
 
 function versionOneArtifactStatement(statement: string): readonly string[] {
   if (
@@ -1536,7 +2093,7 @@ function versionOneArtifactStatement(statement: string): readonly string[] {
 }
 
 export const CONTROL_SCHEMA_VERSION_ONE_STATEMENTS = Object.freeze(
-  CONTROL_SCHEMA_STATEMENTS.flatMap(versionOneArtifactStatement),
+  CONTROL_SCHEMA_VERSION_TWO_STATEMENTS.flatMap(versionOneArtifactStatement),
 )
 
 export const CONTROL_SCHEMA_VERSION_ONE_ARTIFACT_SHA256 =
@@ -1548,4 +2105,8 @@ export function controlSchemaSql(): string {
 
 export function controlSchemaVersionOneSql(): string {
   return `${CONTROL_SCHEMA_VERSION_ONE_STATEMENTS.join("\n\n")}\n`
+}
+
+export function controlSchemaVersionTwoSql(): string {
+  return `${CONTROL_SCHEMA_VERSION_TWO_STATEMENTS.join("\n\n")}\n`
 }

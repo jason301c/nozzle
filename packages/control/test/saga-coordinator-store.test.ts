@@ -2,9 +2,11 @@ import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlit
 import {
   appendAuditEvent,
   type DigestFunction,
+  type IrreversibleAuthorization,
   leaseProof,
   type OperationStepPlanInput,
   sagaActionIdempotencyKey,
+  sealIrreversibleAuthorization,
   sealOperationPlan,
   sealSagaDescriptor,
 } from "@nozzle/core"
@@ -410,6 +412,7 @@ type QueryFault =
   | { readonly kind: "termination_winner_projection"; readonly row: unknown }
   | {
       readonly kind:
+        | "authorization_receipt_missing"
         | "audit_missing"
         | "audit_mismatch"
         | "classified_audit_mismatch"
@@ -488,6 +491,12 @@ class QueryFaultDatabase implements TransactionalControlDatabase {
   }
 
   prepare(sql: string): ControlStatement {
+    if (
+      this.#fault.kind === "authorization_receipt_missing" &&
+      sql.includes('FROM "nozzle_irreversible_authorization_receipts"')
+    ) {
+      return new FixedStatement(null)
+    }
     if (
       this.#fault.kind === "termination_transition_disappears" &&
       sql === 'SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1'
@@ -969,6 +978,7 @@ async function fixture(
   queryFault?: QueryFault,
   omitActionPlan = false,
   omitTerminationPlan = false,
+  irreversibleAction = false,
 ): Promise<Fixture> {
   const base = new DatabaseAdapter()
   databases.push(base)
@@ -993,18 +1003,22 @@ async function fixture(
       descriptorId: `coordinator-descriptor-${suffix}`,
       steps: [
         {
-          authorizationPolicyChecksum: null,
+          authorizationPolicyChecksum: irreversibleAction ? "ee".repeat(32) : null,
           baseRetryDelayMs: 0,
-          compensationAction: {
-            actionId: "a.compensate",
-            artifactChecksum: "cc".repeat(32),
-            version: 1,
-          },
-          compensationObservation: {
-            actionId: "a.observe-compensation",
-            artifactChecksum: "dd".repeat(32),
-            version: 1,
-          },
+          compensationAction: irreversibleAction
+            ? null
+            : {
+                actionId: "a.compensate",
+                artifactChecksum: "cc".repeat(32),
+                version: 1,
+              },
+          compensationObservation: irreversibleAction
+            ? null
+            : {
+                actionId: "a.observe-compensation",
+                artifactChecksum: "dd".repeat(32),
+                version: 1,
+              },
           forwardAction: {
             actionId: "a.forward",
             artifactChecksum: "aa".repeat(32),
@@ -1016,7 +1030,7 @@ async function fixture(
             version: 1,
           },
           inputSchemaChecksum: "11".repeat(32),
-          irreversible: false,
+          irreversible: irreversibleAction,
           maxAttempts: 3,
           maxRetryDelayMs: 100,
           outputSchemaChecksum: "22".repeat(32),
@@ -1078,7 +1092,7 @@ async function fixture(
           },
           {
             activation: "conditional",
-            checkpoint: "reversible",
+            checkpoint: irreversibleAction ? "irreversible" : "reversible",
             effectProtocol: "saga_receipt",
             idempotencyKey: sagaActionIdempotencyKey(sagaId, "a", "forward"),
             inputChecksum: actionInputChecksum,
@@ -1106,7 +1120,8 @@ async function fixture(
       ).filter(
         (step) =>
           (!omitActionPlan || step.stepId !== forwardStepId) &&
-          (!omitTerminationPlan || step.stepId !== SAGA_TERMINATION_OPERATION_STEP_ID),
+          (!omitTerminationPlan || step.stepId !== SAGA_TERMINATION_OPERATION_STEP_ID) &&
+          (!irreversibleAction || step.stepId !== compensationStepId),
       ),
     },
     digest,
@@ -1206,16 +1221,40 @@ function actionInput(
   attemptId = `${run.sagaId}:a:forward:1`,
   proof = run.proof,
   phase: "compensation" | "forward" = "forward",
+  irreversibleAuthorization?: IrreversibleAuthorization,
 ) {
   return {
     actorChecksum: "coordinator-test-actor",
     attemptId,
+    ...(irreversibleAuthorization === undefined ? {} : { irreversibleAuthorization }),
     operationId: run.operationId,
     phase,
     proof,
     sagaId: run.sagaId,
     stepId: "a",
   }
+}
+
+async function irreversibleAuthorization(
+  run: Fixture,
+  authorizationId = `${run.sagaId}:authorization`,
+): Promise<IrreversibleAuthorization> {
+  const operation = await run.operations.get(run.operationId)
+  if (operation === undefined) throw new Error("Missing irreversible operation fixture.")
+  const authorized = await run.leases.authorizeAt(run.proof)
+  return sealIrreversibleAuthorization(
+    operation.operation.plan,
+    {
+      actorChecksum: "coordinator-test-actor",
+      authorizationId,
+      decisionChecksum: `${authorizationId}:decision`,
+      lease: authorized.record,
+      leaseProof: run.proof,
+      sealedAtServerTimeMs: authorized.serverTimeMs,
+      stepId: sagaActionOperationStepId("a", "forward"),
+    },
+    digest,
+  )
 }
 
 async function reacquire(run: Fixture, proof: Fixture["proof"], suffix: string) {
@@ -3342,6 +3381,215 @@ describe("D1SagaCoordinatorStore", () => {
       disposition: "in_progress",
     })
     expect(count(run.base.database, "nozzle_operation_effects")).toBe(2)
+  })
+
+  it("atomically retains one exact irreversible authorization across begin and replay", async () => {
+    const run = await fixture("irreversible-begin", undefined, undefined, false, false, true)
+    await run.coordinator.initializeSaga(run.initialize)
+    const attemptId = `${run.sagaId}:a:forward:1`
+    await expect(run.coordinator.beginAction(actionInput(run, attemptId))).rejects.toThrow(
+      /no sealed authorization/u,
+    )
+    const first = await irreversibleAuthorization(run, `${run.sagaId}:authorization:first`)
+    const second = await irreversibleAuthorization(run, `${run.sagaId}:authorization:second`)
+    const input = actionInput(run, attemptId, run.proof, "forward", first)
+    let authorizationReads = 0
+    Object.defineProperty(input, "irreversibleAuthorization", {
+      configurable: true,
+      get() {
+        authorizationReads += 1
+        return authorizationReads === 1 ? first : second
+      },
+    })
+
+    await expect(run.coordinator.beginAction(input)).resolves.toMatchObject({
+      disposition: "execute",
+    })
+    expect(authorizationReads).toBe(1)
+    const operationStepId = sagaActionOperationStepId("a", "forward")
+    const stored = (await run.operations.get(run.operationId))?.operation.steps[operationStepId]
+    expect(stored).toMatchObject({
+      authorizationChecksum: first.authorizationChecksum,
+      irreversibleAuthorization: first,
+      state: "running",
+    })
+    expect(Object.isFrozen(stored?.irreversibleAuthorization)).toBe(true)
+    const transitionId = operationTransitionIdentity("accepted", [
+      run.operationId,
+      operationStepId,
+      attemptId,
+    ])
+    const transition = run.base.database
+      .prepare(
+        `SELECT "to_record_json" FROM "nozzle_operation_transitions"
+         WHERE "transition_id" = ?1`,
+      )
+      .get({ "?1": transitionId }) as { readonly to_record_json: string }
+    expect(JSON.parse(transition.to_record_json)).toMatchObject({
+      authorizationChecksum: first.authorizationChecksum,
+      irreversibleAuthorization: first,
+    })
+    await expect(run.coordinator.beginAction(actionInput(run, attemptId))).resolves.toMatchObject({
+      disposition: "in_progress",
+    })
+
+    const reversible = await fixture("reversible-rejects-authorization")
+    await reversible.coordinator.initializeSaga(reversible.initialize)
+    await expect(
+      reversible.coordinator.beginAction(
+        actionInput(reversible, undefined, reversible.proof, "forward", first),
+      ),
+    ).rejects.toThrow(/reversible step must not consume/u)
+  })
+
+  it.each([
+    0, 1, 2, 3, 4, 5,
+  ])("rolls irreversible authorization back with coupled statement %i", async (index) => {
+    const run = await fixture(
+      `irreversible-rollback-${index}`,
+      undefined,
+      undefined,
+      false,
+      false,
+      true,
+    )
+    await run.coordinator.initializeSaga(run.initialize)
+    const authorization = await irreversibleAuthorization(run)
+    const operationBefore = await run.operations.get(run.operationId)
+    const sagaBefore = await run.sagas.get(run.sagaId)
+    const faulted = new D1SagaCoordinatorStore(
+      new FaultDatabase(run.base, { index, kind: "rollback_before" }),
+      digest,
+    )
+
+    await expect(
+      faulted.beginAction(actionInput(run, undefined, run.proof, "forward", authorization)),
+    ).rejects.toThrow(/Beginning a saga action exceeded/u)
+    expect(await run.operations.get(run.operationId)).toEqual(operationBefore)
+    expect(await run.sagas.get(run.sagaId)).toEqual(sagaBefore)
+  })
+
+  it("recovers the exact irreversible authorization after commit response loss", async () => {
+    const run = await fixture(
+      "irreversible-lost-response",
+      { kind: "commit_then_throw" },
+      undefined,
+      false,
+      false,
+      true,
+    )
+    await run.coordinator.initializeSaga(run.initialize)
+    const authorization = await irreversibleAuthorization(run)
+
+    await expect(
+      run.coordinator.beginAction(actionInput(run, undefined, run.proof, "forward", authorization)),
+    ).resolves.toMatchObject({ disposition: "execute" })
+    expect(
+      (await run.operations.get(run.operationId))?.operation.steps[
+        sagaActionOperationStepId("a", "forward")
+      ],
+    ).toMatchObject({
+      authorizationChecksum: authorization.authorizationChecksum,
+      irreversibleAuthorization: authorization,
+    })
+  })
+
+  it("commits only one of two contradictory irreversible authorization deliveries", async () => {
+    const run = await fixture("irreversible-concurrent", undefined, undefined, false, false, true)
+    await run.coordinator.initializeSaga(run.initialize)
+    const first = await irreversibleAuthorization(run, `${run.sagaId}:authorization:first`)
+    const second = await irreversibleAuthorization(run, `${run.sagaId}:authorization:second`)
+    const attemptId = `${run.sagaId}:a:forward:1`
+
+    const outcomes = await Promise.allSettled([
+      run.coordinator.beginAction(actionInput(run, attemptId, run.proof, "forward", first)),
+      run.coordinator.beginAction(actionInput(run, attemptId, run.proof, "forward", second)),
+    ])
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1)
+    expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(1)
+    if (outcomes[1]?.status === "rejected") {
+      expect(outcomes[1].reason).toMatchObject({ code: "OperationInterventionRequiredError" })
+    } else if (outcomes[0]?.status === "rejected") {
+      expect(outcomes[0].reason).toMatchObject({ code: "OperationInterventionRequiredError" })
+    }
+    const retained = (await run.operations.get(run.operationId))?.operation.steps[
+      sagaActionOperationStepId("a", "forward")
+    ]?.irreversibleAuthorization
+    expect([first.authorizationChecksum, second.authorizationChecksum]).toContain(
+      retained?.authorizationChecksum,
+    )
+    expect(count(run.base.database, "nozzle_operation_effects")).toBe(2)
+  })
+
+  it("fails closed when an irreversible saga transition loses its authorization receipt", async () => {
+    const run = await fixture(
+      "irreversible-receipt-missing",
+      undefined,
+      { kind: "authorization_receipt_missing" },
+      false,
+      false,
+      true,
+    )
+    await run.coordinator.initializeSaga(run.initialize)
+    const authorization = await irreversibleAuthorization(run)
+
+    await expect(
+      run.coordinator.beginAction(actionInput(run, undefined, run.proof, "forward", authorization)),
+    ).rejects.toThrow(/lacks its exact authorization receipt/u)
+    expect((await run.sagas.get(run.sagaId))?.steps.a?.forward.state).toBe("running")
+  })
+
+  it("records every authorized irreversible retry after exact non-application", async () => {
+    const run = await fixture("irreversible-retry", undefined, undefined, false, false, true)
+    await run.coordinator.initializeSaga(run.initialize)
+    const firstAttemptId = `${run.sagaId}:a:forward:1`
+    const firstAuthorization = await irreversibleAuthorization(
+      run,
+      `${run.sagaId}:authorization:first`,
+    )
+    await run.coordinator.beginAction(
+      actionInput(run, firstAttemptId, run.proof, "forward", firstAuthorization),
+    )
+    await run.attempts.accept({
+      attemptId: firstAttemptId,
+      inputJson: run.actionInputJson,
+      phase: "forward",
+      proof: run.proof,
+      purpose: "effect",
+      sagaId: run.sagaId,
+      sagaStepId: "a",
+    })
+    await run.attempts.complete({
+      attemptId: firstAttemptId,
+      errorJson: '{"code":"not-applied"}',
+      evidenceJson: '{"source":"provider"}',
+      proof: run.proof,
+      state: "not_applied",
+    })
+    await run.coordinator.settleActionFromReceipt(actionInput(run, firstAttemptId))
+    expect((await run.sagas.get(run.sagaId))?.steps.a?.forward.state).toBe("retryable_failed")
+
+    const secondAttemptId = `${run.sagaId}:a:forward:2`
+    const secondAuthorization = await irreversibleAuthorization(
+      run,
+      `${run.sagaId}:authorization:second`,
+    )
+    await expect(
+      run.coordinator.beginAction(
+        actionInput(run, secondAttemptId, run.proof, "forward", secondAuthorization),
+      ),
+    ).resolves.toMatchObject({ disposition: "execute" })
+    expect(
+      run.base.database
+        .prepare(
+          `SELECT "authorization_id" FROM "nozzle_irreversible_authorization_receipts"
+           ORDER BY "authorization_id"`,
+        )
+        .all(),
+    ).toEqual([
+      { authorization_id: firstAuthorization.authorizationId },
+      { authorization_id: secondAuthorization.authorizationId },
+    ])
   })
 
   it("recovers an exact commit when the D1 response is lost", async () => {

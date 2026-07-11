@@ -1,6 +1,7 @@
 import {
   mapSagaSettlementOutcome,
   NozzleError,
+  type OperationPlan,
   type OperationRecord,
   type OperationStepPlan,
   type OperationStepRecord,
@@ -42,6 +43,22 @@ const SAGA_ACTION_KEYS = new Set([
   "state",
 ])
 const SAGA_STEP_KEYS = ["compensation", "forward", "inputChecksum"] as const
+const IRREVERSIBLE_AUTHORIZATION_KEYS = [
+  "actorChecksum",
+  "authorizationChecksum",
+  "authorizationId",
+  "decisionChecksum",
+  "fencingToken",
+  "holderId",
+  "leaseAcquisitionId",
+  "leaseKey",
+  "operationId",
+  "planChecksum",
+  "sealedAtServerTimeMs",
+  "schemaVersion",
+  "stepId",
+  "stepInputChecksum",
+] as const
 
 /** Caller-supplied inputs for the pure terminal model; this is not persistence authority. */
 export interface SagaTerminalModelEvidence {
@@ -407,7 +424,9 @@ function selectedKeys(
     "fencingToken",
     "lastAttemptId",
     "progressCounters",
-    ...(plan.checkpoint === "irreversible" ? ["authorizationChecksum"] : []),
+    ...(plan.checkpoint === "irreversible"
+      ? ["authorizationChecksum", "irreversibleAuthorization"]
+      : []),
     ...(generic.errorChecksum === undefined ? [] : ["errorChecksum"]),
     ...(generic.reconciliationEvidenceChecksum === undefined
       ? []
@@ -421,18 +440,47 @@ function selectedKeys(
 function exactAuthorization(
   generic: OperationStepRecord,
   plan: OperationStepPlan,
+  operationPlan: Pick<OperationPlan, "operationId" | "planChecksum">,
   expectedAuthorizationChecksum: string | undefined,
 ): boolean {
-  return plan.checkpoint === "irreversible"
-    ? nonEmpty(expectedAuthorizationChecksum) &&
-        generic.authorizationChecksum === expectedAuthorizationChecksum
-    : expectedAuthorizationChecksum === undefined && generic.authorizationChecksum === undefined
+  if (plan.checkpoint === "reversible") {
+    return (
+      expectedAuthorizationChecksum === undefined &&
+      generic.authorizationChecksum === undefined &&
+      generic.irreversibleAuthorization === undefined
+    )
+  }
+  const authorization = generic.irreversibleAuthorization
+  return (
+    nonEmpty(expectedAuthorizationChecksum) &&
+    generic.authorizationChecksum === expectedAuthorizationChecksum &&
+    plainRecord(authorization) &&
+    exactKeys(authorization, IRREVERSIBLE_AUTHORIZATION_KEYS) &&
+    authorization.schemaVersion === 1 &&
+    authorization.authorizationChecksum === expectedAuthorizationChecksum &&
+    authorization.stepId === plan.stepId &&
+    authorization.stepInputChecksum === plan.inputChecksum &&
+    authorization.leaseKey === plan.leaseKey &&
+    authorization.operationId === operationPlan.operationId &&
+    authorization.planChecksum === operationPlan.planChecksum &&
+    authorization.fencingToken === generic.fencingToken &&
+    Number.isSafeInteger(authorization.sealedAtServerTimeMs) &&
+    authorization.sealedAtServerTimeMs >= 0 &&
+    [
+      authorization.actorChecksum,
+      authorization.authorizationId,
+      authorization.decisionChecksum,
+      authorization.holderId,
+      authorization.leaseAcquisitionId,
+    ].every(nonEmpty)
+  )
 }
 
 function exactSelectedAction(
   action: SagaActionRecord,
   generic: OperationStepRecord,
   plan: OperationStepPlan,
+  operationPlan: Pick<OperationPlan, "operationId" | "planChecksum">,
   phase: SagaActionPhase,
   expectedAuthorizationChecksum: string | undefined,
 ): void {
@@ -491,7 +539,7 @@ function exactSelectedAction(
     generic.lastAttemptId !== action.lastAttemptId ||
     generic.startedAttempts !== action.attempts ||
     generic.state !== expectedState ||
-    !exactAuthorization(generic, plan, expectedAuthorizationChecksum) ||
+    !exactAuthorization(generic, plan, operationPlan, expectedAuthorizationChecksum) ||
     !exactEvidenceShape
   ) {
     intervention(`Selected saga action ${plan.stepId} contradicts its generic operation step.`)
@@ -502,6 +550,7 @@ function retryableDecision(
   action: SagaActionRecord,
   generic: OperationStepRecord,
   plan: OperationStepPlan,
+  operationPlan: Pick<OperationPlan, "operationId" | "planChecksum">,
   evidence: SagaTerminalModelEvidence,
 ): SagaTerminalModelBranchDecision | undefined {
   const expectedAuthorizationChecksum = evidence.irreversibleAuthorizationChecksums[plan.stepId]
@@ -511,7 +560,9 @@ function retryableDecision(
       "fencingToken",
       "lastAttemptId",
       "progressCounters",
-      ...(plan.checkpoint === "irreversible" ? ["authorizationChecksum"] : []),
+      ...(plan.checkpoint === "irreversible"
+        ? ["authorizationChecksum", "irreversibleAuthorization"]
+        : []),
       ...(generic.errorChecksum === undefined ? [] : ["errorChecksum"]),
       "reconciliationEvidenceChecksum",
       "resultChecksum",
@@ -525,7 +576,7 @@ function retryableDecision(
       !positiveInteger(generic.fencingToken) ||
       generic.lastAttemptId !== action.lastAttemptId ||
       generic.startedAttempts !== action.attempts ||
-      !exactAuthorization(generic, plan, expectedAuthorizationChecksum) ||
+      !exactAuthorization(generic, plan, operationPlan, expectedAuthorizationChecksum) ||
       !nonEmpty(generic.reconciliationEvidenceChecksum) ||
       generic.resultChecksum !== generic.reconciliationEvidenceChecksum ||
       (action.observationEvidenceChecksum !== undefined &&
@@ -545,7 +596,9 @@ function retryableDecision(
     "fencingToken",
     "lastAttemptId",
     "progressCounters",
-    ...(plan.checkpoint === "irreversible" ? ["authorizationChecksum"] : []),
+    ...(plan.checkpoint === "irreversible"
+      ? ["authorizationChecksum", "irreversibleAuthorization"]
+      : []),
     ...(generic.errorChecksum === undefined ? [] : ["errorChecksum"]),
     ...(generic.reconciliationEvidenceChecksum === undefined
       ? []
@@ -574,7 +627,7 @@ function retryableDecision(
     generic.lastAttemptId !== action.lastAttemptId ||
     generic.startedAttempts !== action.attempts ||
     generic.state !== "retryable_failed" ||
-    !exactAuthorization(generic, plan, expectedAuthorizationChecksum) ||
+    !exactAuthorization(generic, plan, operationPlan, expectedAuthorizationChecksum) ||
     !nonEmpty(evidenceChecksum) ||
     (!directFailure && !crashAbsence && !observation)
   ) {
@@ -617,6 +670,7 @@ function classifyAction(
   action: SagaActionRecord,
   generic: OperationStepRecord,
   plan: OperationStepPlan,
+  operationPlan: Pick<OperationPlan, "operationId" | "planChecksum">,
   phase: SagaActionPhase,
   evidence: SagaTerminalModelEvidence,
   decisions: SagaTerminalModelBranchDecision[],
@@ -626,7 +680,7 @@ function classifyAction(
     return
   }
   if (action.state === "retryable_failed" && phase === "forward") {
-    const decision = retryableDecision(action, generic, plan, evidence)
+    const decision = retryableDecision(action, generic, plan, operationPlan, evidence)
     if (decision !== undefined) decisions.push(decision)
     return
   }
@@ -634,6 +688,7 @@ function classifyAction(
     action,
     generic,
     plan,
+    operationPlan,
     phase,
     evidence.irreversibleAuthorizationChecksums[plan.stepId],
   )
@@ -725,6 +780,7 @@ function evaluateTerminalSagaBranches(
         sagaStep[phase],
         operation.steps[stepId] as OperationStepRecord,
         planById.get(stepId) as OperationStepPlan,
+        operation.plan,
         phase,
         evidence,
         decisions,

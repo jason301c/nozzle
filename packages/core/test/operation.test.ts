@@ -13,12 +13,15 @@ import {
   decideLeaseRelease,
   decideLeaseRenewal,
   encodeAuditEventChecksumInput,
+  encodeIrreversibleAuthorizationChecksumInput,
   encodeOperationPlanChecksumInput,
   type FencedLeaseRecord,
+  type IrreversibleAuthorization,
   leaseProof,
   loadAuditEvent,
   loadIrreversibleAuthorization,
   loadOperationPlan,
+  MAX_IRREVERSIBLE_AUTHORIZATION_BYTES,
   markOperationStepNotRequired,
   markRunningStepNotDispatchedAfterCrash,
   markRunningStepsUnknownAfterCrash,
@@ -78,6 +81,16 @@ function planInput(steps: readonly OperationStepPlanInput[] = [step("one")]): Op
 
 async function plan(steps?: readonly OperationStepPlanInput[]): Promise<OperationPlan> {
   return sealOperationPlan(planInput(steps), digest)
+}
+
+async function resignAuthorization(
+  authorization: IrreversibleAuthorization,
+): Promise<IrreversibleAuthorization> {
+  const { authorizationChecksum: _authorizationChecksum, ...unsigned } = authorization
+  return {
+    ...unsigned,
+    authorizationChecksum: await digest(encodeIrreversibleAuthorizationChecksumInput(unsigned)),
+  }
 }
 
 function acquire(
@@ -730,6 +743,7 @@ describe("sealed irreversible authorization", () => {
       }),
     ).toThrow("integrity-verified")
     const loadedAuthorization = await loadIrreversibleAuthorization(persistedAuthorization, digest)
+    expect(Object.isFrozen(loadedAuthorization)).toBe(true)
     expect(
       begin(operation, lease, {
         authorization: loadedAuthorization,
@@ -752,6 +766,321 @@ describe("sealed irreversible authorization", () => {
     ).rejects.toThrow("version is unsupported")
     const reversibleOperation = createOperationRecord(await plan())
     expect(() => begin(reversibleOperation, lease, { authorization })).toThrow("reversible step")
+  })
+
+  it("retains the exact trusted authorization through every attempted transition", async () => {
+    const sealedPlan = await plan([
+      step("delete", {
+        checkpoint: "irreversible",
+        effectProtocol: "saga_receipt",
+        retryClassification: "reconcile_first",
+      }),
+    ])
+    const activeLease = acquire()
+    const authorization = await sealIrreversibleAuthorization(
+      sealedPlan,
+      {
+        actorChecksum: "actor",
+        authorizationId: "authorization-retained",
+        decisionChecksum: "decision",
+        lease: activeLease,
+        leaseProof: leaseProof(activeLease),
+        sealedAtServerTimeMs: 105,
+        stepId: "delete",
+      },
+      digest,
+    )
+    const running = begin(createOperationRecord(sealedPlan), activeLease, {
+      authorization,
+      idempotencyKey: "idempotency-delete",
+      precondition: "pre-delete",
+      stepId: "delete",
+    }).operation
+    const retryable = recordStepFailure(running, {
+      attemptId: "attempt-1",
+      errorChecksum: "definitely-absent",
+      outcome: "definitely_not_applied",
+      stepId: "delete",
+    })
+    const unknown = recordStepFailure(running, {
+      attemptId: "attempt-1",
+      errorChecksum: "lost-response",
+      outcome: "unknown",
+      stepId: "delete",
+    })
+    const retried = begin(retryable, activeLease, {
+      attemptId: "attempt-2",
+      authorization,
+      idempotencyKey: "idempotency-delete",
+      precondition: "pre-delete",
+      stepId: "delete",
+    }).operation
+    const states = [
+      running,
+      recordStepSuccess(running, {
+        attemptId: "attempt-1",
+        observedPostconditionChecksum: "post-delete",
+        resultChecksum: "deleted",
+        stepId: "delete",
+      }),
+      retryable,
+      retried,
+      recordStepFailure(running, {
+        attemptId: "attempt-1",
+        errorChecksum: "permanent",
+        outcome: "permanent",
+        stepId: "delete",
+      }),
+      unknown,
+      markRunningStepUnknownAfterCrash(running, "delete", "crash-unknown"),
+      markRunningStepNotDispatchedAfterCrash(running, "delete", "dispatch-absent"),
+      recordStepReconciliation(unknown, {
+        evidenceChecksum: "observed-applied",
+        observedPostconditionChecksum: "post-delete",
+        outcome: "applied",
+        resultChecksum: "deleted-after-reconciliation",
+        stepId: "delete",
+      }),
+      recordStepReconciliation(unknown, {
+        evidenceChecksum: "observed-absent",
+        outcome: "not_applied",
+        stepId: "delete",
+      }),
+      recordStepReconciliation(unknown, {
+        evidenceChecksum: "still-indeterminate",
+        outcome: "indeterminate",
+        stepId: "delete",
+      }),
+      recordSagaStepTerminalClassification(unknown, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "terminal-absence",
+        stepId: "delete",
+      }),
+      recordSagaStepTerminalClassification(retryable, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "definitely-absent",
+        stepId: "delete",
+      }),
+    ]
+
+    for (const state of states) {
+      expect(state.steps.delete?.authorizationChecksum).toBe(authorization.authorizationChecksum)
+      expect(state.steps.delete?.irreversibleAuthorization).toBe(authorization)
+      expect(Object.isFrozen(state.steps.delete?.irreversibleAuthorization)).toBe(true)
+    }
+  })
+
+  it("fails closed when an attempted step loses or forges its retained authorization", async () => {
+    const sealedPlan = await plan([step("delete", { checkpoint: "irreversible" })])
+    const activeLease = acquire()
+    const authorization = await sealIrreversibleAuthorization(
+      sealedPlan,
+      {
+        actorChecksum: "actor",
+        authorizationId: "authorization-retained",
+        decisionChecksum: "decision",
+        lease: activeLease,
+        leaseProof: leaseProof(activeLease),
+        sealedAtServerTimeMs: 105,
+        stepId: "delete",
+      },
+      digest,
+    )
+    const running = begin(createOperationRecord(sealedPlan), activeLease, {
+      authorization,
+      idempotencyKey: "idempotency-delete",
+      precondition: "pre-delete",
+      stepId: "delete",
+    }).operation
+    const record = running.steps.delete
+    if (!record) throw new Error("Fixture step is missing.")
+    const { irreversibleAuthorization: _body, ...checksumOnly } = record
+    const { authorizationChecksum: _checksum, ...bodyOnly } = record
+    const replacements = [
+      checksumOnly,
+      bodyOnly,
+      { ...record, authorizationChecksum: "contradictory-checksum" },
+      { ...record, irreversibleAuthorization: Object.freeze({ ...authorization }) },
+      { ...record, irreversibleAuthorization: new Proxy(authorization, {}) },
+    ]
+
+    for (const replacement of replacements) {
+      const malformed = {
+        ...running,
+        steps: { ...running.steps, delete: replacement },
+      } as OperationRecord
+      expect(() =>
+        recordStepSuccess(malformed, {
+          attemptId: "attempt-1",
+          observedPostconditionChecksum: "post-delete",
+          resultChecksum: "deleted",
+          stepId: "delete",
+        }),
+      ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+    }
+  })
+
+  it("accepts only an exact trusted authorization when one is supplied on replay", async () => {
+    const sealedPlan = await plan([step("delete", { checkpoint: "irreversible" })])
+    const activeLease = acquire()
+    const authorization = await sealIrreversibleAuthorization(
+      sealedPlan,
+      {
+        actorChecksum: "actor",
+        authorizationId: "authorization-replay",
+        decisionChecksum: "decision",
+        lease: activeLease,
+        leaseProof: leaseProof(activeLease),
+        sealedAtServerTimeMs: 105,
+        stepId: "delete",
+      },
+      digest,
+    )
+    const otherTrustedAuthorization = await sealIrreversibleAuthorization(
+      sealedPlan,
+      {
+        actorChecksum: "actor",
+        authorizationId: "authorization-other",
+        decisionChecksum: "other-decision",
+        lease: activeLease,
+        leaseProof: leaseProof(activeLease),
+        sealedAtServerTimeMs: 105,
+        stepId: "delete",
+      },
+      digest,
+    )
+    const running = begin(createOperationRecord(sealedPlan), activeLease, {
+      authorization,
+      idempotencyKey: "idempotency-delete",
+      precondition: "pre-delete",
+      stepId: "delete",
+    }).operation
+    const succeeded = recordStepSuccess(running, {
+      attemptId: "attempt-1",
+      observedPostconditionChecksum: "post-delete",
+      resultChecksum: "deleted",
+      stepId: "delete",
+    })
+    const exactLoadedAuthorization = await loadIrreversibleAuthorization(
+      { ...authorization },
+      digest,
+    )
+    const replayInput = {
+      idempotencyKey: "idempotency-delete",
+      precondition: "pre-delete",
+      stepId: "delete",
+    }
+
+    expect(begin(succeeded, activeLease, replayInput)).toMatchObject({
+      disposition: "replay",
+      resultChecksum: "deleted",
+    })
+    expect(begin(succeeded, activeLease, { ...replayInput, authorization })).toMatchObject({
+      disposition: "replay",
+      resultChecksum: "deleted",
+    })
+    expect(
+      begin(succeeded, activeLease, {
+        ...replayInput,
+        authorization: exactLoadedAuthorization,
+      }),
+    ).toMatchObject({ disposition: "replay", resultChecksum: "deleted" })
+    expect(begin(running, activeLease, { ...replayInput, authorization }).disposition).toBe(
+      "in_progress",
+    )
+    const unknown = markRunningStepUnknownAfterCrash(running, "delete", "lost-response")
+    expect(begin(unknown, activeLease, { ...replayInput, authorization }).disposition).toBe(
+      "reconcile",
+    )
+
+    for (const contradictory of [
+      otherTrustedAuthorization,
+      Object.freeze({ ...authorization }),
+      new Proxy(authorization, {}),
+    ]) {
+      expect(() =>
+        begin(succeeded, activeLease, {
+          ...replayInput,
+          authorization: contradictory,
+        }),
+      ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+    }
+
+    const reversibleRunning = begin(createOperationRecord(await plan()), activeLease).operation
+    const reversibleSucceeded = recordStepSuccess(reversibleRunning, {
+      attemptId: "attempt-1",
+      observedPostconditionChecksum: "post-one",
+      resultChecksum: "done",
+      stepId: "one",
+    })
+    expect(() => begin(reversibleSucceeded, activeLease, { authorization })).toThrow(
+      "reversible step",
+    )
+  })
+
+  it("accepts an exact 64 KiB receipt and rejects the next byte", async () => {
+    const sealedPlan = await plan([step("delete", { checkpoint: "irreversible" })])
+    const activeLease = acquire()
+    const sealWithActor = (actorChecksum: string) =>
+      sealIrreversibleAuthorization(
+        sealedPlan,
+        {
+          actorChecksum,
+          authorizationId: "authorization-sized",
+          decisionChecksum: "decision",
+          lease: activeLease,
+          leaseProof: leaseProof(activeLease),
+          sealedAtServerTimeMs: 105,
+          stepId: "delete",
+        },
+        digest,
+      )
+    const smallest = await sealWithActor("a")
+    const encoder = new TextEncoder()
+    const smallestBytes = encoder.encode(JSON.stringify(smallest)).byteLength
+    const exact = await sealWithActor(
+      "a".repeat(1 + MAX_IRREVERSIBLE_AUTHORIZATION_BYTES - smallestBytes),
+    )
+    expect(encoder.encode(JSON.stringify(exact)).byteLength).toBe(
+      MAX_IRREVERSIBLE_AUTHORIZATION_BYTES,
+    )
+    await expect(
+      sealWithActor("a".repeat(2 + MAX_IRREVERSIBLE_AUTHORIZATION_BYTES - smallestBytes)),
+    ).rejects.toThrow("exceeds the 64 KiB receipt limit")
+    let oversizedDigestCalls = 0
+    await expect(
+      sealIrreversibleAuthorization(
+        sealedPlan,
+        {
+          actorChecksum: "a".repeat(MAX_IRREVERSIBLE_AUTHORIZATION_BYTES),
+          authorizationId: "authorization-oversized-before-digest",
+          decisionChecksum: "decision",
+          lease: activeLease,
+          leaseProof: leaseProof(activeLease),
+          sealedAtServerTimeMs: 105,
+          stepId: "delete",
+        },
+        async (input) => {
+          oversizedDigestCalls += 1
+          return digest(input)
+        },
+      ),
+    ).rejects.toThrow("exceeds the 64 KiB receipt limit")
+    expect(oversizedDigestCalls).toBe(0)
+
+    const loaded = await loadIrreversibleAuthorization({ ...exact }, digest)
+    expect(loaded).toEqual(exact)
+    expect(Object.isFrozen(loaded)).toBe(true)
+    const oversized = await resignAuthorization({
+      ...exact,
+      actorChecksum: `${exact.actorChecksum}a`,
+    })
+    expect(encoder.encode(JSON.stringify(oversized)).byteLength).toBe(
+      MAX_IRREVERSIBLE_AUTHORIZATION_BYTES + 1,
+    )
+    await expect(loadIrreversibleAuthorization(oversized, digest)).rejects.toThrow(
+      "exceeds the 64 KiB receipt limit",
+    )
   })
 
   it("captures authorization inputs once and brands only exact persisted fields", async () => {

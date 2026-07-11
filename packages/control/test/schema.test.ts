@@ -9,9 +9,12 @@ import {
   CONTROL_SCHEMA_VERSION,
   CONTROL_SCHEMA_VERSION_ONE_ARTIFACT_SHA256,
   CONTROL_SCHEMA_VERSION_ONE_STATEMENTS,
+  CONTROL_SCHEMA_VERSION_TWO_ARTIFACT_SHA256,
+  CONTROL_SCHEMA_VERSION_TWO_STATEMENTS,
   CONTROL_TABLE_NAMES,
   controlSchemaSql,
   controlSchemaVersionOneSql,
+  controlSchemaVersionTwoSql,
 } from "../src/schema.js"
 
 function withDatabase(run: (database: DatabaseSync) => void): void {
@@ -70,6 +73,9 @@ const schemaInstallBoundaries = CONTROL_SCHEMA_STATEMENTS.flatMap((statement, in
     statement.includes("nozzle_control_saga_attempt_insert_v2") ||
     statement.includes("nozzle_control_saga_outcome_insert_v2") ||
     statement.includes("nozzle_control_saga_protocol_classify_v2") ||
+    statement.includes("irreversible_authorization") ||
+    statement.includes("irreversible_saga_attempt_v3") ||
+    statement.includes("irreversible_provider_attempt_v3") ||
     statement.includes('DROP TRIGGER IF EXISTS "nozzle_control_saga_attempt_insert"') ||
     statement.includes('DROP TRIGGER IF EXISTS "nozzle_control_saga_outcome_insert"') ||
     index === CONTROL_SCHEMA_STATEMENTS.length - 1
@@ -89,10 +95,20 @@ describe("control D1 schema", () => {
     expect(sql).not.toContain("nozzle_saga_action_attempt_protocols")
   })
 
+  it("keeps the complete historical version-two install artifact checksum-locked", () => {
+    const sql = controlSchemaVersionTwoSql()
+    expect(Object.isFrozen(CONTROL_SCHEMA_VERSION_TWO_STATEMENTS)).toBe(true)
+    expect(createHash("sha256").update(sql).digest("hex")).toBe(
+      CONTROL_SCHEMA_VERSION_TWO_ARTIFACT_SHA256,
+    )
+    expect(sql).toContain("VALUES (2, CAST(unixepoch('subsec') * 1000 AS INTEGER))")
+    expect(sql).not.toContain("nozzle_irreversible_authorization_receipts")
+  })
+
   it("emits one deterministic install artifact with every required ledger table", () => {
     const sql = controlSchemaSql()
     expect(sql).toBe(`${CONTROL_SCHEMA_STATEMENTS.join("\n\n")}\n`)
-    expect(CONTROL_SCHEMA_VERSION).toBe(2)
+    expect(CONTROL_SCHEMA_VERSION).toBe(3)
     expect(Object.isFrozen(CONTROL_SCHEMA_STATEMENTS)).toBe(true)
     expect(Object.isFrozen(CONTROL_TABLE_NAMES)).toBe(true)
     expect(sql).not.toContain("fictional-secret")
@@ -126,7 +142,7 @@ describe("control D1 schema", () => {
              ORDER BY "schema_version"`,
           )
           .all(),
-      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }])
+      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }, { schema_version: 3 }])
       expect(() =>
         database.prepare(`UPDATE "nozzle_control_meta" SET "installed_at_ms" = 0`).run(),
       ).toThrow("NOZZLE_CONTROL_INSTALL_IDENTITY_IMMUTABLE")
@@ -176,6 +192,7 @@ describe("control D1 schema", () => {
           schema_version: 1,
         },
         expect.objectContaining({ schema_version: 2 }),
+        expect.objectContaining({ schema_version: 3 }),
       ])
       expect(
         database
@@ -218,7 +235,7 @@ describe("control D1 schema", () => {
              ORDER BY "schema_version"`,
           )
           .all(),
-      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }])
+      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }, { schema_version: 3 }])
       expect(
         database
           .prepare(
@@ -248,7 +265,7 @@ describe("control D1 schema", () => {
              ORDER BY "schema_version"`,
           )
           .all(),
-      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }])
+      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }, { schema_version: 3 }])
     } finally {
       database.close()
     }
@@ -300,7 +317,7 @@ describe("control D1 schema", () => {
                ORDER BY "schema_version"`,
             )
             .all(),
-        ).toEqual([{ schema_version: 1 }, { schema_version: 2 }])
+        ).toEqual([{ schema_version: 1 }, { schema_version: 2 }, { schema_version: 3 }])
         expect(
           installer
             .prepare(
@@ -338,7 +355,8 @@ describe("control D1 schema", () => {
         "schema_version" INTEGER PRIMARY KEY NOT NULL CHECK ("schema_version" >= 1),
         "published_at_ms" INTEGER NOT NULL CHECK ("published_at_ms" >= 0)
       );
-      INSERT INTO "nozzle_control_schema_versions" VALUES (1, 1234), (2, 2345), (3, 3456);
+      INSERT INTO "nozzle_control_schema_versions"
+      VALUES (1, 1234), (2, 2345), (3, 3456), (4, 4567);
       CREATE TABLE "nozzle_saga_action_attempts" ("attempt_id" TEXT);
       CREATE TRIGGER "nozzle_control_saga_attempt_insert_v2"
       BEFORE INSERT ON "nozzle_saga_action_attempts" BEGIN SELECT 3; END;`)
@@ -398,13 +416,121 @@ describe("control D1 schema", () => {
         database
           .prepare(
             `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
-             WHERE "schema_version" = 2`,
+             WHERE "schema_version" = 3`,
           )
           .get(),
       ).toEqual({ count: 0 })
     } finally {
       database.close()
     }
+  })
+
+  it.each([
+    [
+      "nozzle_control_irreversible_authorization_body_unpublished_v3",
+      "nozzle_operation_transitions",
+    ],
+    ["nozzle_control_irreversible_authorization_body_shape_v3", "nozzle_operation_transitions"],
+    ["nozzle_control_irreversible_authorization_body_plan_v3", "nozzle_operation_transitions"],
+    ["nozzle_control_irreversible_authorization_body_fence_v3", "nozzle_operation_transitions"],
+    ["nozzle_control_irreversible_authorization_dispatch_v3", "nozzle_operation_transitions"],
+    ["nozzle_control_irreversible_authorization_retry_v3", "nozzle_operation_transitions"],
+    ["nozzle_control_irreversible_authorization_preserve_v3", "nozzle_operation_transitions"],
+    [
+      "nozzle_control_irreversible_authorization_receipt_insert_v3",
+      "nozzle_irreversible_authorization_receipts",
+    ],
+    [
+      "nozzle_control_irreversible_authorization_receipt_update",
+      "nozzle_irreversible_authorization_receipts",
+    ],
+    [
+      "nozzle_control_irreversible_authorization_receipt_delete",
+      "nozzle_irreversible_authorization_receipts",
+    ],
+    ["nozzle_control_irreversible_saga_attempt_v3", "nozzle_saga_action_attempts"],
+    ["nozzle_control_irreversible_provider_attempt_v3", "nozzle_provider_attempts"],
+    [
+      "nozzle_control_irreversible_authorization_receipt_classify_v3",
+      "nozzle_operation_transitions",
+    ],
+  ] as const)("refuses version-three publication with a corrupt %s trigger", (triggerName, tableName) => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      for (const statement of CONTROL_SCHEMA_STATEMENTS.slice(0, -1)) database.exec(statement)
+      database.exec(`DROP TRIGGER "${triggerName}";`)
+      database.exec(
+        `CREATE TRIGGER "${triggerName}" BEFORE INSERT ON "${tableName}"
+         BEGIN SELECT 3; END;`,
+      )
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+             WHERE "schema_version" = 3`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("refuses version-three publication with a corrupt authorization receipt table", () => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      database.exec(controlSchemaVersionTwoSql())
+      database.exec(`CREATE TABLE "nozzle_irreversible_authorization_receipts" (
+        "transition_id" TEXT PRIMARY KEY NOT NULL
+      );`)
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+             WHERE "schema_version" = 3`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("installs every authorization guard and backfill before publishing version three", () => {
+    const mapperIndex = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+      statement.includes("nozzle_control_irreversible_authorization_receipt_classify_v3"),
+    )
+    const backfillIndex = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+      statement.startsWith('INSERT INTO "nozzle_irreversible_authorization_receipts"'),
+    )
+    const guardIndices = [
+      "nozzle_control_irreversible_authorization_body_unpublished_v3",
+      "nozzle_control_irreversible_authorization_body_shape_v3",
+      "nozzle_control_irreversible_authorization_body_plan_v3",
+      "nozzle_control_irreversible_authorization_body_fence_v3",
+      "nozzle_control_irreversible_authorization_dispatch_v3",
+      "nozzle_control_irreversible_authorization_retry_v3",
+      "nozzle_control_irreversible_authorization_preserve_v3",
+      "nozzle_control_irreversible_authorization_receipt_insert_v3",
+      "nozzle_control_irreversible_saga_attempt_v3",
+      "nozzle_control_irreversible_provider_attempt_v3",
+    ].map((name) =>
+      CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+        statement.includes(`CREATE TRIGGER IF NOT EXISTS "${name}"`),
+      ),
+    )
+    expect(guardIndices.every((index) => index >= 0)).toBe(true)
+    expect(mapperIndex).toBeGreaterThan(Math.max(...guardIndices))
+    expect(backfillIndex).toBeGreaterThan(mapperIndex)
+    expect(CONTROL_SCHEMA_STATEMENTS.at(-1)).toBe(
+      `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`,
+    )
   })
 
   it("installs and verifies replacement saga guards before publishing version two", () => {
@@ -440,7 +566,7 @@ describe("control D1 schema", () => {
     expect(protocolGuardIndices.every((index) => index >= 0)).toBe(true)
     expect(protocolMapperIndex).toBeGreaterThan(Math.max(...protocolGuardIndices))
     expect(protocolBackfillIndex).toBeGreaterThan(protocolMapperIndex)
-    expect(CONTROL_SCHEMA_STATEMENTS.at(-1)).toBe(
+    expect(CONTROL_SCHEMA_VERSION_TWO_STATEMENTS.at(-1)).toBe(
       `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
 VALUES (2, CAST(unixepoch('subsec') * 1000 AS INTEGER))
 ON CONFLICT ("schema_version") DO NOTHING;`,

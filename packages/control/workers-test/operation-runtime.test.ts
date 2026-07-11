@@ -1,9 +1,16 @@
 import { env } from "cloudflare:workers"
-import { type DigestFunction, leaseProof, sealOperationPlan, verifyAuditChain } from "@nozzle/core"
+import {
+  type DigestFunction,
+  leaseProof,
+  sealIrreversibleAuthorization,
+  sealOperationPlan,
+  verifyAuditChain,
+} from "@nozzle/core"
 import { beforeAll, describe, expect, it } from "vitest"
 import { D1LeaseStore } from "../src/lease-store.js"
 import { D1OperationStore } from "../src/operation-store.js"
-import { CONTROL_SCHEMA_STATEMENTS } from "../src/schema.js"
+import { D1ProviderAttemptStore } from "../src/provider-attempt-store.js"
+import { CONTROL_SCHEMA_STATEMENTS, CONTROL_SCHEMA_VERSION } from "../src/schema.js"
 
 declare global {
   namespace Cloudflare {
@@ -20,11 +27,244 @@ const digest: DigestFunction = async (input) => {
   return [...hash].map((byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
+function canonicalJson(value: unknown): string {
+  const canonical = (candidate: unknown): unknown => {
+    if (Array.isArray(candidate)) return candidate.map(canonical)
+    if (typeof candidate === "object" && candidate !== null) {
+      const output: Record<string, unknown> = {}
+      for (const key of Object.keys(candidate).sort()) {
+        output[key] = canonical((candidate as Record<string, unknown>)[key])
+      }
+      return output
+    }
+    return candidate
+  }
+  return JSON.stringify(canonical(value))
+}
+
 beforeAll(async () => {
   for (const statement of CONTROL_SCHEMA_STATEMENTS) await env.DB.prepare(statement).run()
 })
 
 describe("real workerd operation ledger", () => {
+  it("retains an irreversible provider authorization across a real D1 restart", async () => {
+    await expect(
+      env.DB.prepare(
+        `SELECT "schema_version" FROM "nozzle_control_schema_versions"
+         WHERE "schema_version" = ?1`,
+      )
+        .bind(CONTROL_SCHEMA_VERSION)
+        .first(),
+    ).resolves.toEqual({ schema_version: CONTROL_SCHEMA_VERSION })
+
+    const operationId = "workerd-irreversible-provider-operation"
+    const stepId = "provider-call"
+    const attemptId = "workerd-irreversible-provider-attempt"
+    const leaseKey = "workerd:irreversible-provider"
+    const capabilitySnapshotJson = '{"runtime":"workerd-irreversible-provider-v1"}'
+    const inputJson = '{"operation":"create-d1-database"}'
+    const plan = await sealOperationPlan(
+      {
+        capabilitySnapshotChecksum: await digest(new TextEncoder().encode(capabilitySnapshotJson)),
+        idempotencyKey: "workerd-irreversible-provider-operation-key",
+        inputChecksum: await digest(new TextEncoder().encode(inputJson)),
+        operationId,
+        operationType: "workerd-irreversible-provider-test",
+        steps: [
+          {
+            checkpoint: "irreversible",
+            dependsOn: [],
+            effectProtocol: "provider_receipt",
+            idempotencyKey: "workerd-irreversible-provider-step-key",
+            inputChecksum: "workerd-irreversible-provider-step-input",
+            leaseKey,
+            postconditionChecksum: "workerd-irreversible-provider-postcondition",
+            preconditionChecksum: "workerd-irreversible-provider-precondition",
+            recoveryInstructions: "Inspect the durable authorization and provider receipt.",
+            retryClassification: "reconcile_first",
+            stepId,
+          },
+        ],
+      },
+      digest,
+    )
+    const operations = new D1OperationStore(env.DB, digest)
+    await operations.create({
+      actorChecksum: "workerd-irreversible-provider-actor",
+      capabilitySnapshotJson,
+      environmentId: "workerd-irreversible-provider",
+      idempotencyScope: "workerd-irreversible-provider",
+      inputJson,
+      plan,
+      requiredShardIds: [],
+    })
+    const leases = new D1LeaseStore(env.DB)
+    const acquired = await leases.acquire({
+      acquisitionId: "workerd-irreversible-provider-acquisition",
+      holderId: "workerd-irreversible-provider-controller",
+      leaseKey,
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Irreversible provider lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+    const authorized = await leases.authorizeAt(proof)
+    const authorization = await sealIrreversibleAuthorization(
+      plan,
+      {
+        actorChecksum: "workerd-irreversible-provider-actor",
+        authorizationId: "workerd-irreversible-provider-authorization",
+        decisionChecksum: "workerd-irreversible-provider-approved",
+        lease: authorized.record,
+        leaseProof: proof,
+        sealedAtServerTimeMs: authorized.serverTimeMs,
+        stepId,
+      },
+      digest,
+    )
+    await expect(
+      operations.beginStep({
+        actorChecksum: "workerd-irreversible-provider-actor",
+        attemptId,
+        idempotencyKey: "workerd-irreversible-provider-step-key",
+        irreversibleAuthorization: authorization,
+        observedPreconditionChecksum: "workerd-irreversible-provider-precondition",
+        operationId,
+        proof,
+        stepId,
+      }),
+    ).resolves.toMatchObject({ disposition: "execute" })
+
+    const restarted = new D1OperationStore(env.DB, digest)
+    const loaded = await restarted.get(operationId)
+    const loadedStep = loaded?.operation.steps[stepId]
+    expect(loadedStep?.irreversibleAuthorization).toEqual(authorization)
+    expect(loadedStep?.irreversibleAuthorization).not.toBe(authorization)
+    expect(Object.isFrozen(loadedStep)).toBe(true)
+    expect(Object.isFrozen(loadedStep?.irreversibleAuthorization)).toBe(true)
+
+    const durable = await env.DB.prepare(
+      `SELECT "step"."record_json", "transition"."created_at_ms",
+              "transition"."to_record_json",
+              "transition"."transition_id"
+       FROM "nozzle_operation_steps" AS "step"
+       JOIN "nozzle_operation_transitions" AS "transition"
+         ON "transition"."operation_id" = "step"."operation_id"
+        AND "transition"."step_id" = "step"."step_id"
+       WHERE "step"."operation_id" = ?1 AND "step"."step_id" = ?2`,
+    )
+      .bind(operationId, stepId)
+      .first<{
+        created_at_ms: number
+        record_json: string
+        to_record_json: string
+        transition_id: string
+      }>()
+    if (!durable) throw new Error("Irreversible transition fixture is missing.")
+    expect(durable.to_record_json).toBe(durable.record_json)
+    expect(durable.record_json).toBe(canonicalJson(JSON.parse(durable.record_json)))
+    expect(JSON.parse(durable.record_json)).toMatchObject({
+      authorizationChecksum: authorization.authorizationChecksum,
+      irreversibleAuthorization: authorization,
+      state: "running",
+    })
+    await expect(
+      env.DB.prepare(
+        `SELECT "transition_id", "authorization_id", "authorization_checksum",
+                "protocol_version", "classified_at_ms"
+         FROM "nozzle_irreversible_authorization_receipts"
+         WHERE "transition_id" = ?1`,
+      )
+        .bind(durable.transition_id)
+        .first(),
+    ).resolves.toEqual({
+      authorization_checksum: authorization.authorizationChecksum,
+      authorization_id: authorization.authorizationId,
+      classified_at_ms: durable.created_at_ms,
+      protocol_version: 2,
+      transition_id: durable.transition_id,
+    })
+
+    const providerAttempts = new D1ProviderAttemptStore(env.DB, digest)
+    const accepted = await providerAttempts.accept({
+      actorChecksum: "workerd-irreversible-provider-actor",
+      attemptId,
+      endpoint: "POST /accounts/{account_id}/d1/database",
+      mutating: true,
+      operationId,
+      purpose: "effect",
+      proof,
+      requestChecksum: "workerd-irreversible-provider-request",
+      stepId,
+      targetChecksum: "workerd-irreversible-provider-target",
+    })
+    expect(accepted).toMatchObject({
+      attemptId,
+      operationId,
+      state: "accepted",
+      stepId,
+    })
+    const outcome = await providerAttempts.complete({
+      attemptId,
+      evidenceJson: '{"cfRay":"workerd-irreversible-ray","status":200}',
+      proof,
+      resultJson: '{"uuid":"00000000-0000-4000-8000-000000000003"}',
+      state: "confirmed",
+    })
+    if (outcome.state !== "confirmed") throw new Error("Provider outcome was not confirmed.")
+    const completed = await restarted.completeStep({
+      actorChecksum: "workerd-irreversible-provider-actor",
+      attemptId,
+      observedPostconditionChecksum: "workerd-irreversible-provider-postcondition",
+      operationId,
+      proof,
+      resultChecksum: outcome.outcomeChecksum,
+      stepId,
+    })
+    expect(completed.steps[stepId]).toMatchObject({
+      authorizationChecksum: authorization.authorizationChecksum,
+      irreversibleAuthorization: authorization,
+      resultChecksum: outcome.outcomeChecksum,
+      state: "succeeded",
+    })
+
+    const terminal = await env.DB.prepare(
+      `SELECT "step"."record_json", "transition"."from_record_json",
+              "transition"."to_record_json"
+       FROM "nozzle_operation_steps" AS "step"
+       JOIN "nozzle_operation_transitions" AS "transition"
+         ON "transition"."operation_id" = "step"."operation_id"
+        AND "transition"."step_id" = "step"."step_id"
+        AND "transition"."to_record_json" = "step"."record_json"
+       WHERE "step"."operation_id" = ?1 AND "step"."step_id" = ?2`,
+    )
+      .bind(operationId, stepId)
+      .first<{
+        from_record_json: string
+        record_json: string
+        to_record_json: string
+      }>()
+    if (!terminal) throw new Error("Terminal irreversible transition fixture is missing.")
+    expect(terminal.to_record_json).toBe(terminal.record_json)
+    for (const recordJson of [terminal.from_record_json, terminal.to_record_json]) {
+      expect(recordJson).toBe(canonicalJson(JSON.parse(recordJson)))
+      expect(JSON.parse(recordJson)).toMatchObject({
+        authorizationChecksum: authorization.authorizationChecksum,
+        irreversibleAuthorization: authorization,
+      })
+    }
+    await expect(
+      env.DB.prepare(
+        `SELECT count(*) AS "count" FROM "nozzle_irreversible_authorization_receipts"
+         WHERE "transition_id" IN (
+           SELECT "transition_id" FROM "nozzle_operation_transitions"
+           WHERE "operation_id" = ?1 AND "step_id" = ?2
+         )`,
+      )
+        .bind(operationId, stepId)
+        .first(),
+    ).resolves.toEqual({ count: 1 })
+  })
+
   it("persists an unused conditional path without fabricating an attempt", async () => {
     const store = new D1OperationStore(env.DB, digest)
     const leases = new D1LeaseStore(env.DB)

@@ -3,6 +3,7 @@ import {
   createOperationRecord,
   createSagaRecord,
   type DigestFunction,
+  type IrreversibleAuthorization,
   loadSagaRecord,
   markRunningStepNotDispatchedAfterCrash,
   markSagaActionNotDispatched,
@@ -226,13 +227,51 @@ function succeed(
   })
 }
 
-function selectedRecord(selected: SagaActionRecord, plan: OperationStepPlan): OperationStepRecord {
+function modelAuthorization(
+  operation: OperationRecord,
+  plan: OperationStepPlan,
+  authorizationChecksum = "irreversible-authorization",
+): IrreversibleAuthorization {
+  return Object.freeze({
+    actorChecksum: "terminal-model-actor",
+    authorizationChecksum,
+    authorizationId: `${plan.stepId}:authorization`,
+    decisionChecksum: `${plan.stepId}:decision`,
+    fencingToken: 1,
+    holderId: "terminal-model-holder",
+    leaseAcquisitionId: "terminal-model-acquisition",
+    leaseKey: plan.leaseKey,
+    operationId: operation.plan.operationId,
+    planChecksum: operation.plan.planChecksum,
+    sealedAtServerTimeMs: 1_000,
+    schemaVersion: 1,
+    stepId: plan.stepId,
+    stepInputChecksum: plan.inputChecksum,
+  })
+}
+
+function modelAuthorizationFields(
+  operation: OperationRecord,
+  stepId: string,
+  authorizationChecksum = "irreversible-authorization",
+): Pick<OperationStepRecord, "authorizationChecksum" | "irreversibleAuthorization"> {
+  const plan = operation.plan.steps.find((step) => step.stepId === stepId)
+  if (plan === undefined) throw new Error("Missing irreversible operation plan step.")
+  return {
+    authorizationChecksum,
+    irreversibleAuthorization: modelAuthorization(operation, plan, authorizationChecksum),
+  }
+}
+
+function selectedRecord(
+  operation: OperationRecord,
+  selected: SagaActionRecord,
+  plan: OperationStepPlan,
+): OperationStepRecord {
   const observed = selected.observationEvidenceChecksum
   const intervention = selected.state === "intervention_required" && observed !== undefined
   return Object.freeze({
-    ...(plan.checkpoint === "irreversible"
-      ? { authorizationChecksum: "irreversible-authorization" }
-      : {}),
+    ...(plan.checkpoint === "irreversible" ? modelAuthorizationFields(operation, plan.stepId) : {}),
     costCounters: Object.freeze({}),
     ...(observed === undefined
       ? {}
@@ -261,7 +300,7 @@ function withSelectedAction(
   return withOperationStep(
     operation,
     operationStepId,
-    selectedRecord(action(saga, stepId, phase), plan),
+    selectedRecord(operation, action(saga, stepId, phase), plan),
   )
 }
 
@@ -768,7 +807,7 @@ describe("terminal saga branch oracle", () => {
     operation = withExplicitTermination(operation)
     const stepId = sagaActionOperationStepId("commit", "forward")
     operation = withOperationStep(operation, stepId, {
-      authorizationChecksum: "commit-authorization",
+      ...modelAuthorizationFields(operation, stepId, "commit-authorization"),
       costCounters: Object.freeze({}),
       errorChecksum: "commit-receipt",
       fencingToken: 1,
@@ -790,7 +829,7 @@ describe("terminal saga branch oracle", () => {
     ])
 
     operation = withOperationStep(operation, stepId, {
-      authorizationChecksum: "commit-authorization",
+      ...modelAuthorizationFields(operation, stepId, "commit-authorization"),
       costCounters: Object.freeze({}),
       errorChecksum: "commit-receipt",
       fencingToken: 1,
@@ -828,6 +867,37 @@ describe("terminal saga branch oracle", () => {
     ]) {
       expectCode(
         () => decideBranches(operation, saga, sagaTerminalModelEvidence(saga, authorizations)),
+        "OperationInterventionRequiredError",
+      )
+    }
+
+    const record = operation.steps[stepId] as OperationStepRecord
+    const authorization = record.irreversibleAuthorization as IrreversibleAuthorization
+    const malformedBodies: readonly unknown[] = [
+      null,
+      { ...authorization, unexpected: true },
+      { ...authorization, schemaVersion: 2 },
+      { ...authorization, authorizationChecksum: "wrong-authorization" },
+      { ...authorization, stepId: "saga:forward:other" },
+      { ...authorization, stepInputChecksum: "wrong-input" },
+      { ...authorization, leaseKey: "wrong-lease" },
+      { ...authorization, operationId: "wrong-operation" },
+      { ...authorization, planChecksum: "wrong-plan" },
+      { ...authorization, fencingToken: 2 },
+      { ...authorization, sealedAtServerTimeMs: Number.NaN },
+      { ...authorization, sealedAtServerTimeMs: -1 },
+      { ...authorization, actorChecksum: "" },
+    ]
+    for (const irreversibleAuthorization of malformedBodies) {
+      expectCode(
+        () =>
+          decideTerminalSagaBranches(
+            withOperationStep(operation, stepId, {
+              ...record,
+              irreversibleAuthorization: irreversibleAuthorization as IrreversibleAuthorization,
+            }),
+            saga,
+          ),
         "OperationInterventionRequiredError",
       )
     }

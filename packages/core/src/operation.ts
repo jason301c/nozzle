@@ -89,6 +89,8 @@ export const OPERATION_STEP_STATES = [
   "not_required",
 ] as const
 
+export const MAX_IRREVERSIBLE_AUTHORIZATION_BYTES = 64 * 1_024
+
 export type OperationStepState = (typeof OPERATION_STEP_STATES)[number]
 export type RetryClassification = "idempotent" | "never" | "reconcile_first"
 export type CheckpointKind = "irreversible" | "reversible"
@@ -146,6 +148,7 @@ export interface OperationStepRecord {
   readonly costCounters: Readonly<Record<string, number>>
   readonly errorChecksum?: string
   readonly fencingToken?: number
+  readonly irreversibleAuthorization?: IrreversibleAuthorization
   readonly lastAttemptId?: string
   readonly progressCounters: Readonly<Record<string, number>>
   readonly reconciliationEvidenceChecksum?: string
@@ -749,6 +752,7 @@ const PERSISTED_STEP_RECORD_KEYS = new Set([
   "costCounters",
   "errorChecksum",
   "fencingToken",
+  "irreversibleAuthorization",
   "lastAttemptId",
   "progressCounters",
   "reconciliationEvidenceChecksum",
@@ -757,7 +761,11 @@ const PERSISTED_STEP_RECORD_KEYS = new Set([
   "state",
 ])
 
-function loadPersistedStepRecord(value: unknown, planStep: OperationStepPlan): OperationStepRecord {
+function loadPersistedStepRecord(
+  value: unknown,
+  planStep: OperationStepPlan,
+  loadedAuthorization?: IrreversibleAuthorization,
+): OperationStepRecord {
   persistedInvariant(plainRecord(value), "A persisted operation step record is malformed.")
   persistedInvariant(
     Object.keys(value).every((key) => PERSISTED_STEP_RECORD_KEYS.has(key)),
@@ -779,6 +787,17 @@ function loadPersistedStepRecord(value: unknown, planStep: OperationStepPlan): O
     value.authorizationChecksum,
     "Authorization checksum",
   )
+  const authorizationCandidate = value.irreversibleAuthorization
+  persistedInvariant(
+    (authorizationCandidate === undefined) === (loadedAuthorization === undefined),
+    "A persisted irreversible authorization body is incomplete or unexpected.",
+  )
+  if (loadedAuthorization !== undefined) {
+    persistedInvariant(
+      authorizationChecksum === loadedAuthorization.authorizationChecksum,
+      "A persisted irreversible authorization body contradicts its checksum.",
+    )
+  }
   const errorChecksum = persistedOptionalString(value.errorChecksum, "Step error checksum")
   const lastAttemptId = persistedOptionalString(value.lastAttemptId, "Last attempt ID")
   const reconciliationEvidenceChecksum = persistedOptionalString(
@@ -865,12 +884,13 @@ function loadPersistedStepRecord(value: unknown, planStep: OperationStepPlan): O
   }
   if (planStep.checkpoint === "reversible") {
     persistedInvariant(
-      authorizationChecksum === undefined,
+      authorizationChecksum === undefined && loadedAuthorization === undefined,
       "A reversible step persisted irreversible authorization.",
     )
   } else {
     persistedInvariant(
-      neverAttempted === (authorizationChecksum === undefined),
+      neverAttempted === (authorizationChecksum === undefined) &&
+        (loadedAuthorization === undefined || !neverAttempted),
       "Persisted irreversible authorization state is inconsistent.",
     )
   }
@@ -886,6 +906,9 @@ function loadPersistedStepRecord(value: unknown, planStep: OperationStepPlan): O
     costCounters,
     ...(errorChecksum === undefined ? {} : { errorChecksum }),
     ...(fencingToken === undefined ? {} : { fencingToken }),
+    ...(loadedAuthorization === undefined
+      ? {}
+      : { irreversibleAuthorization: loadedAuthorization }),
     ...(lastAttemptId === undefined ? {} : { lastAttemptId }),
     progressCounters,
     ...(reconciliationEvidenceChecksum === undefined ? {} : { reconciliationEvidenceChecksum }),
@@ -920,7 +943,36 @@ export async function loadOperationRecord(
   )
   const steps: Record<string, OperationStepRecord> = {}
   for (const planStep of plan.steps) {
-    steps[planStep.stepId] = loadPersistedStepRecord(snapshot.steps[planStep.stepId], planStep)
+    const candidate = snapshot.steps[planStep.stepId]
+    const authorizationCandidate = plainRecord(candidate)
+      ? candidate.irreversibleAuthorization
+      : undefined
+    const authorization =
+      authorizationCandidate === undefined
+        ? undefined
+        : await loadIrreversibleAuthorization(
+            authorizationCandidate as IrreversibleAuthorization,
+            digest,
+          )
+    if (
+      authorization !== undefined &&
+      (authorization.operationId !== plan.operationId ||
+        authorization.planChecksum !== plan.planChecksum ||
+        authorization.stepId !== planStep.stepId ||
+        authorization.stepInputChecksum !== planStep.inputChecksum ||
+        authorization.leaseKey !== planStep.leaseKey)
+    ) {
+      interventionError(
+        "A persisted irreversible authorization is bound to a different immutable plan.",
+      )
+    }
+    const step = loadPersistedStepRecord(candidate, planStep, authorization)
+    if (authorization !== undefined && authorization.fencingToken !== step.fencingToken) {
+      interventionError(
+        "A persisted irreversible authorization is bound to a different operation fence.",
+      )
+    }
+    steps[planStep.stepId] = step
   }
   return Object.freeze({ plan, steps: Object.freeze(steps) })
 }
@@ -1247,12 +1299,24 @@ export async function sealIrreversibleAuthorization(
     stepId: step.stepId,
     stepInputChecksum: step.inputChecksum,
   })
+  if (
+    new TextEncoder().encode(JSON.stringify(authorization)).byteLength >
+    MAX_IRREVERSIBLE_AUTHORIZATION_BYTES
+  ) {
+    configurationError("Irreversible authorization exceeds the 64 KiB receipt limit.")
+  }
   const authorizationChecksum = await digestChecksum(
     encodeIrreversibleAuthorizationChecksumInput(authorization),
     digest,
     "Irreversible authorization checksum",
   )
   const sealed = Object.freeze({ ...authorization, authorizationChecksum })
+  if (
+    new TextEncoder().encode(JSON.stringify(sealed)).byteLength >
+    MAX_IRREVERSIBLE_AUTHORIZATION_BYTES
+  ) {
+    configurationError("Irreversible authorization exceeds the 64 KiB receipt limit.")
+  }
   TRUSTED_IRREVERSIBLE_AUTHORIZATIONS.add(sealed)
   return sealed
 }
@@ -1319,6 +1383,11 @@ export async function loadIrreversibleAuthorization(
     stepInputChecksum: snapshot.stepInputChecksum as string,
     authorizationChecksum: snapshot.authorizationChecksum as string,
   }
+  persistedInvariant(
+    new TextEncoder().encode(JSON.stringify(authorization)).byteLength <=
+      MAX_IRREVERSIBLE_AUTHORIZATION_BYTES,
+    "The persisted irreversible authorization exceeds the 64 KiB receipt limit.",
+  )
   if (!(await verifyIrreversibleAuthorizationChecksum(authorization, digest))) {
     interventionError("The persisted irreversible authorization checksum does not match.")
   }
@@ -1331,7 +1400,7 @@ function assertAuthorizationForInvocation(
   operation: OperationRecord,
   step: OperationStepPlan,
   request: StepInvocationRequest,
-): string | undefined {
+): IrreversibleAuthorization | undefined {
   if (step.checkpoint === "reversible") {
     if (request.irreversibleAuthorization) {
       configurationError("A reversible step must not consume irreversible authorization.")
@@ -1365,7 +1434,72 @@ function assertAuthorizationForInvocation(
     )
   }
   assertWellFormedString(authorization.authorizationChecksum, "Authorization checksum")
-  return authorization.authorizationChecksum
+  return authorization
+}
+
+function authorizationRecordFields(
+  authorization: IrreversibleAuthorization | undefined,
+): Pick<OperationStepRecord, "authorizationChecksum" | "irreversibleAuthorization"> {
+  return authorization === undefined
+    ? {}
+    : {
+        authorizationChecksum: authorization.authorizationChecksum,
+        irreversibleAuthorization: authorization,
+      }
+}
+
+function retainedAuthorizationFields(
+  operation: OperationRecord,
+  step: OperationStepPlan,
+  record: OperationStepRecord,
+): Pick<OperationStepRecord, "authorizationChecksum" | "irreversibleAuthorization"> {
+  const authorization = record.irreversibleAuthorization
+  const authorizationExpected = step.checkpoint === "irreversible" && record.startedAttempts > 0
+  if (
+    authorizationExpected !== (authorization !== undefined) ||
+    (authorization === undefined) !== (record.authorizationChecksum === undefined) ||
+    (authorization !== undefined &&
+      (!TRUSTED_IRREVERSIBLE_AUTHORIZATIONS.has(authorization) ||
+        authorization.authorizationChecksum !== record.authorizationChecksum ||
+        authorization.operationId !== operation.plan.operationId ||
+        authorization.planChecksum !== operation.plan.planChecksum ||
+        authorization.stepId !== step.stepId ||
+        authorization.stepInputChecksum !== step.inputChecksum ||
+        authorization.leaseKey !== step.leaseKey ||
+        authorization.fencingToken !== record.fencingToken))
+  ) {
+    interventionError("The irreversible authorization record is incomplete or contradictory.")
+  }
+  return authorizationRecordFields(authorization)
+}
+
+function assertReplayAuthorization(
+  operation: OperationRecord,
+  step: OperationStepPlan,
+  record: OperationStepRecord,
+  supplied: IrreversibleAuthorization | undefined,
+): void {
+  if (record.state === "pending") return
+  if (record.state === "retryable_failed") {
+    retainedAuthorizationFields(operation, step, record)
+    return
+  }
+  if (supplied === undefined) return
+  if (step.checkpoint === "reversible") {
+    configurationError("A reversible step must not consume irreversible authorization.")
+  }
+  const retained = retainedAuthorizationFields(operation, step, record).irreversibleAuthorization
+  if (
+    !TRUSTED_IRREVERSIBLE_AUTHORIZATIONS.has(supplied) ||
+    retained === undefined ||
+    ![...IRREVERSIBLE_AUTHORIZATION_KEYS].every(
+      (key) =>
+        supplied[key as keyof IrreversibleAuthorization] ===
+        retained[key as keyof IrreversibleAuthorization],
+    )
+  ) {
+    interventionError("A replayed step supplied contradictory irreversible authorization.")
+  }
 }
 
 function assertDependenciesSucceeded(operation: OperationRecord, step: OperationStepPlan): void {
@@ -1449,6 +1583,7 @@ function exactAtomicTerminalReplay(
     Object.keys(record.costCounters).length !== 0,
     record.errorChecksum !== expected.errorChecksum,
     record.fencingToken !== expected.fencingToken,
+    record.irreversibleAuthorization !== undefined,
     record.lastAttemptId !== expected.lastAttemptId,
     Object.keys(record.progressCounters).length !== 0,
     record.reconciliationEvidenceChecksum !== expected.reconciliationEvidenceChecksum,
@@ -1469,6 +1604,7 @@ function assertPristineAtomicStep(record: OperationStepRecord): void {
       record.authorizationChecksum !== undefined,
       record.errorChecksum !== undefined,
       record.fencingToken !== undefined,
+      record.irreversibleAuthorization !== undefined,
       record.lastAttemptId !== undefined,
       record.reconciliationEvidenceChecksum !== undefined,
       record.resultChecksum !== undefined,
@@ -1557,6 +1693,7 @@ export function beginOperationStep(
   if (request.idempotencyKey !== planStep.idempotencyKey) {
     resumeError("The step ID is already bound to a different idempotency key.")
   }
+  assertReplayAuthorization(operation, planStep, record, request.irreversibleAuthorization)
   if (record.state === "succeeded") {
     if (!record.resultChecksum) interventionError("A successful step has no result checksum.")
     return Object.freeze({
@@ -1590,9 +1727,9 @@ export function beginOperationStep(
     resumeError("The step was invoked under the wrong lease key.")
   }
   assertLeaseAuthorized(request.lease, request.leaseProof, request.serverTimeMs)
-  const authorizationChecksum = assertAuthorizationForInvocation(operation, planStep, request)
+  const irreversibleAuthorization = assertAuthorizationForInvocation(operation, planStep, request)
   const next: OperationStepRecord = Object.freeze({
-    ...(authorizationChecksum ? { authorizationChecksum } : {}),
+    ...authorizationRecordFields(irreversibleAuthorization),
     activeAttemptId: request.attemptId,
     costCounters: record.costCounters,
     fencingToken: request.leaseProof.fencingToken,
@@ -1662,9 +1799,7 @@ export function recordStepSuccess(
     interventionError("The step postcondition does not match the sealed operation plan.")
   }
   const next: OperationStepRecord = Object.freeze({
-    ...(record.authorizationChecksum
-      ? { authorizationChecksum: record.authorizationChecksum }
-      : {}),
+    ...retainedAuthorizationFields(operation, planStep, record),
     ...withCounterDeltas(record, input.counters),
     fencingToken: record.fencingToken,
     lastAttemptId: input.attemptId,
@@ -1698,9 +1833,7 @@ export function recordStepFailure(
     state = "failed"
   } else state = "retryable_failed"
   const next: OperationStepRecord = Object.freeze({
-    ...(record.authorizationChecksum
-      ? { authorizationChecksum: record.authorizationChecksum }
-      : {}),
+    ...retainedAuthorizationFields(operation, planStep, record),
     ...withCounterDeltas(record, input.counters),
     errorChecksum: input.errorChecksum,
     fencingToken: record.fencingToken,
@@ -1726,9 +1859,7 @@ function recoverRunningStepAfterCrash(
     interventionError("A running step has incomplete crash-recovery metadata.")
   }
   const recovered: OperationStepRecord = {
-    ...(record.authorizationChecksum
-      ? { authorizationChecksum: record.authorizationChecksum }
-      : {}),
+    ...retainedAuthorizationFields(operation, planStep, record),
     costCounters: record.costCounters,
     ...(errorChecksum === undefined ? {} : { errorChecksum }),
     fencingToken: record.fencingToken,
@@ -1776,6 +1907,8 @@ export function markRunningStepsUnknownAfterCrash(operation: OperationRecord): O
 }
 
 function reconciledStepRecord(
+  operation: OperationRecord,
+  planStep: OperationStepPlan,
   record: OperationStepRecord,
   fencingToken: number,
   lastAttemptId: string,
@@ -1785,9 +1918,7 @@ function reconciledStepRecord(
   resultChecksum?: string,
 ): OperationStepRecord {
   return Object.freeze({
-    ...(record.authorizationChecksum
-      ? { authorizationChecksum: record.authorizationChecksum }
-      : {}),
+    ...retainedAuthorizationFields(operation, planStep, record),
     ...withCounterDeltas(record, counters),
     ...(record.errorChecksum ? { errorChecksum: record.errorChecksum } : {}),
     fencingToken,
@@ -1842,6 +1973,8 @@ export function recordStepReconciliation(
   }
 
   const next = reconciledStepRecord(
+    operation,
+    planStep,
     record,
     record.fencingToken,
     record.lastAttemptId,
@@ -1893,7 +2026,8 @@ export function recordSagaStepTerminalClassification(
   ) {
     assertSagaClassificationMetadata(record)
   }
-  loadPersistedStepRecord(record, planStep)
+  retainedAuthorizationFields(operation, planStep, record)
+  loadPersistedStepRecord(record, planStep, record.irreversibleAuthorization)
   if (record.state === "succeeded") {
     if (
       record.reconciliationEvidenceChecksum === input.receiptOutcomeChecksum &&
@@ -1920,6 +2054,8 @@ export function recordSagaStepTerminalClassification(
     operation,
     input.stepId,
     reconciledStepRecord(
+      operation,
+      planStep,
       record,
       record.fencingToken,
       record.lastAttemptId,

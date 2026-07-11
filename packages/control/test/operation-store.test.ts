@@ -162,6 +162,8 @@ class ScriptedDatabase implements TransactionalControlDatabase {
 }
 
 interface TransitionFaults {
+  readonly auditEventRow?: unknown
+  readonly authorizationReceiptRow?: unknown
   readonly dropTransitionBatch?: boolean
   readonly hideAuditAfterBatch?: boolean
   readonly hideCurrentAfterBatch?: boolean
@@ -169,7 +171,34 @@ interface TransitionFaults {
   readonly providerAttemptRow?: unknown
   readonly sagaAttemptRow?: unknown
   readonly transitionRow?: unknown
+  readonly throwAfterTransitionBatch?: boolean
+  readonly throwAtTransitionStatement?: number
   readonly throwTransitionBatch?: boolean
+}
+
+class ThrowingRunStatement implements ControlStatement {
+  readonly #delegate: ControlStatement
+
+  constructor(delegate: ControlStatement) {
+    this.#delegate = delegate
+  }
+
+  bind(...values: readonly ControlBindingValue[]): ControlStatement {
+    this.#delegate.bind(...values)
+    return this
+  }
+
+  all<T>(): Promise<ControlQueryResult<T>> {
+    return this.#delegate.all<T>()
+  }
+
+  first<T>(): Promise<T | null> {
+    return this.#delegate.first<T>()
+  }
+
+  async run(): Promise<ControlRunResult> {
+    throw new Error("injected transition statement failure")
+  }
 }
 
 class FaultInjectingDatabase implements TransactionalControlDatabase {
@@ -187,10 +216,35 @@ class FaultInjectingDatabase implements TransactionalControlDatabase {
     this.#transitionBatchRan = true
     if (this.#faults.throwTransitionBatch) throw new Error("injected transition batch failure")
     if (this.#faults.dropTransitionBatch) return batchResults(4, 0)
-    return this.#delegate.batch(statements)
+    const executed =
+      this.#faults.throwAtTransitionStatement === undefined
+        ? statements
+        : statements.map((statement, index) =>
+            index === this.#faults.throwAtTransitionStatement
+              ? new ThrowingRunStatement(statement)
+              : statement,
+          )
+    const results = await this.#delegate.batch(executed)
+    if (this.#faults.throwAfterTransitionBatch) {
+      throw new Error("injected post-commit response loss")
+    }
+    return results
   }
 
   prepare(sql: string): ControlStatement {
+    if (
+      sql.includes('SELECT "event_json" FROM "nozzle_audit_log"') &&
+      sql.includes('AND "event_hash" = ?2') &&
+      Object.hasOwn(this.#faults, "auditEventRow")
+    ) {
+      return new ScriptedStatement(sql, { first: () => this.#faults.auditEventRow })
+    }
+    if (
+      sql.includes('FROM "nozzle_irreversible_authorization_receipts"') &&
+      Object.hasOwn(this.#faults, "authorizationReceiptRow")
+    ) {
+      return new ScriptedStatement(sql, { first: () => this.#faults.authorizationReceiptRow })
+    }
     if (
       sql.includes('FROM "nozzle_provider_attempts" AS "attempt"') &&
       Object.hasOwn(this.#faults, "providerAttemptRow")
@@ -226,7 +280,7 @@ class FaultInjectingDatabase implements TransactionalControlDatabase {
     if (
       this.#transitionBatchRan &&
       this.#faults.hideAuditAfterBatch &&
-      sql.includes('SELECT 1 AS "present" FROM "nozzle_audit_log"')
+      sql.includes('SELECT "event_json" FROM "nozzle_audit_log"')
     ) {
       return new ScriptedStatement(sql, { first: () => null })
     }
@@ -278,6 +332,35 @@ function planInput(
 
 async function sealedPlan(input: Parameters<typeof planInput>[0] = {}) {
   return sealTestPlan(planInput(input))
+}
+
+async function sealedIrreversiblePlan(operationId: string): Promise<OperationPlan> {
+  const input = planInput({
+    idempotencyKey: `${operationId}-key`,
+    inputChecksum: `${operationId}-input`,
+    operationId,
+  })
+  const firstStep = input.steps[0]
+  if (!firstStep) throw new Error("Fixture step is missing.")
+  return sealTestPlan({
+    ...input,
+    steps: [{ ...firstStep, checkpoint: "irreversible" }],
+  })
+}
+
+function canonicalRecordJson(value: unknown): string {
+  const canonical = (candidate: unknown): unknown => {
+    if (Array.isArray(candidate)) return candidate.map(canonical)
+    if (typeof candidate === "object" && candidate !== null) {
+      const output: Record<string, unknown> = {}
+      for (const key of Object.keys(candidate).sort()) {
+        output[key] = canonical((candidate as Record<string, unknown>)[key])
+      }
+      return output
+    }
+    return candidate
+  }
+  return JSON.stringify(canonical(value))
 }
 
 const payloads = new WeakMap<
@@ -1623,18 +1706,8 @@ describe("D1OperationStore", () => {
     ).resolves.toMatchObject({ disposition: "blocked" })
   })
 
-  it("accepts sealed authorization for an irreversible stored step", async () => {
-    const baseStep = planInput().steps[0]
-    if (!baseStep) throw new Error("Fixture step is missing.")
-    const plan = await sealTestPlan({
-      ...planInput({ operationId: "irreversible-operation" }),
-      steps: [
-        {
-          ...baseStep,
-          checkpoint: "irreversible",
-        },
-      ],
-    })
+  it("persists the complete canonical authorization in both durable projections and reloads it frozen", async () => {
+    const plan = await sealedIrreversiblePlan("irreversible-operation")
     await store.create(creationInput(plan))
     const leases = new D1LeaseStore(database)
     const acquired = await leases.acquire({
@@ -1658,10 +1731,132 @@ describe("D1OperationStore", () => {
       },
       digest,
     )
+    const accepted = await store.beginStep({
+      actorChecksum: "actor",
+      attemptId: "irreversible-attempt",
+      idempotencyKey: "step-a-key",
+      irreversibleAuthorization: authorization,
+      observedPreconditionChecksum: "step-a-pre",
+      operationId: plan.operationId,
+      proof,
+      stepId: "a",
+    })
+    expect(accepted).toMatchObject({
+      disposition: "execute",
+      operation: {
+        steps: {
+          a: {
+            authorizationChecksum: authorization.authorizationChecksum,
+            irreversibleAuthorization: authorization,
+            state: "running",
+          },
+        },
+      },
+    })
+
+    const current = database.database
+      .prepare(
+        `SELECT "record_json" FROM "nozzle_operation_steps"
+         WHERE "operation_id" = ? AND "step_id" = 'a'`,
+      )
+      .get(plan.operationId) as { readonly record_json: string }
+    const transition = database.database
+      .prepare(
+        `SELECT "to_record_json" FROM "nozzle_operation_transitions"
+         WHERE "operation_id" = ? AND "step_id" = 'a'`,
+      )
+      .get(plan.operationId) as { readonly to_record_json: string }
+    expect(transition.to_record_json).toBe(current.record_json)
+    expect(current.record_json).toBe(canonicalRecordJson(JSON.parse(current.record_json)))
+    expect(JSON.parse(current.record_json)).toMatchObject({
+      authorizationChecksum: authorization.authorizationChecksum,
+      irreversibleAuthorization: authorization,
+      state: "running",
+    })
+
+    const restarted = new D1OperationStore(database, digest)
+    const loaded = await restarted.get(plan.operationId)
+    const loadedStep = loaded?.operation.steps.a
+    expect(loadedStep?.irreversibleAuthorization).toEqual(authorization)
+    expect(loadedStep?.irreversibleAuthorization).not.toBe(authorization)
+    expect(Object.isFrozen(loadedStep)).toBe(true)
+    expect(Object.isFrozen(loadedStep?.irreversibleAuthorization)).toBe(true)
+
+    database.database.exec('DROP TRIGGER "nozzle_control_step_state_update";')
+    database.database
+      .prepare(
+        `UPDATE "nozzle_operation_steps" SET "record_json" = ?
+         WHERE "operation_id" = ? AND "step_id" = 'a'`,
+      )
+      .run(JSON.stringify(JSON.parse(current.record_json), null, 2), plan.operationId)
+    await expect(restarted.get(plan.operationId)).rejects.toThrow(
+      /step columns contradict the verified step record/u,
+    )
+  })
+
+  it("loads legacy checksum-only authorization for diagnosis but rejects dispatch and mutation", async () => {
+    const plan = await sealedIrreversiblePlan("legacy-authorization-operation")
+    await store.create(creationInput(plan))
+    const leases = new D1LeaseStore(database)
+    const acquired = await leases.acquire({
+      acquisitionId: "legacy-authorization-acquisition",
+      holderId: "legacy-authorization-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Fixture lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+    const authorization = await sealIrreversibleAuthorization(
+      plan,
+      {
+        actorChecksum: "legacy-actor",
+        authorizationId: "legacy-authorization",
+        decisionChecksum: "legacy-approved",
+        lease: acquired.record,
+        leaseProof: proof,
+        sealedAtServerTimeMs: 1,
+        stepId: "a",
+      },
+      digest,
+    )
+    await store.beginStep({
+      actorChecksum: "legacy-actor",
+      attemptId: "legacy-attempt",
+      idempotencyKey: "step-a-key",
+      irreversibleAuthorization: authorization,
+      observedPreconditionChecksum: "step-a-pre",
+      operationId: plan.operationId,
+      proof,
+      stepId: "a",
+    })
+    const row = database.database
+      .prepare(
+        `SELECT "record_json" FROM "nozzle_operation_steps"
+         WHERE "operation_id" = ? AND "step_id" = 'a'`,
+      )
+      .get(plan.operationId) as { readonly record_json: string }
+    const legacy = JSON.parse(row.record_json) as Record<string, unknown>
+    delete legacy.irreversibleAuthorization
+    expect(legacy.authorizationChecksum).toBe(authorization.authorizationChecksum)
+    database.database.exec('DROP TRIGGER "nozzle_control_step_state_update";')
+    database.database
+      .prepare(
+        `UPDATE "nozzle_operation_steps" SET "record_json" = ?
+         WHERE "operation_id" = ? AND "step_id" = 'a'`,
+      )
+      .run(canonicalRecordJson(legacy), plan.operationId)
+
+    const restarted = new D1OperationStore(database, digest)
+    const loaded = await restarted.get(plan.operationId)
+    expect(loaded?.operation.steps.a).toMatchObject({
+      authorizationChecksum: authorization.authorizationChecksum,
+      state: "running",
+    })
+    expect(loaded?.operation.steps.a).not.toHaveProperty("irreversibleAuthorization")
     await expect(
-      store.beginStep({
-        actorChecksum: "actor",
-        attemptId: "irreversible-attempt",
+      restarted.beginStep({
+        actorChecksum: "legacy-actor",
+        attemptId: "legacy-attempt",
         idempotencyKey: "step-a-key",
         irreversibleAuthorization: authorization,
         observedPreconditionChecksum: "step-a-pre",
@@ -1669,7 +1864,408 @@ describe("D1OperationStore", () => {
         proof,
         stepId: "a",
       }),
+    ).rejects.toThrow(/authorization record is incomplete or contradictory/u)
+    await expect(
+      restarted.completeStep({
+        actorChecksum: "legacy-actor",
+        attemptId: "legacy-attempt",
+        observedPostconditionChecksum: "step-a-post",
+        operationId: plan.operationId,
+        proof,
+        resultChecksum: "legacy-result",
+        stepId: "a",
+      }),
+    ).rejects.toThrow(/authorization record is incomplete or contradictory/u)
+    expect(
+      database.database
+        .prepare(
+          `SELECT count(*) AS "count" FROM "nozzle_operation_transitions"
+           WHERE "operation_id" = ?`,
+        )
+        .get(plan.operationId),
+    ).toEqual({ count: 1 })
+  })
+
+  it("fails closed when a committed irreversible transition loses its authorization receipt", async () => {
+    const plan = await sealedIrreversiblePlan("missing-authorization-receipt")
+    await store.create(creationInput(plan))
+    const leases = new D1LeaseStore(database)
+    const acquired = await leases.acquire({
+      acquisitionId: "missing-receipt-acquisition",
+      holderId: "missing-receipt-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Fixture lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+    const authorization = await sealIrreversibleAuthorization(
+      plan,
+      {
+        actorChecksum: "missing-receipt-actor",
+        authorizationId: "missing-receipt-authorization",
+        decisionChecksum: "missing-receipt-approved",
+        lease: acquired.record,
+        leaseProof: proof,
+        sealedAtServerTimeMs: 1,
+        stepId: "a",
+      },
+      digest,
+    )
+    const faulted = new D1OperationStore(
+      new FaultInjectingDatabase(database, { authorizationReceiptRow: null }),
+      digest,
+    )
+
+    await expect(
+      faulted.beginStep({
+        actorChecksum: "missing-receipt-actor",
+        attemptId: "missing-receipt-attempt",
+        idempotencyKey: "step-a-key",
+        irreversibleAuthorization: authorization,
+        observedPreconditionChecksum: "step-a-pre",
+        operationId: plan.operationId,
+        proof,
+        stepId: "a",
+      }),
+    ).rejects.toThrow(/lacks its exact authorization receipt/u)
+    expect((await store.get(plan.operationId))?.operation.steps.a).toMatchObject({
+      irreversibleAuthorization: authorization,
+      state: "running",
+    })
+  })
+
+  it("retains a distinct receipt for an authorized retry after proven non-application", async () => {
+    const plan = await sealedIrreversiblePlan("irreversible-authorized-retry")
+    await store.create(creationInput(plan))
+    const leases = new D1LeaseStore(database)
+    const acquired = await leases.acquire({
+      acquisitionId: "authorized-retry-acquisition",
+      holderId: "authorized-retry-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Fixture lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+    const seal = (suffix: string) =>
+      sealIrreversibleAuthorization(
+        plan,
+        {
+          actorChecksum: "authorized-retry-actor",
+          authorizationId: `authorized-retry-${suffix}`,
+          decisionChecksum: `authorized-retry-${suffix}-approved`,
+          lease: acquired.record,
+          leaseProof: proof,
+          sealedAtServerTimeMs: 1,
+          stepId: "a",
+        },
+        digest,
+      )
+    const first = await seal("first")
+    await store.beginStep({
+      actorChecksum: "authorized-retry-actor",
+      attemptId: "authorized-retry-attempt-1",
+      idempotencyKey: "step-a-key",
+      irreversibleAuthorization: first,
+      observedPreconditionChecksum: "step-a-pre",
+      operationId: plan.operationId,
+      proof,
+      stepId: "a",
+    })
+    await store.failStep({
+      actorChecksum: "authorized-retry-actor",
+      attemptId: "authorized-retry-attempt-1",
+      errorChecksum: "authorized-retry-not-applied",
+      operationId: plan.operationId,
+      outcome: "definitely_not_applied",
+      proof,
+      stepId: "a",
+    })
+    const second = await seal("second")
+    await expect(
+      store.beginStep({
+        actorChecksum: "authorized-retry-actor",
+        attemptId: "authorized-retry-attempt-2",
+        idempotencyKey: "step-a-key",
+        irreversibleAuthorization: second,
+        observedPreconditionChecksum: "step-a-pre",
+        operationId: plan.operationId,
+        proof,
+        stepId: "a",
+      }),
     ).resolves.toMatchObject({ disposition: "execute" })
+    expect(
+      database.database
+        .prepare(
+          `SELECT "authorization_id" FROM "nozzle_irreversible_authorization_receipts"
+           WHERE "transition_id" IN (
+             SELECT "transition_id" FROM "nozzle_operation_transitions"
+             WHERE "operation_id" = ? AND "step_id" = 'a'
+           ) ORDER BY "classified_at_ms", "transition_id"`,
+        )
+        .all(plan.operationId),
+    ).toEqual([
+      { authorization_id: first.authorizationId },
+      { authorization_id: second.authorizationId },
+    ])
+  })
+
+  it("rolls back the complete authorization receipt at every transition statement boundary", async () => {
+    const leases = new D1LeaseStore(database)
+    const acquired = await leases.acquire({
+      acquisitionId: "authorization-rollback-acquisition",
+      holderId: "authorization-rollback-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Fixture lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+
+    for (let position = 0; position < 4; position += 1) {
+      const operationId = `authorization-rollback-${position}`
+      const plan = await sealedIrreversiblePlan(operationId)
+      await store.create(creationInput(plan))
+      const authorization = await sealIrreversibleAuthorization(
+        plan,
+        {
+          actorChecksum: "rollback-actor",
+          authorizationId: `rollback-authorization-${position}`,
+          decisionChecksum: `rollback-approved-${position}`,
+          lease: acquired.record,
+          leaseProof: proof,
+          sealedAtServerTimeMs: 1,
+          stepId: "a",
+        },
+        digest,
+      )
+      const faulted = new D1OperationStore(
+        new FaultInjectingDatabase(database, { throwAtTransitionStatement: position }),
+        digest,
+      )
+      await expect(
+        faulted.beginStep({
+          actorChecksum: "rollback-actor",
+          attemptId: `rollback-attempt-${position}`,
+          idempotencyKey: "step-a-key",
+          irreversibleAuthorization: authorization,
+          observedPreconditionChecksum: "step-a-pre",
+          operationId,
+          proof,
+          stepId: "a",
+        }),
+      ).rejects.toThrow(/bounded transition retry budget/u)
+
+      const loaded = await store.get(operationId)
+      expect(loaded).toMatchObject({
+        operation: {
+          steps: {
+            a: {
+              startedAttempts: 0,
+              state: "pending",
+            },
+          },
+        },
+      })
+      expect(loaded?.operation.steps.a).not.toHaveProperty("authorizationChecksum")
+      expect(loaded?.operation.steps.a).not.toHaveProperty("irreversibleAuthorization")
+      expect(
+        database.database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_operation_transitions"
+             WHERE "operation_id" = ?`,
+          )
+          .get(operationId),
+      ).toEqual({ count: 0 })
+      expect(
+        database.database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_audit_log"
+             WHERE "operation_id" = ?`,
+          )
+          .get(operationId),
+      ).toEqual({ count: 1 })
+      expect(
+        database.database
+          .prepare(`SELECT "status" FROM "nozzle_operations" WHERE "operation_id" = ?`)
+          .get(operationId),
+      ).toEqual({ status: "planned" })
+    }
+  })
+
+  it("recovers an exact committed authorization after response loss and captures its accessor once", async () => {
+    const plan = await sealedIrreversiblePlan("authorization-response-loss")
+    await store.create(creationInput(plan))
+    const leases = new D1LeaseStore(database)
+    const acquired = await leases.acquire({
+      acquisitionId: "authorization-response-loss-acquisition",
+      holderId: "authorization-response-loss-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Fixture lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+    const authorization = await sealIrreversibleAuthorization(
+      plan,
+      {
+        actorChecksum: "response-loss-actor",
+        authorizationId: "response-loss-authorization",
+        decisionChecksum: "response-loss-approved",
+        lease: acquired.record,
+        leaseProof: proof,
+        sealedAtServerTimeMs: 1,
+        stepId: "a",
+      },
+      digest,
+    )
+    let authorizationReads = 0
+    const request = {
+      actorChecksum: "response-loss-actor",
+      attemptId: "response-loss-attempt",
+      idempotencyKey: "step-a-key",
+      get irreversibleAuthorization() {
+        authorizationReads += 1
+        return authorization
+      },
+      observedPreconditionChecksum: "step-a-pre",
+      operationId: plan.operationId,
+      proof,
+      stepId: "a",
+    }
+    const faulted = new D1OperationStore(
+      new FaultInjectingDatabase(database, { throwAfterTransitionBatch: true }),
+      digest,
+    )
+    await expect(faulted.beginStep(request)).resolves.toMatchObject({ disposition: "execute" })
+    expect(authorizationReads).toBe(1)
+    expect(
+      database.database
+        .prepare(
+          `SELECT count(*) AS "count" FROM "nozzle_operation_transitions"
+           WHERE "operation_id" = ?`,
+        )
+        .get(plan.operationId),
+    ).toEqual({ count: 1 })
+    expect(
+      database.database
+        .prepare(
+          `SELECT count(*) AS "count" FROM "nozzle_audit_log"
+           WHERE "operation_id" = ?`,
+        )
+        .get(plan.operationId),
+    ).toEqual({ count: 2 })
+    await expect(new D1OperationStore(database, digest).beginStep(request)).resolves.toMatchObject({
+      disposition: "in_progress",
+    })
+    expect(authorizationReads).toBe(2)
+  })
+
+  it("serializes exact authorization races and rejects a conflicting authorization race", async () => {
+    const leases = new D1LeaseStore(database)
+    const acquired = await leases.acquire({
+      acquisitionId: "authorization-race-acquisition",
+      holderId: "authorization-race-controller",
+      leaseKey: "fleet-a:operation",
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Fixture lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+
+    const exactPlan = await sealedIrreversiblePlan("exact-authorization-race")
+    await store.create(creationInput(exactPlan))
+    const exactAuthorization = await sealIrreversibleAuthorization(
+      exactPlan,
+      {
+        actorChecksum: "race-actor",
+        authorizationId: "exact-race-authorization",
+        decisionChecksum: "exact-race-approved",
+        lease: acquired.record,
+        leaseProof: proof,
+        sealedAtServerTimeMs: 1,
+        stepId: "a",
+      },
+      digest,
+    )
+    const exactRequest = {
+      actorChecksum: "race-actor",
+      attemptId: "exact-race-attempt",
+      idempotencyKey: "step-a-key",
+      irreversibleAuthorization: exactAuthorization,
+      observedPreconditionChecksum: "step-a-pre",
+      operationId: exactPlan.operationId,
+      proof,
+      stepId: "a",
+    }
+    const exact = await Promise.all([
+      new D1OperationStore(database, digest).beginStep(exactRequest),
+      new D1OperationStore(database, digest).beginStep(exactRequest),
+    ])
+    expect(
+      exact.every((decision) => ["execute", "in_progress"].includes(decision.disposition)),
+    ).toBe(true)
+    expect(exact.some((decision) => decision.disposition === "execute")).toBe(true)
+    expect(
+      database.database
+        .prepare(
+          `SELECT count(*) AS "count" FROM "nozzle_operation_transitions"
+           WHERE "operation_id" = ?`,
+        )
+        .get(exactPlan.operationId),
+    ).toEqual({ count: 1 })
+
+    const conflictingPlan = await sealedIrreversiblePlan("conflicting-authorization-race")
+    await store.create(creationInput(conflictingPlan))
+    const authorizationInputs = [
+      { authorizationId: "conflicting-authorization-a", decisionChecksum: "approved-a" },
+      { authorizationId: "conflicting-authorization-b", decisionChecksum: "approved-b" },
+    ] as const
+    const authorizations = await Promise.all(
+      authorizationInputs.map((candidate) =>
+        sealIrreversibleAuthorization(
+          conflictingPlan,
+          {
+            actorChecksum: "race-actor",
+            ...candidate,
+            lease: acquired.record,
+            leaseProof: proof,
+            sealedAtServerTimeMs: 1,
+            stepId: "a",
+          },
+          digest,
+        ),
+      ),
+    )
+    const conflicting = await Promise.allSettled(
+      authorizations.map((irreversibleAuthorization) =>
+        new D1OperationStore(database, digest).beginStep({
+          actorChecksum: "race-actor",
+          attemptId: "conflicting-race-attempt",
+          idempotencyKey: "step-a-key",
+          irreversibleAuthorization,
+          observedPreconditionChecksum: "step-a-pre",
+          operationId: conflictingPlan.operationId,
+          proof,
+          stepId: "a",
+        }),
+      ),
+    )
+    const fulfilled = conflicting.filter((result) => result.status === "fulfilled")
+    const rejected = conflicting.filter((result) => result.status === "rejected")
+    expect(fulfilled).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    expect(rejected[0]).toMatchObject({
+      reason: { code: "OperationInterventionRequiredError" },
+    })
+    const retained = await store.get(conflictingPlan.operationId)
+    expect(authorizations.map((candidate) => candidate.authorizationChecksum)).toContain(
+      retained?.operation.steps.a?.authorizationChecksum,
+    )
+    expect(
+      database.database
+        .prepare(
+          `SELECT count(*) AS "count" FROM "nozzle_operation_transitions"
+           WHERE "operation_id" = ?`,
+        )
+        .get(conflictingPlan.operationId),
+    ).toEqual({ count: 1 })
   })
 
   it("supports evidence-only not-applied reconciliation and records optional counters", async () => {
@@ -1880,6 +2476,7 @@ describe("D1OperationStore", () => {
         transitionRow: {
           acquisition_id: proof.acquisitionId,
           audit_event_hash: "wrong-audit",
+          created_at_ms: 1,
           fencing_token: proof.fencingToken,
           from_operation_status: "planned",
           from_record_json: "{}",
@@ -1909,6 +2506,34 @@ describe("D1OperationStore", () => {
         message,
       )
     }
+
+    const contradictoryAuditPlan = await prepare("contradictory-audit")
+    const contradictoryAudit = await appendAuditEvent(
+      undefined,
+      {
+        actorChecksum: "other-actor",
+        environmentId: "fleet-a",
+        eventType: "step.attempt.accepted",
+        fencingToken: proof.fencingToken,
+        idempotencyKey: "other-transition",
+        operationId: contradictoryAuditPlan.operationId,
+        payloadChecksum: "step-a-input",
+        serverTimeMs: 1,
+        stepId: "a",
+      },
+      digest,
+    )
+    const contradictoryAuditStore = new D1OperationStore(
+      new FaultInjectingDatabase(database, {
+        auditEventRow: { event_json: JSON.stringify(contradictoryAudit) },
+      }),
+      digest,
+    )
+    await expect(
+      contradictoryAuditStore.beginStep(
+        beginInput(contradictoryAuditPlan.operationId, "contradictory-audit"),
+      ),
+    ).rejects.toThrow(/contradictory audit event/u)
 
     const outcomePlan = await prepare("dropped-outcome")
     await store.beginStep(beginInput(outcomePlan.operationId, "outcome-attempt"))

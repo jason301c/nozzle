@@ -6,6 +6,8 @@ import {
   createOperationRecord,
   type DigestFunction,
   decideLeaseAcquisition,
+  encodeIrreversibleAuthorizationChecksumInput,
+  type IrreversibleAuthorization,
   leaseProof,
   loadAuditEvent,
   loadOperationRecord,
@@ -101,8 +103,58 @@ async function started(overrides: Partial<OperationStepPlanInput> = {}): Promise
   return decision.operation
 }
 
+async function authorizedStarted(overrides: Partial<OperationStepPlanInput> = {}): Promise<{
+  readonly authorization: IrreversibleAuthorization
+  readonly operation: OperationRecord
+}> {
+  const sealedPlan = await plan({
+    checkpoint: "irreversible",
+    effectProtocol: "saga_receipt",
+    retryClassification: "reconcile_first",
+    ...overrides,
+  })
+  const operation = createOperationRecord(sealedPlan)
+  const activeLease = lease()
+  const proof = leaseProof(activeLease)
+  const authorization = await sealIrreversibleAuthorization(
+    sealedPlan,
+    {
+      actorChecksum: "actor",
+      authorizationId: "authorization-1",
+      decisionChecksum: "decision",
+      lease: activeLease,
+      leaseProof: proof,
+      sealedAtServerTimeMs: 105,
+      stepId: "one",
+    },
+    digest,
+  )
+  const decision = beginOperationStep(operation, {
+    attemptId: "attempt-1",
+    idempotencyKey: "step-key",
+    irreversibleAuthorization: authorization,
+    lease: activeLease,
+    leaseProof: proof,
+    observedPreconditionChecksum: "precondition",
+    serverTimeMs: 110,
+    stepId: "one",
+  })
+  if (decision.disposition !== "execute") throw new Error("Fixture step did not start.")
+  return { authorization, operation: decision.operation }
+}
+
 async function roundTrip(operation: OperationRecord): Promise<OperationRecord> {
   return loadOperationRecord(JSON.parse(JSON.stringify(operation)) as unknown, digest)
+}
+
+async function resignAuthorization(
+  authorization: IrreversibleAuthorization,
+): Promise<IrreversibleAuthorization> {
+  const { authorizationChecksum: _authorizationChecksum, ...unsigned } = authorization
+  return {
+    ...unsigned,
+    authorizationChecksum: await digest(encodeIrreversibleAuthorizationChecksumInput(unsigned)),
+  }
 }
 
 function replaceStep(operation: OperationRecord, replacement: unknown): unknown {
@@ -402,7 +454,282 @@ describe("persisted operation record integrity", () => {
     })
     if (decision.disposition !== "execute") throw new Error("Fixture step did not start.")
     await expect(roundTrip(operation)).resolves.toEqual(operation)
-    await expect(roundTrip(decision.operation)).resolves.toEqual(decision.operation)
+    const loaded = await roundTrip(decision.operation)
+    expect(loaded).toEqual(decision.operation)
+    expect(loaded.steps.one?.irreversibleAuthorization).toEqual(authorization)
+    expect(loaded.steps.one?.irreversibleAuthorization).not.toBe(authorization)
+    expect(Object.isFrozen(loaded.steps.one?.irreversibleAuthorization)).toBe(true)
+    expect(
+      recordStepSuccess(loaded, {
+        attemptId: "attempt-1",
+        observedPostconditionChecksum: "postcondition",
+        resultChecksum: "trusted-after-load",
+        stepId: "one",
+      }).steps.one,
+    ).toMatchObject({
+      irreversibleAuthorization: authorization,
+      resultChecksum: "trusted-after-load",
+      state: "succeeded",
+    })
+  })
+
+  it("round trips the full authorization through every attempted durable state", async () => {
+    const { authorization, operation: running } = await authorizedStarted()
+    const retryable = recordStepFailure(running, {
+      attemptId: "attempt-1",
+      errorChecksum: "definitely-absent",
+      outcome: "definitely_not_applied",
+      stepId: "one",
+    })
+    const unknown = recordStepFailure(running, {
+      attemptId: "attempt-1",
+      errorChecksum: "lost-response",
+      outcome: "unknown",
+      stepId: "one",
+    })
+    const activeLease = lease()
+    const retried = beginOperationStep(retryable, {
+      attemptId: "attempt-2",
+      idempotencyKey: "step-key",
+      irreversibleAuthorization: authorization,
+      lease: activeLease,
+      leaseProof: leaseProof(activeLease),
+      observedPreconditionChecksum: "precondition",
+      serverTimeMs: 110,
+      stepId: "one",
+    })
+    if (retried.disposition !== "execute") throw new Error("Fixture retry did not start.")
+    const records = [
+      running,
+      recordStepSuccess(running, {
+        attemptId: "attempt-1",
+        observedPostconditionChecksum: "postcondition",
+        resultChecksum: "succeeded",
+        stepId: "one",
+      }),
+      retryable,
+      retried.operation,
+      recordStepFailure(running, {
+        attemptId: "attempt-1",
+        errorChecksum: "permanent",
+        outcome: "permanent",
+        stepId: "one",
+      }),
+      unknown,
+      markRunningStepsUnknownAfterCrash(running),
+      markRunningStepNotDispatchedAfterCrash(running, "one", "dispatch-absent"),
+      recordStepReconciliation(unknown, {
+        evidenceChecksum: "observed-applied",
+        observedPostconditionChecksum: "postcondition",
+        outcome: "applied",
+        resultChecksum: "reconciled",
+        stepId: "one",
+      }),
+      recordStepReconciliation(unknown, {
+        evidenceChecksum: "observed-absent",
+        outcome: "not_applied",
+        stepId: "one",
+      }),
+      recordStepReconciliation(unknown, {
+        evidenceChecksum: "indeterminate",
+        outcome: "indeterminate",
+        stepId: "one",
+      }),
+      recordSagaStepTerminalClassification(unknown, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "terminal-absence",
+        stepId: "one",
+      }),
+      recordSagaStepTerminalClassification(retryable, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "definitely-absent",
+        stepId: "one",
+      }),
+    ]
+
+    for (const record of records) {
+      const loaded = await roundTrip(record)
+      expect(loaded).toEqual(record)
+      expect(loaded.steps.one?.authorizationChecksum).toBe(authorization.authorizationChecksum)
+      expect(loaded.steps.one?.irreversibleAuthorization).toEqual(authorization)
+      expect(Object.isFrozen(loaded.steps.one?.irreversibleAuthorization)).toBe(true)
+    }
+  })
+
+  it("loads legacy checksum-only records only for quarantine and refuses later mutations", async () => {
+    const { authorization, operation: running } = await authorizedStarted()
+    const runningStep = running.steps.one
+    if (!runningStep) throw new Error("Fixture step is missing.")
+    const { irreversibleAuthorization: _authorization, ...legacyRunningStep } = runningStep
+    const loaded = await loadOperationRecord(replaceStep(running, legacyRunningStep), digest)
+
+    expect(loaded.steps.one).toEqual(legacyRunningStep)
+    expect(loaded.steps.one?.authorizationChecksum).toBeDefined()
+    expect(loaded.steps.one?.irreversibleAuthorization).toBeUndefined()
+    for (const mutate of [
+      () =>
+        recordStepSuccess(loaded, {
+          attemptId: "attempt-1",
+          observedPostconditionChecksum: "postcondition",
+          resultChecksum: "result",
+          stepId: "one",
+        }),
+      () =>
+        recordStepFailure(loaded, {
+          attemptId: "attempt-1",
+          errorChecksum: "failed",
+          outcome: "permanent",
+          stepId: "one",
+        }),
+      () => markRunningStepsUnknownAfterCrash(loaded),
+      () => markRunningStepNotDispatchedAfterCrash(loaded, "one", "dispatch-absent"),
+      () =>
+        recordSagaStepTerminalClassification(loaded, {
+          outcome: "not_applied",
+          receiptOutcomeChecksum: "terminal-absence",
+          stepId: "one",
+        }),
+    ]) {
+      expect(mutate).toThrowError(
+        expect.objectContaining({ code: "OperationInterventionRequiredError" }),
+      )
+    }
+
+    const unknown = recordStepFailure(running, {
+      attemptId: "attempt-1",
+      errorChecksum: "lost-response",
+      outcome: "unknown",
+      stepId: "one",
+    })
+    const unknownStep = unknown.steps.one
+    if (!unknownStep) throw new Error("Fixture unknown step is missing.")
+    const { irreversibleAuthorization: _unknownAuthorization, ...legacyUnknownStep } = unknownStep
+    const loadedUnknown = await loadOperationRecord(replaceStep(unknown, legacyUnknownStep), digest)
+    expect(() =>
+      recordStepReconciliation(loadedUnknown, {
+        evidenceChecksum: "observed-absent",
+        outcome: "not_applied",
+        stepId: "one",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+
+    const retryable = recordStepFailure(running, {
+      attemptId: "attempt-1",
+      errorChecksum: "definitely-absent",
+      outcome: "definitely_not_applied",
+      stepId: "one",
+    })
+    const retryableStep = retryable.steps.one
+    if (!retryableStep) throw new Error("Fixture retryable step is missing.")
+    const { irreversibleAuthorization: _retryAuthorization, ...legacyRetryableStep } = retryableStep
+    const loadedRetryable = await loadOperationRecord(
+      replaceStep(retryable, legacyRetryableStep),
+      digest,
+    )
+    const activeLease = lease()
+    expect(() =>
+      beginOperationStep(loadedRetryable, {
+        attemptId: "attempt-2",
+        idempotencyKey: "step-key",
+        irreversibleAuthorization: authorization,
+        lease: activeLease,
+        leaseProof: leaseProof(activeLease),
+        observedPreconditionChecksum: "precondition",
+        serverTimeMs: 110,
+        stepId: "one",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+  })
+
+  it("rejects incomplete, contradictory, tampered, and extended authorization bodies", async () => {
+    const { authorization, operation: running } = await authorizedStarted()
+    const stepRecord = running.steps.one
+    if (!stepRecord) throw new Error("Fixture step is missing.")
+    const { authorizationChecksum: _stepChecksum, ...bodyWithoutStepChecksum } = stepRecord
+    const { decisionChecksum: _decisionChecksum, ...bodyMissingField } = authorization
+    const malformed = [
+      bodyWithoutStepChecksum,
+      { ...stepRecord, authorizationChecksum: "different-from-body" },
+      {
+        ...stepRecord,
+        irreversibleAuthorization: { ...authorization, decisionChecksum: "tampered" },
+      },
+      {
+        ...stepRecord,
+        irreversibleAuthorization: { ...authorization, unexpected: "field" },
+      },
+      { ...stepRecord, irreversibleAuthorization: bodyMissingField },
+      { ...stepRecord, irreversibleAuthorization: null },
+      { ...stepRecord, irreversibleAuthorization: [] },
+    ]
+
+    for (const replacement of malformed) {
+      await expect(loadOperationRecord(replaceStep(running, replacement), digest)).rejects.toThrow()
+    }
+  })
+
+  it("rejects valid receipts bound to another plan, step, input, lease, or fence", async () => {
+    const { authorization, operation: running } = await authorizedStarted()
+    const stepRecord = running.steps.one
+    if (!stepRecord) throw new Error("Fixture step is missing.")
+    const mismatches = [
+      { field: "operation", value: { ...authorization, operationId: "operation-2" } },
+      { field: "plan", value: { ...authorization, planChecksum: "another-plan" } },
+      { field: "step", value: { ...authorization, stepId: "another-step" } },
+      { field: "input", value: { ...authorization, stepInputChecksum: "another-input" } },
+      { field: "lease", value: { ...authorization, leaseKey: "another-lease" } },
+      { field: "fence", value: { ...authorization, fencingToken: 2 } },
+    ]
+
+    for (const mismatch of mismatches) {
+      const resigned = await resignAuthorization(mismatch.value)
+      await expect(
+        loadOperationRecord(
+          replaceStep(running, {
+            ...stepRecord,
+            authorizationChecksum: resigned.authorizationChecksum,
+            irreversibleAuthorization: resigned,
+          }),
+          digest,
+        ),
+        mismatch.field,
+      ).rejects.toThrow(/different immutable plan|different operation fence/u)
+    }
+  })
+
+  it("captures nested authorization accessors once and rejects nested proxies", async () => {
+    const { authorization, operation: running } = await authorizedStarted()
+    const serialized = structuredClone(running) as unknown as {
+      plan: OperationPlan
+      steps: Record<string, Record<string, unknown>>
+    }
+    const serializedStep = serialized.steps.one
+    if (!serializedStep) throw new Error("Serialized fixture step is missing.")
+    let bodyReads = 0
+    Object.defineProperty(serializedStep, "irreversibleAuthorization", {
+      enumerable: true,
+      get() {
+        bodyReads += 1
+        return bodyReads === 1 ? { ...authorization } : { ...authorization, stepId: "changed" }
+      },
+    })
+
+    const loaded = await loadOperationRecord(serialized, digest)
+    expect(bodyReads).toBe(1)
+    expect(loaded).toEqual(running)
+    expect(Object.isFrozen(loaded.steps.one?.irreversibleAuthorization)).toBe(true)
+
+    const proxied = structuredClone(running) as unknown as {
+      plan: OperationPlan
+      steps: Record<string, Record<string, unknown>>
+    }
+    const proxiedStep = proxied.steps.one
+    if (!proxiedStep) throw new Error("Serialized proxy fixture step is missing.")
+    proxiedStep.irreversibleAuthorization = new Proxy({ ...authorization }, {})
+    await expect(loadOperationRecord(proxied, digest)).rejects.toMatchObject({
+      code: "OperationInterventionRequiredError",
+      message: "The persisted operation record could not be captured safely.",
+    })
   })
 
   it("accepts ordinary and null-prototype serialized records but rejects other containers", async () => {

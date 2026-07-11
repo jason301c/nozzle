@@ -5,6 +5,7 @@ import {
   createOperationRecord,
   createSagaRecord,
   type DigestFunction,
+  type IrreversibleAuthorization,
   type LeaseProof,
   loadAuditEvent,
   loadOperationRecord,
@@ -78,6 +79,7 @@ interface HistoricalStepRow {
 interface TransitionReceiptRow {
   readonly acquisition_id: string
   readonly audit_event_hash: string
+  readonly created_at_ms: number
   readonly fencing_token: number
   readonly from_operation_status: string
   readonly from_record_json: string
@@ -87,6 +89,14 @@ interface TransitionReceiptRow {
   readonly step_id: string
   readonly to_operation_status: string
   readonly to_record_json: string
+  readonly transition_id: string
+}
+
+interface IrreversibleAuthorizationReceiptRow {
+  readonly authorization_checksum: string
+  readonly authorization_id: string | null
+  readonly classified_at_ms: number
+  readonly protocol_version: number
   readonly transition_id: string
 }
 
@@ -156,7 +166,7 @@ export interface InitializeSagaInput {
   readonly stepInputChecksums: Readonly<Record<string, string>>
 }
 
-export interface BeginCoordinatedSagaActionInput {
+interface CoordinatedSagaActionIdentityInput {
   readonly actorChecksum: string
   readonly attemptId: string
   readonly operationId: string
@@ -166,9 +176,13 @@ export interface BeginCoordinatedSagaActionInput {
   readonly stepId: string
 }
 
-export type SettleCoordinatedSagaActionInput = BeginCoordinatedSagaActionInput
-export type SettleCoordinatedSagaObservationInput = BeginCoordinatedSagaActionInput
-export interface RecoverCoordinatedSagaActionInput extends BeginCoordinatedSagaActionInput {
+export interface BeginCoordinatedSagaActionInput extends CoordinatedSagaActionIdentityInput {
+  readonly irreversibleAuthorization?: IrreversibleAuthorization
+}
+
+export type SettleCoordinatedSagaActionInput = CoordinatedSagaActionIdentityInput
+export type SettleCoordinatedSagaObservationInput = CoordinatedSagaActionIdentityInput
+export interface RecoverCoordinatedSagaActionInput extends CoordinatedSagaActionIdentityInput {
   readonly recoveryId: string
 }
 
@@ -283,17 +297,22 @@ async function checkedDigest(
   return boundedText(await digest(frame(domain, values)), "Saga coordinator checksum")
 }
 
-function mutationResults(results: readonly ControlRunResult[], expected: number): void {
+function mutationResults(
+  results: readonly ControlRunResult[],
+  expected: number,
+  transitionIncludesAuthorizationReceipt = false,
+): void {
   if (!Array.isArray(results) || results.length !== expected) {
     intervention("Control D1 returned an incomplete coupled saga batch result.")
   }
-  for (const result of results) {
+  for (const [index, result] of results.entries()) {
     const changes = result.meta.changes
+    const maximumChanges = transitionIncludesAuthorizationReceipt && index === 0 ? 2 : 1
     if (
       result.success !== true ||
       !Number.isSafeInteger(changes) ||
       (changes as number) < 0 ||
-      (changes as number) > 1
+      (changes as number) > maximumChanges
     ) {
       intervention("Control D1 returned malformed coupled saga mutation metadata.")
     }
@@ -302,6 +321,19 @@ function mutationResults(results: readonly ControlRunResult[], expected: number)
 
 function sameOperation(left: OperationRecord, right: OperationRecord): boolean {
   return encode(left) === encode(right)
+}
+
+function isIrreversibleAuthorizationDispatch(input: CoupledTransition): boolean {
+  const plan = input.beforeOperation.operation.plan.steps.find(
+    (step) => step.stepId === input.stepId,
+  ) as OperationStepPlan
+  const before = input.beforeOperation.operation.steps[input.stepId] as OperationStepRecord
+  const after = input.afterOperation.steps[input.stepId] as OperationStepRecord
+  return (
+    plan.checkpoint === "irreversible" &&
+    (before.state === "pending" || before.state === "retryable_failed") &&
+    after.state === "running"
+  )
 }
 
 function sameSaga(left: SagaRecord, right: SagaRecord): boolean {
@@ -1780,6 +1812,34 @@ export class D1SagaCoordinatorStore {
     ) {
       return intervention("The coupled saga transition receipt is contradictory.")
     }
+    if (isIrreversibleAuthorizationDispatch(input)) {
+      const authorization = afterRecord.irreversibleAuthorization
+      const authorizationReceipt = await this.#database
+        .prepare(
+          `SELECT "transition_id", "authorization_id", "authorization_checksum",
+                  "protocol_version", "classified_at_ms"
+           FROM "nozzle_irreversible_authorization_receipts" WHERE "transition_id" = ?1`,
+        )
+        .bind(input.transitionId)
+        .first<IrreversibleAuthorizationReceiptRow>()
+      if (
+        authorization === undefined ||
+        authorizationReceipt === null ||
+        authorizationReceipt.transition_id !== input.transitionId ||
+        authorizationReceipt.authorization_id !== authorization.authorizationId ||
+        authorizationReceipt.authorization_checksum !== authorization.authorizationChecksum ||
+        authorizationReceipt.protocol_version !== 2 ||
+        !Number.isSafeInteger(transition.created_at_ms) ||
+        transition.created_at_ms < 0 ||
+        authorizationReceipt.classified_at_ms !== transition.created_at_ms ||
+        !Number.isSafeInteger(authorizationReceipt.classified_at_ms) ||
+        authorizationReceipt.classified_at_ms < 0
+      ) {
+        return intervention(
+          "The irreversible saga transition lacks its exact authorization receipt.",
+        )
+      }
+    }
     const effect = await this.#database
       .prepare(`SELECT * FROM "nozzle_operation_effects" WHERE "effect_id" = ?1`)
       .bind(input.effectId)
@@ -1884,7 +1944,9 @@ export class D1SagaCoordinatorStore {
     } catch {
       // A conflict may be an exact concurrent winner; immutable receipts decide below.
     }
-    if (results !== undefined) mutationResults(results, statements.length)
+    if (results !== undefined) {
+      mutationResults(results, statements.length, isIrreversibleAuthorizationDispatch(input))
+    }
     return this.#verify(input, recordJson, recordChecksum)
   }
 
@@ -2051,6 +2113,7 @@ export class D1SagaCoordinatorStore {
   }
 
   async beginAction(input: BeginCoordinatedSagaActionInput): Promise<SagaBeginDecision> {
+    const irreversibleAuthorization = input.irreversibleAuthorization
     boundedText(input.actorChecksum, "Saga coordinator actor checksum")
     boundedText(input.attemptId, "Saga action attempt ID")
     const operationStepId = sagaActionOperationStepId(input.stepId, input.phase)
@@ -2068,6 +2131,7 @@ export class D1SagaCoordinatorStore {
       const operationDecision = beginOperationStep(beforeOperation.operation, {
         attemptId: input.attemptId,
         idempotencyKey: action.idempotencyKey,
+        ...(irreversibleAuthorization === undefined ? {} : { irreversibleAuthorization }),
         lease: authorized.record,
         leaseProof: input.proof,
         observedPreconditionChecksum: planStep.preconditionChecksum,

@@ -73,9 +73,14 @@ interface AuditSnapshotRow {
   readonly now_ms: number
 }
 
+interface AuditEventRow {
+  readonly event_json: string
+}
+
 interface TransitionRow {
   readonly acquisition_id: string
   readonly audit_event_hash: string
+  readonly created_at_ms: number
   readonly fencing_token: number
   readonly from_operation_status: string
   readonly from_record_json: string
@@ -85,6 +90,14 @@ interface TransitionRow {
   readonly step_id: string
   readonly to_operation_status: string
   readonly to_record_json: string
+  readonly transition_id: string
+}
+
+interface IrreversibleAuthorizationReceiptRow {
+  readonly authorization_checksum: string
+  readonly authorization_id: string | null
+  readonly classified_at_ms: number
+  readonly protocol_version: number
   readonly transition_id: string
 }
 
@@ -286,19 +299,21 @@ function loadRequiredShards(value: unknown): readonly string[] {
 function validateMutationResults(
   results: readonly ControlRunResult[],
   expectedCount: number,
+  transitionIncludesAuthorizationReceipt = false,
 ): readonly number[] {
   if (!Array.isArray(results) || results.length !== expectedCount) {
     return intervention("Control D1 returned an incomplete operation batch result.")
   }
   const changes: number[] = []
-  for (const result of results) {
+  for (const [index, result] of results.entries()) {
     const count = result.meta.changes
+    const maximumChanges = transitionIncludesAuthorizationReceipt && index === 0 ? 2 : 1
     if (
       result.success !== true ||
       typeof count !== "number" ||
       !Number.isSafeInteger(count) ||
       count < 0 ||
-      count > 1
+      count > maximumChanges
     ) {
       return intervention("Control D1 returned malformed operation mutation metadata.")
     }
@@ -513,6 +528,7 @@ export class D1OperationStore {
         stepRow.idempotency_key !== planStep.idempotencyKey ||
         stepRow.lease_key !== planStep.leaseKey ||
         stepRow.plan_json !== JSON.stringify(planStep) ||
+        stepRow.record_json !== operationStepRecordJson(record) ||
         stepRow.state !== record.state ||
         stepRow.fencing_token !== (record.fencingToken ?? null)
       ) {
@@ -758,7 +774,8 @@ export class D1OperationStore {
       .prepare(
         `SELECT "transition_id", "operation_id", "step_id", "from_record_json",
                 "to_record_json", "from_operation_status", "to_operation_status",
-                "audit_event_hash", "fencing_token", "lease_key", "holder_id", "acquisition_id"
+                "audit_event_hash", "fencing_token", "lease_key", "holder_id", "acquisition_id",
+                "created_at_ms"
          FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1`,
       )
       .bind(transitionId)
@@ -776,6 +793,8 @@ export class D1OperationStore {
       typeof row.to_operation_status !== "string" ||
       typeof row.audit_event_hash !== "string" ||
       row.audit_event_hash.trim() === "" ||
+      !Number.isSafeInteger(row.created_at_ms) ||
+      row.created_at_ms < 0 ||
       typeof row.lease_key !== "string" ||
       row.lease_key.trim() === "" ||
       typeof row.holder_id !== "string" ||
@@ -787,6 +806,21 @@ export class D1OperationStore {
     ) {
       return intervention("Persisted operation transition receipt is malformed.")
     }
+    return Object.freeze(row)
+  }
+
+  async #irreversibleAuthorizationReceipt(
+    transitionId: string,
+  ): Promise<IrreversibleAuthorizationReceiptRow | undefined> {
+    const row = await this.#database
+      .prepare(
+        `SELECT "transition_id", "authorization_id", "authorization_checksum",
+                "protocol_version", "classified_at_ms"
+         FROM "nozzle_irreversible_authorization_receipts" WHERE "transition_id" = ?1`,
+      )
+      .bind(transitionId)
+      .first<IrreversibleAuthorizationReceiptRow>()
+    if (row === null) return undefined
     return Object.freeze(row)
   }
 
@@ -813,6 +847,10 @@ export class D1OperationStore {
     ) as OperationStepPlan
     const beforeRecord = input.before.operation.steps[input.stepId] as OperationStepRecord
     const afterRecord = after.operation.steps[input.stepId] as OperationStepRecord
+    const authorizationDispatch =
+      planStep.checkpoint === "irreversible" &&
+      (beforeRecord.state === "pending" || beforeRecord.state === "retryable_failed") &&
+      afterRecord.state === "running"
     if (planStep.leaseKey !== input.proof.leaseKey) {
       return resume("The operation transition was authorized under the wrong lease key.")
     }
@@ -967,7 +1005,9 @@ export class D1OperationStore {
     } catch {
       // The audit head or step may have advanced. Exact receipt validation below decides replay.
     }
-    if (results !== undefined) validateMutationResults(results, statements.length)
+    if (results !== undefined) {
+      validateMutationResults(results, statements.length, authorizationDispatch)
+    }
     const receipt = await this.#transition(input.transitionId)
     if (!receipt) return undefined
     if (
@@ -977,13 +1017,29 @@ export class D1OperationStore {
       receipt.to_record_json !== afterJson ||
       receipt.from_operation_status !== fromStatus ||
       receipt.to_operation_status !== toStatus ||
-      receipt.audit_event_hash !== audit.eventHash ||
       receipt.fencing_token !== input.proof.fencingToken ||
       receipt.lease_key !== input.proof.leaseKey ||
       receipt.holder_id !== input.proof.holderId ||
       receipt.acquisition_id !== input.proof.acquisitionId
     ) {
       return intervention("An operation transition ID is bound to contradictory durable state.")
+    }
+    if (authorizationDispatch) {
+      const authorization = afterRecord.irreversibleAuthorization
+      const authorizationReceipt = await this.#irreversibleAuthorizationReceipt(input.transitionId)
+      if (
+        authorization === undefined ||
+        authorizationReceipt === undefined ||
+        authorizationReceipt.transition_id !== input.transitionId ||
+        authorizationReceipt.authorization_id !== authorization.authorizationId ||
+        authorizationReceipt.authorization_checksum !== authorization.authorizationChecksum ||
+        authorizationReceipt.protocol_version !== 2 ||
+        authorizationReceipt.classified_at_ms !== receipt.created_at_ms
+      ) {
+        return intervention(
+          "An irreversible operation transition lacks its exact authorization receipt.",
+        )
+      }
     }
     const persisted = await this.get(input.before.operation.plan.operationId)
     if (!persisted) return intervention("A transition receipt references a missing operation.")
@@ -1007,18 +1063,36 @@ export class D1OperationStore {
     }
     const auditRow = await this.#database
       .prepare(
-        `SELECT 1 AS "present" FROM "nozzle_audit_log"
+        `SELECT "event_json" FROM "nozzle_audit_log"
          WHERE "environment_id" = ?1 AND "event_hash" = ?2`,
       )
-      .bind(input.before.environmentId, audit.eventHash)
-      .first<{ readonly present: number }>()
-    if (auditRow?.present !== 1) {
+      .bind(input.before.environmentId, receipt.audit_event_hash)
+      .first<AuditEventRow>()
+    if (auditRow === null) {
       return intervention("A transition receipt was committed without its audit event.")
+    }
+    const persistedAudit = await loadAuditEvent(
+      parseJson(auditRow.event_json, "Persisted transition audit event"),
+      this.#digest,
+    )
+    if (
+      persistedAudit.actorChecksum !== input.actorChecksum ||
+      persistedAudit.environmentId !== input.before.environmentId ||
+      persistedAudit.eventHash !== receipt.audit_event_hash ||
+      persistedAudit.eventType !== input.auditEventType ||
+      persistedAudit.fencingToken !== input.proof.fencingToken ||
+      persistedAudit.idempotencyKey !== input.transitionId ||
+      persistedAudit.operationId !== input.before.operation.plan.operationId ||
+      persistedAudit.payloadChecksum !== input.auditPayloadChecksum ||
+      persistedAudit.stepId !== input.stepId
+    ) {
+      return intervention("A transition receipt is bound to a contradictory audit event.")
     }
     return persisted
   }
 
   async beginStep(input: BeginStoredOperationStepInput): Promise<StepInvocationDecision> {
+    const irreversibleAuthorization = input.irreversibleAuthorization
     nonEmpty(input.operationId, "Operation ID")
     nonEmpty(input.actorChecksum, "Transition actor checksum")
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt += 1) {
@@ -1028,9 +1102,7 @@ export class D1OperationStore {
       const decision = beginOperationStep(before.operation, {
         attemptId: input.attemptId,
         idempotencyKey: input.idempotencyKey,
-        ...(input.irreversibleAuthorization === undefined
-          ? {}
-          : { irreversibleAuthorization: input.irreversibleAuthorization }),
+        ...(irreversibleAuthorization === undefined ? {} : { irreversibleAuthorization }),
         lease: authorized.record,
         leaseProof: input.proof,
         observedPreconditionChecksum: input.observedPreconditionChecksum,
