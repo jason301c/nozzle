@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  type AtomicStepOutcome,
   appendAuditEvent,
   beginOperationStep,
   createOperationRecord,
@@ -13,6 +14,7 @@ import {
   type OperationPlan,
   type OperationRecord,
   type OperationStepPlanInput,
+  recordAtomicStepOutcome,
   recordSagaStepTerminalClassification,
   recordStepFailure,
   recordStepReconciliation,
@@ -70,6 +72,18 @@ function lease() {
   return decision.record
 }
 
+function atomicInput(outcome: AtomicStepOutcome) {
+  const activeLease = lease()
+  return {
+    attemptId: "atomic-attempt-1",
+    idempotencyKey: "step-key",
+    leaseProof: leaseProof(activeLease),
+    observedPreconditionChecksum: "precondition",
+    outcome,
+    stepId: "one",
+  }
+}
+
 async function started(overrides: Partial<OperationStepPlanInput> = {}): Promise<OperationRecord> {
   const operation = createOperationRecord(await plan(overrides))
   const activeLease = lease()
@@ -101,6 +115,22 @@ describe("persisted operation record integrity", () => {
   it("round trips every reachable durable step-state shape", async () => {
     const pending = createOperationRecord(await plan())
     const running = await started()
+    const atomicSucceeded = recordAtomicStepOutcome(
+      pending,
+      atomicInput({
+        observedPostconditionChecksum: "postcondition",
+        resultChecksum: "atomic-result",
+        state: "succeeded",
+      }),
+    )
+    const atomicFailed = recordAtomicStepOutcome(
+      createOperationRecord(await plan()),
+      atomicInput({ errorChecksum: "atomic-error", state: "failed" }),
+    )
+    const atomicIntervention = recordAtomicStepOutcome(
+      createOperationRecord(await plan()),
+      atomicInput({ evidenceChecksum: "atomic-evidence", state: "intervention_required" }),
+    )
     const succeeded = recordStepSuccess(running, {
       attemptId: "attempt-1",
       counters: { cost: { providerCalls: 1 }, progress: { resources: 1 } },
@@ -202,6 +232,9 @@ describe("persisted operation record integrity", () => {
     for (const operation of [
       pending,
       running,
+      atomicSucceeded,
+      atomicFailed,
+      atomicIntervention,
       succeeded,
       retryable,
       failed,
@@ -225,6 +258,23 @@ describe("persisted operation record integrity", () => {
       if (loaded.steps.conditional !== undefined) {
         expect(Object.isFrozen(loaded.steps.conditional)).toBe(true)
       }
+    }
+  })
+
+  it("round trips atomic terminal records as exact duplicate replays", async () => {
+    for (const outcome of [
+      {
+        observedPostconditionChecksum: "postcondition",
+        resultChecksum: "atomic-result",
+        state: "succeeded",
+      },
+      { errorChecksum: "atomic-error", state: "failed" },
+      { evidenceChecksum: "atomic-evidence", state: "intervention_required" },
+    ] satisfies readonly AtomicStepOutcome[]) {
+      const input = atomicInput(outcome)
+      const committed = recordAtomicStepOutcome(createOperationRecord(await plan()), input)
+      const loaded = await roundTrip(committed)
+      expect(recordAtomicStepOutcome(loaded, input)).toBe(loaded)
     }
   })
 

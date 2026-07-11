@@ -14,10 +14,12 @@ import {
   markRunningStepUnknownAfterCrash,
   markSagaActionNotDispatched,
   NozzleError,
+  nextSagaCommand,
   type OperationRecord,
   type OperationStepPlan,
   type OperationStepRecord,
   operationStatus,
+  recordAtomicStepOutcome,
   recordSagaActionFailure,
   recordSagaActionSuccess,
   recordSagaObservation,
@@ -25,6 +27,7 @@ import {
   recordStepFailure,
   recordStepReconciliation,
   recordStepSuccess,
+  requestSagaTermination,
   type SagaActionPhase,
   type SagaActionRecord,
   type SagaBeginDecision,
@@ -48,6 +51,7 @@ import { D1SagaAttemptStore, type SagaAttemptRecord } from "./saga-attempt-store
 import {
   D1SagaStore,
   SAGA_INIT_OPERATION_STEP_ID,
+  SAGA_TERMINATION_OPERATION_STEP_ID,
   sagaActionOperationStepId,
 } from "./saga-store.js"
 
@@ -123,6 +127,10 @@ interface CoupledTransition {
     readonly mode: SagaRecoveryMode
   }
   readonly stepId: string
+  readonly terminationGuard?: {
+    readonly cause: "cancellation" | "timeout"
+    readonly sagaId: string
+  }
   readonly transitionId: string
 }
 
@@ -164,6 +172,22 @@ export interface RecoverCoordinatedSagaActionInput extends BeginCoordinatedSagaA
   readonly recoveryId: string
 }
 
+export interface RequestCoordinatedSagaTerminationInput {
+  readonly actorChecksum: string
+  readonly cause: "cancellation" | "timeout"
+  readonly operationId: string
+  readonly proof: LeaseProof
+  readonly requestChecksum: string
+  readonly requestId: string
+  readonly sagaId: string
+}
+
+interface SagaTerminationReceiptIdentity {
+  readonly attemptId: string
+  readonly evidenceChecksum: string
+  readonly transitionId: string
+}
+
 function configuration(message: string): never {
   throw new NozzleError("ConfigurationError", message)
 }
@@ -176,14 +200,51 @@ function resume(message: string): never {
   throw new NozzleError("OperationResumeRequiredError", message)
 }
 
+function isWellFormedUtf16(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1)
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false
+      index += 1
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false
+    }
+  }
+  return true
+}
+
 function boundedText(value: unknown, label: string): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     return configuration(`${label} must be non-empty.`)
   }
-  if (new TextEncoder().encode(value).byteLength > MAX_IDENTITY_BYTES) {
+  if (!isWellFormedUtf16(value)) {
+    return configuration(`${label} cannot contain unpaired UTF-16 surrogates.`)
+  }
+  const encoded = new TextEncoder().encode(value)
+  if (encoded.byteLength > MAX_IDENTITY_BYTES) {
     return configuration(`${label} exceeds the durable coordinator identity limit.`)
   }
   return value
+}
+
+function terminationPlanStep(operation: OperationRecord): OperationStepPlan {
+  const step = operation.plan.steps.find(
+    (candidate) => candidate.stepId === SAGA_TERMINATION_OPERATION_STEP_ID,
+  )
+  if (
+    !operation.plan.operationType.startsWith("saga:") ||
+    step === undefined ||
+    step.activation !== "conditional" ||
+    step.checkpoint !== "reversible" ||
+    step.completionRole !== "work" ||
+    step.dependsOn.length !== 0 ||
+    step.effectProtocol !== "opaque" ||
+    step.retryClassification !== "idempotent"
+  ) {
+    return intervention("Saga termination lacks its canonical sealed operation step.")
+  }
+  return step
 }
 
 function canonicalValue(value: unknown): unknown {
@@ -344,6 +405,16 @@ function receiptConsumerMatches(receipt: SagaAttemptRecord, proof: LeaseProof): 
   )
 }
 
+function transitionConsumerMatches(transition: TransitionReceiptRow, proof: LeaseProof): boolean {
+  return (
+    transition.lease_key === proof.leaseKey &&
+    (proof.fencingToken > transition.fencing_token ||
+      (proof.fencingToken === transition.fencing_token &&
+        transition.holder_id === proof.holderId &&
+        transition.acquisition_id === proof.acquisitionId))
+  )
+}
+
 function classifiedEffectKind(
   phase: SagaActionPhase,
   receipt: Exclude<SagaAttemptRecord, { readonly state: "accepted" }>,
@@ -485,6 +556,27 @@ export class D1SagaCoordinatorStore {
     return `${kind}:${await checkedDigest(this.#digest, COORDINATOR_ID_DOMAIN, [kind, ...values])}`
   }
 
+  async #terminationIdentity(
+    input: RequestCoordinatedSagaTerminationInput,
+  ): Promise<SagaTerminationReceiptIdentity> {
+    const requestIdentity = [input.operationId, input.sagaId, input.requestId]
+    const attemptId = await this.#identity("saga-termination-attempt", requestIdentity)
+    return Object.freeze({
+      attemptId,
+      evidenceChecksum: await checkedDigest(this.#digest, COORDINATOR_ID_DOMAIN, [
+        "saga-termination-evidence",
+        ...requestIdentity,
+        input.requestChecksum,
+        input.cause,
+      ]),
+      transitionId: operationTransitionIdentity("succeeded", [
+        input.operationId,
+        SAGA_TERMINATION_OPERATION_STEP_ID,
+        attemptId,
+      ]),
+    })
+  }
+
   async #recordChecksum(recordJson: string): Promise<string> {
     return checkedDigest(this.#digest, RECORD_DOMAIN, [recordJson])
   }
@@ -593,18 +685,13 @@ export class D1SagaCoordinatorStore {
     if (saga === undefined) {
       return intervention("Saga initialization has no current projection.")
     }
-    const currentProof = initialization.proof
     if (
       !exactColumns(transition as unknown as Record<string, unknown>, {
         operation_id: initialization.operationId,
         step_id: SAGA_INIT_OPERATION_STEP_ID,
         transition_id: transitionId,
       }) ||
-      transition.lease_key !== currentProof.leaseKey ||
-      currentProof.fencingToken < transition.fencing_token ||
-      (currentProof.fencingToken === transition.fencing_token &&
-        (currentProof.holderId !== transition.holder_id ||
-          currentProof.acquisitionId !== transition.acquisition_id))
+      !transitionConsumerMatches(transition, initialization.proof)
     ) {
       return intervention("Saga initialization has a contradictory operation transition.")
     }
@@ -682,6 +769,210 @@ export class D1SagaCoordinatorStore {
       return intervention("Saga initialization replay lost its immutable transition.")
     }
     return committed.saga
+  }
+
+  async #terminationReceiptProjection(input: {
+    readonly cause: "cancellation" | "timeout"
+    readonly identity: SagaTerminationReceiptIdentity
+    readonly operationId: string
+    readonly proof: LeaseProof
+    readonly sagaId: string
+  }): Promise<SagaRecord | undefined> {
+    const transition = await this.#database
+      .prepare(`SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1`)
+      .bind(input.identity.transitionId)
+      .first<TransitionReceiptRow>()
+    if (transition === null) return undefined
+    const operation = await this.#operation(input.operationId)
+    const saga = await this.#saga(input.sagaId, input.operationId)
+    if (saga === undefined) {
+      return intervention("Saga termination has no current projection.")
+    }
+    if (
+      !exactColumns(transition as unknown as Record<string, unknown>, {
+        operation_id: input.operationId,
+        step_id: SAGA_TERMINATION_OPERATION_STEP_ID,
+        transition_id: input.identity.transitionId,
+      }) ||
+      !transitionConsumerMatches(transition, input.proof)
+    ) {
+      return intervention("Saga termination has a contradictory operation transition.")
+    }
+    const auditRow = await this.#database
+      .prepare(
+        `SELECT "event_json" FROM "nozzle_audit_log"
+         WHERE "environment_id" = ?1 AND "event_hash" = ?2`,
+      )
+      .bind(operation.environmentId, transition.audit_event_hash)
+      .first<AuditEventRow>()
+    if (auditRow === null) {
+      return intervention("Saga termination lacks its exact audit event.")
+    }
+    const audit = await loadAuditEvent(
+      persistedJson(auditRow.event_json, "The saga termination audit event"),
+      this.#digest,
+    )
+    const effects = await this.#database
+      .prepare(
+        `SELECT * FROM "nozzle_operation_effects"
+         WHERE "transition_id" = ?1 AND "resource_kind" = 'saga' AND "resource_id" = ?2
+         ORDER BY "effect_id"`,
+      )
+      .bind(input.identity.transitionId, input.sagaId)
+      .all<EffectReceiptRow>()
+    if (effects.results.length === 0) {
+      return intervention("Saga termination lacks its exact coupled effect receipt.")
+    }
+    if (effects.results.length !== 1) {
+      return intervention("Saga termination has ambiguous coupled effect receipts.")
+    }
+    const effect = effects.results[0] as EffectReceiptRow
+    const afterSaga = await this.#historicalSaga(effect)
+    if (afterSaga.stateVersion < 1 || afterSaga.terminationRequestedAtMs === null) {
+      return intervention("Saga termination effect has no valid predecessor or request time.")
+    }
+    const priorEffect = await this.#database
+      .prepare(
+        `SELECT * FROM "nozzle_operation_effects"
+         WHERE "resource_kind" = 'saga' AND "resource_id" = ?1 AND "to_state_version" = ?2`,
+      )
+      .bind(input.sagaId, afterSaga.stateVersion - 1)
+      .first<EffectReceiptRow>()
+    if (priorEffect === null) {
+      return intervention("Saga termination lacks its prior immutable saga version.")
+    }
+    const beforeSaga = await this.#historicalSaga(priorEffect)
+    if (
+      !exactColumns(priorEffect as unknown as Record<string, unknown>, {
+        operation_id: input.operationId,
+        resource_id: input.sagaId,
+        resource_kind: "saga",
+        to_state_version: beforeSaga.stateVersion,
+      }) ||
+      beforeSaga.sagaId !== input.sagaId ||
+      beforeSaga.stateVersion !== afterSaga.stateVersion - 1
+    ) {
+      return intervention("Saga termination has a contradictory saga version chain.")
+    }
+    if (input.cause === "timeout" && afterSaga.terminationRequestedAtMs < beforeSaga.deadlineAtMs) {
+      return intervention("Saga timeout termination predates its immutable deadline.")
+    }
+    const operationBefore = await this.#operationBefore(operation, audit.sequence)
+    const planStep = terminationPlanStep(operationBefore)
+    const historicalProof: LeaseProof = Object.freeze({
+      acquisitionId: transition.acquisition_id,
+      fencingToken: transition.fencing_token,
+      holderId: transition.holder_id,
+      leaseKey: transition.lease_key,
+    })
+    const expectedOperation = recordAtomicStepOutcome(operationBefore, {
+      attemptId: input.identity.attemptId,
+      idempotencyKey: planStep.idempotencyKey,
+      leaseProof: historicalProof,
+      observedPreconditionChecksum: planStep.preconditionChecksum,
+      outcome: {
+        observedPostconditionChecksum: planStep.postconditionChecksum,
+        resultChecksum: input.identity.evidenceChecksum,
+        state: "succeeded",
+      },
+      stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
+    })
+    const expectedSaga = requestSagaTermination(beforeSaga, {
+      cause: input.cause,
+      serverTimeMs: afterSaga.terminationRequestedAtMs,
+    })
+    const effectKind = `termination:${input.cause}`
+    const effectId = await this.#identity("saga-effect", [
+      input.identity.transitionId,
+      input.sagaId,
+      effectKind,
+      expectedSaga.stateVersion.toString(10),
+    ])
+    if (
+      sagaIntentJson(saga) !== sagaIntentJson(expectedSaga) ||
+      saga.terminationCause !== expectedSaga.terminationCause ||
+      saga.terminationRequestedAtMs !== expectedSaga.terminationRequestedAtMs
+    ) {
+      return intervention("Saga termination replay contradicts immutable saga intent.")
+    }
+    const expectedStep = expectedOperation.steps[
+      SAGA_TERMINATION_OPERATION_STEP_ID
+    ] as OperationStepRecord
+    if (
+      operationStepRecordJson(
+        operation.operation.steps[SAGA_TERMINATION_OPERATION_STEP_ID] as OperationStepRecord,
+      ) !== operationStepRecordJson(expectedStep)
+    ) {
+      return intervention("Saga termination replay contradicts its immutable operation step.")
+    }
+    const expectedRecordJson = encode(expectedSaga)
+    const committed = await this.#verify(
+      {
+        actorChecksum: audit.actorChecksum,
+        afterOperation: expectedOperation,
+        afterSaga: expectedSaga,
+        auditEventType: "saga.termination.requested",
+        beforeOperation: Object.freeze({ ...operation, operation: operationBefore }),
+        beforeSaga,
+        effectId,
+        effectKind,
+        evidenceChecksum: input.identity.evidenceChecksum,
+        proof: historicalProof,
+        stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
+        transitionId: input.identity.transitionId,
+      },
+      expectedRecordJson,
+      await this.#recordChecksum(expectedRecordJson),
+    )
+    if (committed === undefined) {
+      return intervention("Saga termination replay lost its immutable transition.")
+    }
+    return committed.saga
+  }
+
+  async #existingTerminationProjection(input: {
+    readonly operationId: string
+    readonly proof: LeaseProof
+    readonly sagaId: string
+  }): Promise<SagaRecord> {
+    const saga = await this.#saga(input.sagaId, input.operationId)
+    if (saga === undefined) {
+      return intervention("The explicit termination winner has no current saga projection.")
+    }
+    const operation = await this.#operation(input.operationId)
+    const cause = saga.terminationCause
+    if (cause !== "cancellation" && cause !== "timeout") {
+      return intervention("The saga has no explicit termination request to replay.")
+    }
+    const record = operation.operation.steps[
+      SAGA_TERMINATION_OPERATION_STEP_ID
+    ] as OperationStepRecord
+    if (
+      record.state !== "succeeded" ||
+      record.lastAttemptId === undefined ||
+      record.resultChecksum === undefined
+    ) {
+      return intervention("The explicit saga termination lacks its canonical operation outcome.")
+    }
+    const replay = await this.#terminationReceiptProjection({
+      cause,
+      identity: {
+        attemptId: record.lastAttemptId,
+        evidenceChecksum: record.resultChecksum,
+        transitionId: operationTransitionIdentity("succeeded", [
+          operation.operation.plan.operationId,
+          SAGA_TERMINATION_OPERATION_STEP_ID,
+          record.lastAttemptId,
+        ]),
+      },
+      operationId: operation.operation.plan.operationId,
+      proof: input.proof,
+      sagaId: saga.sagaId,
+    })
+    if (replay === undefined) {
+      return intervention("The explicit saga termination lacks its immutable receipt.")
+    }
+    return replay
   }
 
   async #classifiedProjection(input: {
@@ -1245,6 +1536,14 @@ export class D1SagaCoordinatorStore {
                AND "attempt"."fencing_token" = ?16
                AND "outcome"."attempt_id" IS NULL
            ))
+         ) AND (
+           ?17 = 'none' OR EXISTS (
+             SELECT 1 FROM "nozzle_sagas"
+             WHERE "saga_id" = ?18 AND "operation_id" = ?2 AND "record_json" = ?19
+               AND "termination_cause" IS NULL
+               AND (?17 = 'cancellation'
+                 OR (?17 = 'timeout' AND "deadline_at_ms" <= ${SERVER_TIME_SQL}))
+           )
          )`,
       )
       .bind(
@@ -1264,6 +1563,9 @@ export class D1SagaCoordinatorStore {
         input.recoveryGuard?.attemptId ?? "none",
         input.recoveryGuard?.acceptanceChecksum ?? "none",
         input.recoveryGuard?.dispatchFencingToken ?? input.proof.fencingToken,
+        input.terminationGuard?.cause ?? "none",
+        input.terminationGuard?.sagaId ?? "none",
+        beforeSagaJson ?? "none",
       )
     const effect = this.#database
       .prepare(
@@ -1649,6 +1951,103 @@ export class D1SagaCoordinatorStore {
       if (persisted !== undefined) return persisted
     }
     return intervention("Saga initialization exceeded the bounded coupled retry budget.")
+  }
+
+  async requestTermination(input: RequestCoordinatedSagaTerminationInput): Promise<SagaRecord> {
+    boundedText(input.actorChecksum, "Saga termination actor checksum")
+    boundedText(input.operationId, "Operation ID")
+    boundedText(input.requestId, "Saga termination request ID")
+    boundedText(input.requestChecksum, "Saga termination request checksum")
+    boundedText(input.sagaId, "Saga ID")
+    if (input.cause !== "cancellation" && input.cause !== "timeout") {
+      return configuration("Saga termination request cause is unsupported.")
+    }
+    const identity = await this.#terminationIdentity(input)
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+      const authorized = await this.#leases.authorizeAt(input.proof)
+      const replay = await this.#terminationReceiptProjection({
+        cause: input.cause,
+        identity,
+        operationId: input.operationId,
+        proof: input.proof,
+        sagaId: input.sagaId,
+      })
+      if (replay !== undefined) return replay
+      const beforeOperation = await this.#operation(input.operationId)
+      const beforeSaga = await this.#saga(input.sagaId, input.operationId)
+      if (beforeSaga === undefined) return resume("The saga does not exist.")
+      if (
+        beforeSaga.terminationCause === "cancellation" ||
+        beforeSaga.terminationCause === "timeout"
+      ) {
+        return this.#existingTerminationProjection({
+          operationId: input.operationId,
+          proof: input.proof,
+          sagaId: input.sagaId,
+        })
+      }
+      if (beforeSaga.terminationCause === "failure") return beforeSaga
+      const command = nextSagaCommand(beforeSaga, authorized.serverTimeMs)
+      if (command.kind === "terminal") return beforeSaga
+      if (input.cause === "timeout" && command.kind !== "request_termination") {
+        return resume("The authoritative saga deadline has not expired.")
+      }
+      const planStep = terminationPlanStep(beforeOperation.operation)
+      const afterOperation = recordAtomicStepOutcome(beforeOperation.operation, {
+        attemptId: identity.attemptId,
+        idempotencyKey: planStep.idempotencyKey,
+        leaseProof: input.proof,
+        observedPreconditionChecksum: planStep.preconditionChecksum,
+        outcome: {
+          observedPostconditionChecksum: planStep.postconditionChecksum,
+          resultChecksum: identity.evidenceChecksum,
+          state: "succeeded",
+        },
+        stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
+      })
+      const afterSaga = requestSagaTermination(beforeSaga, {
+        cause: input.cause,
+        serverTimeMs: authorized.serverTimeMs,
+      })
+      const effectKind = `termination:${input.cause}`
+      const effectId = await this.#identity("saga-effect", [
+        identity.transitionId,
+        input.sagaId,
+        effectKind,
+        afterSaga.stateVersion.toString(10),
+      ])
+      let committed: CoupledCommitResult | undefined
+      try {
+        committed = await this.#commit({
+          actorChecksum: input.actorChecksum,
+          afterOperation,
+          afterSaga,
+          auditEventType: "saga.termination.requested",
+          beforeOperation,
+          beforeSaga,
+          effectId,
+          effectKind,
+          evidenceChecksum: identity.evidenceChecksum,
+          proof: input.proof,
+          stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
+          terminationGuard: { cause: input.cause, sagaId: input.sagaId },
+          transitionId: identity.transitionId,
+        })
+      } catch (error) {
+        const winner = await this.#terminationReceiptProjection({
+          cause: input.cause,
+          identity,
+          operationId: input.operationId,
+          proof: input.proof,
+          sagaId: input.sagaId,
+        })
+        if (winner !== undefined) return winner
+        throw error
+      }
+      const persisted = committedSaga(committed, afterSaga)
+      if (persisted !== undefined) return persisted
+    }
+    return intervention("Saga termination exceeded the bounded coupled retry budget.")
   }
 
   async beginAction(input: BeginCoordinatedSagaActionInput): Promise<SagaBeginDecision> {

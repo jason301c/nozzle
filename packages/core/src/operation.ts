@@ -198,6 +198,24 @@ export interface CounterDeltas {
   readonly progress?: Readonly<Record<string, number>>
 }
 
+export type AtomicStepOutcome =
+  | {
+      readonly observedPostconditionChecksum: string
+      readonly resultChecksum: string
+      readonly state: "succeeded"
+    }
+  | { readonly errorChecksum: string; readonly state: "failed" }
+  | { readonly evidenceChecksum: string; readonly state: "intervention_required" }
+
+export interface AtomicStepOutcomeInput {
+  readonly attemptId: string
+  readonly idempotencyKey: string
+  readonly leaseProof: LeaseProof
+  readonly observedPreconditionChecksum: string
+  readonly outcome: AtomicStepOutcome
+  readonly stepId: string
+}
+
 export type StepFailureOutcome = "definitely_not_applied" | "permanent" | "unknown"
 export type StepReconciliationOutcome = "applied" | "indeterminate" | "not_applied"
 
@@ -1189,6 +1207,142 @@ export function markOperationStepNotRequired(
       state: "not_required",
     }),
   )
+}
+
+function atomicTerminalStepRecord(
+  attemptId: string,
+  fencingToken: number,
+  outcome: AtomicStepOutcome,
+): OperationStepRecord {
+  const common = {
+    costCounters: Object.freeze({}),
+    fencingToken,
+    lastAttemptId: attemptId,
+    progressCounters: Object.freeze({}),
+    startedAttempts: 1,
+  }
+  if (outcome.state === "succeeded") {
+    return Object.freeze({
+      ...common,
+      resultChecksum: outcome.resultChecksum,
+      state: outcome.state,
+    })
+  }
+  if (outcome.state === "failed") {
+    return Object.freeze({ ...common, errorChecksum: outcome.errorChecksum, state: outcome.state })
+  }
+  return Object.freeze({
+    ...common,
+    reconciliationEvidenceChecksum: outcome.evidenceChecksum,
+    state: outcome.state,
+  })
+}
+
+function exactAtomicTerminalReplay(
+  record: OperationStepRecord,
+  expected: OperationStepRecord,
+): boolean {
+  return ![
+    Object.keys(record).length !== Object.keys(expected).length,
+    record.activeAttemptId !== undefined,
+    record.authorizationChecksum !== undefined,
+    Object.keys(record.costCounters).length !== 0,
+    record.errorChecksum !== expected.errorChecksum,
+    record.fencingToken !== expected.fencingToken,
+    record.lastAttemptId !== expected.lastAttemptId,
+    Object.keys(record.progressCounters).length !== 0,
+    record.reconciliationEvidenceChecksum !== expected.reconciliationEvidenceChecksum,
+    record.resultChecksum !== expected.resultChecksum,
+    record.startedAttempts !== expected.startedAttempts,
+    record.state !== expected.state,
+  ].includes(true)
+}
+
+function assertPristineAtomicStep(record: OperationStepRecord): void {
+  if (
+    [
+      Object.keys(record).length !== 4,
+      record.startedAttempts !== 0,
+      Object.keys(record.costCounters).length !== 0,
+      Object.keys(record.progressCounters).length !== 0,
+      record.activeAttemptId !== undefined,
+      record.authorizationChecksum !== undefined,
+      record.errorChecksum !== undefined,
+      record.fencingToken !== undefined,
+      record.lastAttemptId !== undefined,
+      record.reconciliationEvidenceChecksum !== undefined,
+      record.resultChecksum !== undefined,
+    ].includes(true)
+  ) {
+    interventionError("The pending atomic step record contains contradictory attempt evidence.")
+  }
+}
+
+/**
+ * Commits a coordinator-owned step whose acceptance and outcome share one persistence transaction.
+ * The persistence caller must verify the complete proof against the active lease in that transaction.
+ */
+export function recordAtomicStepOutcome(
+  operation: OperationRecord,
+  input: AtomicStepOutcomeInput,
+): OperationRecord {
+  assertWellFormedString(input.stepId, "Step ID")
+  assertWellFormedString(input.attemptId, "Attempt ID")
+  assertWellFormedString(input.idempotencyKey, "Step idempotency key")
+  assertWellFormedString(input.observedPreconditionChecksum, "Observed precondition checksum")
+  validateLeaseProof(input.leaseProof)
+  const planStep = getPlanStep(operation, input.stepId)
+  const record = getStepRecord(operation, input.stepId)
+  if (planStep.checkpoint !== "reversible") {
+    configurationError("An atomic internal outcome requires a reversible operation step.")
+  }
+  if (planStep.effectProtocol !== "opaque") {
+    configurationError("An atomic internal outcome cannot bypass a receipt-owned step.")
+  }
+  if (input.idempotencyKey !== planStep.idempotencyKey) {
+    resumeError("The atomic step ID is already bound to a different idempotency key.")
+  }
+  if (input.observedPreconditionChecksum !== planStep.preconditionChecksum) {
+    resumeError("The atomic step precondition does not match the sealed operation plan.")
+  }
+  if (input.leaseProof.leaseKey !== planStep.leaseKey) {
+    resumeError("The atomic step outcome was recorded under the wrong lease key.")
+  }
+  assertDependenciesSucceeded(operation, planStep)
+  if (!plainRecord(input.outcome)) configurationError("Atomic step outcome is malformed.")
+
+  const outcome = input.outcome as AtomicStepOutcome
+  if (outcome.state === "succeeded") {
+    assertWellFormedString(outcome.resultChecksum, "Atomic step result checksum")
+    assertWellFormedString(
+      outcome.observedPostconditionChecksum,
+      "Observed atomic step postcondition checksum",
+    )
+    if (outcome.observedPostconditionChecksum !== planStep.postconditionChecksum) {
+      interventionError("The atomic step postcondition contradicts the sealed operation plan.")
+    }
+  } else if (outcome.state === "failed") {
+    assertWellFormedString(outcome.errorChecksum, "Atomic step error checksum")
+  } else if (outcome.state === "intervention_required") {
+    assertWellFormedString(outcome.evidenceChecksum, "Atomic step intervention evidence checksum")
+  } else {
+    configurationError("Atomic step outcome state is invalid.")
+  }
+
+  const next = atomicTerminalStepRecord(input.attemptId, input.leaseProof.fencingToken, outcome)
+  if (
+    record.state === "succeeded" ||
+    record.state === "failed" ||
+    record.state === "intervention_required"
+  ) {
+    if (exactAtomicTerminalReplay(record, next)) return operation
+    interventionError("A duplicate atomic step outcome contradicts durable terminal evidence.")
+  }
+  if (record.state !== "pending") {
+    resumeError("Only a pending atomic step can record its first terminal outcome.")
+  }
+  assertPristineAtomicStep(record)
+  return updateStep(operation, input.stepId, next)
 }
 
 export function beginOperationStep(

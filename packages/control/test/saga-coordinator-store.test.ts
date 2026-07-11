@@ -19,7 +19,11 @@ import type {
 import { D1LeaseStore } from "../src/lease-store.js"
 import { D1OperationStore, operationTransitionIdentity } from "../src/operation-store.js"
 import { D1SagaAttemptStore, sagaActionInputChecksum } from "../src/saga-attempt-store.js"
-import { D1SagaCoordinatorStore, type InitializeSagaInput } from "../src/saga-coordinator-store.js"
+import {
+  D1SagaCoordinatorStore,
+  type InitializeSagaInput,
+  type RequestCoordinatedSagaTerminationInput,
+} from "../src/saga-coordinator-store.js"
 import {
   D1SagaStore,
   SAGA_INIT_OPERATION_STEP_ID,
@@ -323,9 +327,87 @@ class AdvanceBeforeInitializationReceiptReadDatabase implements TransactionalCon
   }
 }
 
+class ServerTimeDatabase implements TransactionalControlDatabase {
+  readonly #base: TransactionalControlDatabase
+  readonly #serverTimeMs: number
+
+  constructor(base: TransactionalControlDatabase, serverTimeMs: number) {
+    this.#base = base
+    this.#serverTimeMs = serverTimeMs
+  }
+
+  async batch(statements: readonly ControlStatement[]): Promise<readonly ControlRunResult[]> {
+    return this.#base.batch(statements)
+  }
+
+  prepare(sql: string): ControlStatement {
+    return this.#base.prepare(
+      sql.replaceAll(
+        "CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+        this.#serverTimeMs.toString(10),
+      ),
+    )
+  }
+}
+
+class AdvanceBeforeTerminationReceiptReadDatabase implements TransactionalControlDatabase {
+  readonly #advance: () => Promise<void>
+  readonly #base: TransactionalControlDatabase
+  #pending = true
+
+  constructor(base: TransactionalControlDatabase, advance: () => Promise<void>) {
+    this.#advance = advance
+    this.#base = base
+  }
+
+  async batch(statements: readonly ControlStatement[]): Promise<readonly ControlRunResult[]> {
+    return this.#base.batch(statements)
+  }
+
+  prepare(sql: string): ControlStatement {
+    const statement = this.#base.prepare(sql)
+    if (
+      this.#pending &&
+      sql === 'SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1'
+    ) {
+      this.#pending = false
+      return new AdvanceBeforeReadStatement(statement, this.#advance)
+    }
+    return statement
+  }
+}
+
+class FailFirstTerminationVerificationReadDatabase implements TransactionalControlDatabase {
+  readonly #base: DatabaseAdapter
+  #armed = false
+
+  constructor(base: DatabaseAdapter) {
+    this.#base = base
+  }
+
+  async batch(statements: readonly ControlStatement[]): Promise<readonly ControlRunResult[]> {
+    const results = await this.#base.batch(statements)
+    this.#armed = true
+    return results
+  }
+
+  prepare(sql: string): ControlStatement {
+    if (
+      this.#armed &&
+      sql === 'SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1'
+    ) {
+      this.#armed = false
+      throw new Error("injected first post-commit termination receipt read failure")
+    }
+    return this.#base.prepare(sql)
+  }
+}
+
 type QueryFault =
   | { readonly kind: "audit_snapshot"; readonly row: unknown }
   | { readonly kind: "saga_projection"; readonly row: unknown }
+  | { readonly kind: "termination_projection"; readonly row: unknown }
+  | { readonly kind: "termination_winner_projection"; readonly row: unknown }
   | {
       readonly kind:
         | "audit_missing"
@@ -367,6 +449,22 @@ type QueryFault =
         | "settlement_effect_missing"
         | "settlement_saga_missing"
         | "settlement_transition_missing"
+        | "termination_audit_mismatch"
+        | "termination_audit_missing"
+        | "termination_effect_ambiguous"
+        | "termination_effect_mismatch"
+        | "termination_effect_missing"
+        | "termination_effect_without_termination"
+        | "termination_existing_step_incomplete"
+        | "termination_prior_mismatch"
+        | "termination_prior_missing"
+        | "termination_projection_missing"
+        | "termination_step_mismatch"
+        | "termination_step_missing"
+        | "termination_transition_disappears"
+        | "termination_transition_mismatch"
+        | "termination_transition_missing"
+        | "termination_winner_projection_missing"
     }
 
 class QueryFaultDatabase implements TransactionalControlDatabase {
@@ -375,6 +473,8 @@ class QueryFaultDatabase implements TransactionalControlDatabase {
   #batched = false
   #initializationTransitionReads = 0
   #sagaAttemptReads = 0
+  #terminationSagaReads = 0
+  #terminationTransitionReads = 0
 
   constructor(base: DatabaseAdapter, fault: QueryFault) {
     this.#base = base
@@ -388,6 +488,159 @@ class QueryFaultDatabase implements TransactionalControlDatabase {
   }
 
   prepare(sql: string): ControlStatement {
+    if (
+      this.#fault.kind === "termination_transition_disappears" &&
+      sql === 'SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1'
+    ) {
+      this.#terminationTransitionReads += 1
+      if (this.#terminationTransitionReads === 2) return new FixedStatement(null)
+    }
+    if (
+      (this.#fault.kind === "termination_transition_mismatch" ||
+        this.#fault.kind === "termination_transition_missing") &&
+      sql === 'SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1'
+    ) {
+      if (this.#fault.kind === "termination_transition_missing") return new FixedStatement(null)
+      const row = this.#base.database
+        .prepare(
+          `SELECT * FROM "nozzle_operation_transitions"
+           WHERE "step_id" = ? ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get(SAGA_TERMINATION_OPERATION_STEP_ID) as Record<string, unknown>
+      return new FixedStatement({ ...row, holder_id: "wrong-holder" })
+    }
+    if (
+      this.#fault.kind === "termination_existing_step_incomplete" &&
+      sql.includes('FROM "nozzle_operation_steps" WHERE "operation_id" = ?1 ORDER BY "step_id"')
+    ) {
+      const rows = this.#base.database
+        .prepare(
+          `SELECT "operation_id", "step_id", "idempotency_key", "lease_key", "plan_json",
+                  "record_json", "state", "fencing_token", "updated_at_ms"
+           FROM "nozzle_operation_steps" ORDER BY "step_id"`,
+        )
+        .all() as Record<string, unknown>[]
+      return new FixedRowsStatement(
+        rows.map((row) =>
+          row.step_id === SAGA_TERMINATION_OPERATION_STEP_ID
+            ? {
+                ...row,
+                fencing_token: null,
+                record_json: JSON.stringify({
+                  costCounters: {},
+                  progressCounters: {},
+                  startedAttempts: 0,
+                  state: "pending",
+                }),
+                state: "pending",
+              }
+            : row,
+        ),
+      )
+    }
+    if (
+      (this.#fault.kind === "termination_step_mismatch" ||
+        this.#fault.kind === "termination_step_missing") &&
+      sql.includes('FROM "nozzle_operation_steps" WHERE "operation_id" = ?1 ORDER BY "step_id"')
+    ) {
+      const rows = this.#base.database
+        .prepare(
+          `SELECT "operation_id", "step_id", "idempotency_key", "lease_key", "plan_json",
+                  "record_json", "state", "fencing_token", "updated_at_ms"
+           FROM "nozzle_operation_steps" ORDER BY "step_id"`,
+        )
+        .all() as Record<string, unknown>[]
+      return new FixedRowsStatement(
+        rows.flatMap((row) => {
+          if (row.step_id !== SAGA_TERMINATION_OPERATION_STEP_ID) return [row]
+          if (this.#fault.kind === "termination_step_missing") return []
+          const record = JSON.parse(row.record_json as string) as Record<string, unknown>
+          return [{ ...row, record_json: JSON.stringify({ ...record, resultChecksum: "wrong" }) }]
+        }),
+      )
+    }
+    if (
+      (this.#fault.kind === "termination_audit_mismatch" ||
+        this.#fault.kind === "termination_audit_missing") &&
+      sql.includes('SELECT "event_json" FROM "nozzle_audit_log"') &&
+      sql.includes('"event_hash" = ?2')
+    ) {
+      if (this.#fault.kind === "termination_audit_missing") return new FixedStatement(null)
+      const row = this.#base.database
+        .prepare(
+          `SELECT "event_json" FROM "nozzle_audit_log"
+           ORDER BY "sequence" LIMIT 1`,
+        )
+        .get() as Record<string, unknown>
+      return new FixedStatement(row)
+    }
+    if (
+      (this.#fault.kind === "termination_effect_ambiguous" ||
+        this.#fault.kind === "termination_effect_mismatch" ||
+        this.#fault.kind === "termination_effect_missing" ||
+        this.#fault.kind === "termination_effect_without_termination") &&
+      sql.includes('WHERE "transition_id" = ?1') &&
+      sql.includes("\"resource_kind\" = 'saga'") &&
+      sql.includes('"resource_id" = ?2')
+    ) {
+      if (this.#fault.kind === "termination_effect_missing") return new FixedRowsStatement([])
+      const row = this.#base.database
+        .prepare(
+          `SELECT * FROM "nozzle_operation_effects"
+           WHERE "step_id" = ? ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get(
+          this.#fault.kind === "termination_effect_without_termination"
+            ? SAGA_INIT_OPERATION_STEP_ID
+            : SAGA_TERMINATION_OPERATION_STEP_ID,
+        ) as Record<string, unknown>
+      if (this.#fault.kind === "termination_effect_without_termination") {
+        return new FixedRowsStatement([row])
+      }
+      if (this.#fault.kind === "termination_effect_ambiguous") {
+        return new FixedRowsStatement([row, row])
+      }
+      return new FixedRowsStatement([{ ...row, record_checksum: "wrong-checksum" }])
+    }
+    if (
+      (this.#fault.kind === "termination_prior_mismatch" ||
+        this.#fault.kind === "termination_prior_missing") &&
+      sql.includes('"to_state_version" = ?2') &&
+      sql.includes("\"resource_kind\" = 'saga'")
+    ) {
+      if (this.#fault.kind === "termination_prior_missing") return new FixedStatement(null)
+      const row = this.#base.database
+        .prepare(
+          `SELECT * FROM "nozzle_operation_effects"
+           WHERE "step_id" = ? ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get(SAGA_TERMINATION_OPERATION_STEP_ID) as Record<string, unknown>
+      return new FixedStatement(row)
+    }
+    if (
+      this.#fault.kind === "termination_projection_missing" &&
+      sql.includes('FROM "nozzle_sagas" AS "saga"')
+    ) {
+      return new FixedStatement(null)
+    }
+    if (
+      this.#fault.kind === "termination_projection" &&
+      sql.includes('FROM "nozzle_sagas" AS "saga"')
+    ) {
+      return new FixedStatement(this.#fault.row)
+    }
+    if (
+      (this.#fault.kind === "termination_winner_projection" ||
+        this.#fault.kind === "termination_winner_projection_missing") &&
+      sql.includes('FROM "nozzle_sagas" AS "saga"')
+    ) {
+      this.#terminationSagaReads += 1
+      if (this.#terminationSagaReads === 2) {
+        return new FixedStatement(
+          this.#fault.kind === "termination_winner_projection" ? this.#fault.row : null,
+        )
+      }
+    }
     if (
       (this.#fault.kind === "initialized_transition_history_mismatch" ||
         this.#fault.kind === "initialized_transition_identity_mismatch" ||
@@ -715,6 +968,7 @@ async function fixture(
   fault?: BatchFault,
   queryFault?: QueryFault,
   omitActionPlan = false,
+  omitTerminationPlan = false,
 ): Promise<Fixture> {
   const base = new DatabaseAdapter()
   databases.push(base)
@@ -849,7 +1103,11 @@ async function fixture(
             stepId: compensationStepId,
           },
         ] as const satisfies readonly OperationStepPlanInput[]
-      ).filter((step) => !omitActionPlan || step.stepId !== forwardStepId),
+      ).filter(
+        (step) =>
+          (!omitActionPlan || step.stepId !== forwardStepId) &&
+          (!omitTerminationPlan || step.stepId !== SAGA_TERMINATION_OPERATION_STEP_ID),
+      ),
     },
     digest,
   )
@@ -1028,44 +1286,25 @@ async function unknownEffectObservation(
   return { effectAttemptId, observationAttemptId, observationProof, observationReceipt }
 }
 
-async function requestCancellation(run: Fixture, proof: Fixture["proof"]): Promise<void> {
-  const attemptId = `${run.sagaId}:termination:1`
-  const resultChecksum = `${attemptId}:result`
-  await run.operations.beginStep({
+function terminationInput(
+  run: Fixture,
+  proof: Fixture["proof"] = run.proof,
+  cause: "cancellation" | "timeout" = "cancellation",
+  requestSuffix: string = cause,
+): RequestCoordinatedSagaTerminationInput {
+  return {
     actorChecksum: "coordinator-test-actor",
-    attemptId,
-    idempotencyKey: `${run.operationId}:termination:key`,
-    observedPreconditionChecksum: `${run.operationId}:termination:precondition`,
+    cause,
     operationId: run.operationId,
     proof,
-    stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
-  })
-  await run.operations.completeStep({
-    actorChecksum: "coordinator-test-actor",
-    attemptId,
-    observedPostconditionChecksum: `${run.operationId}:termination:postcondition`,
-    operationId: run.operationId,
-    proof,
-    resultChecksum,
-    stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
-  })
-  await run.sagas.requestTermination({
-    cause: "cancellation",
-    effect: {
-      effectId: `${attemptId}:effect`,
-      operationId: run.operationId,
-      proof,
-      stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
-      transitionId: operationTransitionIdentity("succeeded", [
-        run.operationId,
-        SAGA_TERMINATION_OPERATION_STEP_ID,
-        attemptId,
-      ]),
-    },
-    evidenceChecksum: resultChecksum,
+    requestChecksum: `${run.sagaId}:termination:${requestSuffix}:checksum`,
+    requestId: `${run.sagaId}:termination:${requestSuffix}:request`,
     sagaId: run.sagaId,
-    serverTimeMs: 2_000_000_000_000,
-  })
+  }
+}
+
+async function requestTermination(run: Fixture, proof: Fixture["proof"]) {
+  return run.coordinator.requestTermination(terminationInput(run, proof))
 }
 
 type RecoveryMode = "accepted_unknown" | "not_dispatched"
@@ -1081,7 +1320,7 @@ async function recoverableAction(
   if (phase === "compensation") {
     const forwardAttemptId = `${run.sagaId}:a:forward:1`
     await terminalReceipt(run, "confirmed", forwardAttemptId)
-    await requestCancellation(run, run.proof)
+    await requestTermination(run, run.proof)
     await run.coordinator.settleActionFromReceipt(actionInput(run, forwardAttemptId))
   }
   const attemptId = `${run.sagaId}:a:${phase}:1`
@@ -1150,6 +1389,83 @@ function acceptedAttemptRow(database: DatabaseSync, attemptId: string): Record<s
     output_checksum: null,
     output_json: null,
     state: null,
+  }
+}
+
+function leaseExpiration(run: Fixture): number {
+  const row = run.base.database
+    .prepare(`SELECT "expires_at_ms" FROM "nozzle_leases" WHERE "lease_key" = ?`)
+    .get(run.proof.leaseKey) as { readonly expires_at_ms: number }
+  return row.expires_at_ms
+}
+
+async function contradictoryTerminationProjection(run: Fixture): Promise<Record<string, unknown>> {
+  const row = run.base.database
+    .prepare(
+      `SELECT "saga".*,
+              "effect"."effect_id" AS "effect_id",
+              "effect"."resource_kind" AS "effect_resource_kind",
+              "effect"."resource_id" AS "effect_resource_id",
+              "effect"."operation_id" AS "effect_operation_id",
+              "effect"."to_state_version" AS "effect_to_state_version",
+              "effect"."evidence_checksum" AS "effect_evidence_checksum",
+              "effect"."record_checksum" AS "effect_record_checksum",
+              "effect"."record_json" AS "effect_record_json"
+       FROM "nozzle_sagas" AS "saga"
+       JOIN "nozzle_operation_effects" AS "effect"
+         ON "effect"."effect_id" = "saga"."last_effect_id"
+       WHERE "saga"."saga_id" = ?`,
+    )
+    .get(run.sagaId) as Record<string, unknown>
+  const record = JSON.parse(row.record_json as string) as Record<string, unknown>
+  const inputChecksum = `${record.inputChecksum as string}:contradictory`
+  const recordJson = JSON.stringify({ ...record, inputChecksum })
+  const recordChecksum = await sagaRecordChecksum(recordJson)
+  return {
+    ...row,
+    effect_record_checksum: recordChecksum,
+    effect_record_json: recordJson,
+    input_checksum: inputChecksum,
+    record_checksum: recordChecksum,
+    record_json: recordJson,
+  }
+}
+
+function initialTerminationProjection(run: Fixture): Record<string, unknown> {
+  const current = run.base.database
+    .prepare(`SELECT * FROM "nozzle_sagas" WHERE "saga_id" = ?`)
+    .get(run.sagaId) as Record<string, unknown>
+  const effect = run.base.database
+    .prepare(
+      `SELECT * FROM "nozzle_operation_effects"
+       WHERE "resource_kind" = 'saga' AND "resource_id" = ? AND "to_state_version" = 0`,
+    )
+    .get(run.sagaId) as Record<string, unknown>
+  const record = JSON.parse(effect.record_json as string) as {
+    readonly stateVersion: number
+    readonly status: string
+    readonly terminationCause: string | null
+    readonly terminationRequestedAtMs: number | null
+  }
+  return {
+    ...current,
+    commitment: "none",
+    effect_evidence_checksum: effect.evidence_checksum,
+    effect_id: effect.effect_id,
+    effect_operation_id: effect.operation_id,
+    effect_record_checksum: effect.record_checksum,
+    effect_record_json: effect.record_json,
+    effect_resource_id: effect.resource_id,
+    effect_resource_kind: effect.resource_kind,
+    effect_to_state_version: effect.to_state_version,
+    last_effect_id: effect.effect_id,
+    last_evidence_checksum: effect.evidence_checksum,
+    record_checksum: effect.record_checksum,
+    record_json: effect.record_json,
+    state_version: record.stateVersion,
+    status: record.status,
+    termination_cause: record.terminationCause,
+    termination_requested_at_ms: record.terminationRequestedAtMs,
   }
 }
 
@@ -2034,7 +2350,7 @@ describe("D1SagaCoordinatorStore", () => {
       sagaId: run.sagaId,
       sagaStepId: "a",
     })
-    await requestCancellation(run, run.proof)
+    await requestTermination(run, run.proof)
     await run.attempts.complete({
       attemptId: forwardAttemptId,
       evidenceJson: '{"source":"forward"}',
@@ -2229,7 +2545,7 @@ describe("D1SagaCoordinatorStore", () => {
       sagaId: run.sagaId,
       sagaStepId: "a",
     })
-    await requestCancellation(run, run.proof)
+    await requestTermination(run, run.proof)
     await run.attempts.complete({
       attemptId: forwardAttemptId,
       evidenceJson: '{"source":"forward"}',
@@ -2283,7 +2599,7 @@ describe("D1SagaCoordinatorStore", () => {
       sagaId: run.sagaId,
       sagaStepId: "a",
     })
-    await requestCancellation(run, run.proof)
+    await requestTermination(run, run.proof)
     const forwardReceipt = await run.attempts.complete({
       attemptId: forwardAttemptId,
       evidenceJson: '{"source":"forward"}',
@@ -2517,6 +2833,480 @@ describe("D1SagaCoordinatorStore", () => {
     expect(count(run.base.database, "nozzle_operation_effects")).toBe(effectsBefore)
     expect(count(run.base.database, "nozzle_operation_transitions")).toBe(transitionsBefore)
     expect(count(run.base.database, "nozzle_audit_log")).toBe(auditBefore)
+  })
+
+  it("atomically records a cancellation and replays its exact coupled receipt", async () => {
+    const run = await fixture("termination-cancellation")
+    await run.coordinator.initializeSaga(run.initialize)
+    const input = terminationInput(run)
+
+    const cancelled = await run.coordinator.requestTermination(input)
+
+    expect(cancelled).toMatchObject({
+      sagaId: run.sagaId,
+      stateVersion: 1,
+      status: "cancelled",
+      terminationCause: "cancellation",
+    })
+    expect(cancelled.terminationRequestedAtMs).toEqual(expect.any(Number))
+    expect(
+      (await run.operations.get(run.operationId))?.operation.steps[
+        SAGA_TERMINATION_OPERATION_STEP_ID
+      ],
+    ).toMatchObject({ startedAttempts: 1, state: "succeeded" })
+    expect(
+      run.base.database
+        .prepare(
+          `SELECT "effect_kind" FROM "nozzle_operation_effects"
+           WHERE "step_id" = ?`,
+        )
+        .get(SAGA_TERMINATION_OPERATION_STEP_ID),
+    ).toEqual({ effect_kind: "termination:cancellation" })
+    const committed = coupledProjectionRows(run.base.database)
+    await expect(run.coordinator.requestTermination(input)).resolves.toEqual(cancelled)
+    expect(coupledProjectionRows(run.base.database)).toEqual(committed)
+  })
+
+  it("replays termination after action and compensation progress, restart, and takeover", async () => {
+    const run = await fixture("termination-progress-replay")
+    await run.coordinator.initializeSaga(run.initialize)
+    const forwardAttemptId = `${run.sagaId}:a:forward:1`
+    await terminalReceipt(run, "confirmed", forwardAttemptId)
+    const input = terminationInput(run)
+    await run.coordinator.requestTermination(input)
+    await run.coordinator.settleActionFromReceipt(actionInput(run, forwardAttemptId))
+    const afterForward = await run.sagas.get(run.sagaId)
+    const restarted = new D1SagaCoordinatorStore(run.base, digest)
+
+    await expect(restarted.requestTermination(input)).resolves.toEqual(afterForward)
+
+    const compensationAttemptId = `${run.sagaId}:a:compensation:1`
+    await terminalReceipt(run, "confirmed", compensationAttemptId, run.proof, "compensation")
+    await run.coordinator.settleActionFromReceipt(
+      actionInput(run, compensationAttemptId, run.proof, "compensation"),
+    )
+    const compensated = await run.sagas.get(run.sagaId)
+    expect(compensated).toMatchObject({ status: "cancelled", terminationCause: "cancellation" })
+    const takeoverProof = await reacquire(run, run.proof, "termination-replay")
+    const beforeReplay = coupledProjectionRows(run.base.database)
+
+    await expect(
+      new D1SagaCoordinatorStore(run.base, digest).requestTermination({
+        ...input,
+        proof: takeoverProof,
+      }),
+    ).resolves.toEqual(compensated)
+    expect(coupledProjectionRows(run.base.database)).toEqual(beforeReplay)
+  })
+
+  it("uses authoritative lease time to reject a premature timeout and accept the deadline", async () => {
+    const run = await fixture("termination-timeout")
+    const deadlineAtMs = leaseExpiration(run) - 20_000
+    await run.coordinator.initializeSaga({ ...run.initialize, deadlineAtMs })
+    const input = terminationInput(run, run.proof, "timeout")
+    const premature = new D1SagaCoordinatorStore(
+      new ServerTimeDatabase(run.base, deadlineAtMs - 1),
+      digest,
+    )
+
+    await expect(premature.requestTermination(input)).rejects.toThrow(
+      /authoritative saga deadline has not expired/u,
+    )
+    expect(await run.sagas.get(run.sagaId)).toMatchObject({
+      stateVersion: 0,
+      terminationCause: null,
+    })
+    expect(
+      (await run.operations.get(run.operationId))?.operation.steps[
+        SAGA_TERMINATION_OPERATION_STEP_ID
+      ]?.state,
+    ).toBe("pending")
+
+    const atDeadline = new D1SagaCoordinatorStore(
+      new ServerTimeDatabase(run.base, deadlineAtMs),
+      digest,
+    )
+    await expect(atDeadline.requestTermination(input)).resolves.toMatchObject({
+      status: "timed_out",
+      terminationCause: "timeout",
+      terminationRequestedAtMs: deadlineAtMs,
+    })
+  })
+
+  it("preserves the first explicit cause across cancellation and timeout request identities", async () => {
+    const run = await fixture("termination-first-cause")
+    await run.coordinator.initializeSaga(run.initialize)
+    const cancelled = await run.coordinator.requestTermination(terminationInput(run))
+    const rows = coupledProjectionRows(run.base.database)
+
+    await expect(
+      run.coordinator.requestTermination(terminationInput(run, run.proof, "timeout")),
+    ).resolves.toEqual(cancelled)
+    expect(cancelled.terminationCause).toBe("cancellation")
+    expect(coupledProjectionRows(run.base.database)).toEqual(rows)
+  })
+
+  it.each([
+    ["cancellation", "timeout"],
+    ["timeout", "cancellation"],
+  ] as const)("converges concurrent %s and %s requests on the first committed cause", async (winnerCause, contenderCause) => {
+    const run = await fixture(`termination-concurrent-${winnerCause}`)
+    const deadlineAtMs = leaseExpiration(run) - 20_000
+    await run.coordinator.initializeSaga({ ...run.initialize, deadlineAtMs })
+    const serverTimeMs = deadlineAtMs + 1
+    const winnerCoordinator = new D1SagaCoordinatorStore(
+      new ServerTimeDatabase(run.base, serverTimeMs),
+      digest,
+    )
+    const winnerInput = terminationInput(run, run.proof, winnerCause)
+    let winner: unknown
+    const interleaved = new AdvanceBeforeTerminationReceiptReadDatabase(run.base, async () => {
+      winner = await winnerCoordinator.requestTermination(winnerInput)
+    })
+    const contender = new D1SagaCoordinatorStore(
+      new ServerTimeDatabase(interleaved, serverTimeMs + 1),
+      digest,
+    )
+
+    const converged = await contender.requestTermination(
+      terminationInput(run, run.proof, contenderCause),
+    )
+
+    expect(converged).toEqual(winner)
+    expect(converged.terminationCause).toBe(winnerCause)
+    expect(
+      run.base.database
+        .prepare(
+          `SELECT count(*) AS "count" FROM "nozzle_operation_transitions"
+             WHERE "step_id" = ?`,
+        )
+        .get(SAGA_TERMINATION_OPERATION_STEP_ID),
+    ).toEqual({ count: 1 })
+    expect(
+      run.base.database
+        .prepare(
+          `SELECT count(*) AS "count" FROM "nozzle_operation_effects"
+             WHERE "step_id" = ?`,
+        )
+        .get(SAGA_TERMINATION_OPERATION_STEP_ID),
+    ).toEqual({ count: 1 })
+  })
+
+  it("converges the same concurrent request despite differing authoritative read times", async () => {
+    const run = await fixture("termination-concurrent-same-request")
+    await run.coordinator.initializeSaga(run.initialize)
+    const winnerTimeMs = leaseExpiration(run) - 20_000
+    const contenderTimeMs = winnerTimeMs + 1_000
+    const input = terminationInput(run)
+    let winner: unknown
+    const interleaved = new AdvanceBeforeTerminationReceiptReadDatabase(run.base, async () => {
+      winner = await new D1SagaCoordinatorStore(
+        new ServerTimeDatabase(run.base, winnerTimeMs),
+        digest,
+      ).requestTermination(input)
+    })
+    const contender = new D1SagaCoordinatorStore(
+      new ServerTimeDatabase(interleaved, contenderTimeMs),
+      digest,
+    )
+
+    const converged = await contender.requestTermination(input)
+
+    expect(converged).toEqual(winner)
+    expect(converged.terminationRequestedAtMs).toBe(winnerTimeMs)
+    expect(
+      run.base.database
+        .prepare(
+          `SELECT count(*) AS "count" FROM "nozzle_operation_transitions"
+           WHERE "step_id" = ?`,
+        )
+        .get(SAGA_TERMINATION_OPERATION_STEP_ID),
+    ).toEqual({ count: 1 })
+  })
+
+  it("recovers an exact termination after the committed D1 response is lost", async () => {
+    const run = await fixture("termination-lost-response")
+    await run.coordinator.initializeSaga(run.initialize)
+    const faulted = new D1SagaCoordinatorStore(
+      new FaultDatabase(run.base, { kind: "commit_then_throw" }),
+      digest,
+    )
+
+    await expect(faulted.requestTermination(terminationInput(run))).resolves.toMatchObject({
+      status: "cancelled",
+      terminationCause: "cancellation",
+    })
+    expect(
+      run.base.database
+        .prepare(
+          `SELECT count(*) AS "count" FROM "nozzle_operation_effects"
+           WHERE "step_id" = ?`,
+        )
+        .get(SAGA_TERMINATION_OPERATION_STEP_ID),
+    ).toEqual({ count: 1 })
+  })
+
+  it("recovers the committed winner after its first verification read fails", async () => {
+    const run = await fixture("termination-verification-read-loss")
+    await run.coordinator.initializeSaga(run.initialize)
+    const coordinator = new D1SagaCoordinatorStore(
+      new FailFirstTerminationVerificationReadDatabase(run.base),
+      digest,
+    )
+
+    await expect(coordinator.requestTermination(terminationInput(run))).resolves.toMatchObject({
+      status: "cancelled",
+      terminationCause: "cancellation",
+    })
+  })
+
+  it("rethrows a pre-commit coordinator failure when no termination receipt won", async () => {
+    const run = await fixture("termination-no-winner")
+    await run.coordinator.initializeSaga(run.initialize)
+    const coordinator = new D1SagaCoordinatorStore(
+      new QueryFaultDatabase(run.base, {
+        kind: "audit_snapshot",
+        row: { event_json: null, now_ms: -1 },
+      }),
+      digest,
+    )
+
+    await expect(coordinator.requestTermination(terminationInput(run))).rejects.toThrow(
+      /malformed authoritative saga coordinator time/u,
+    )
+    expect(await run.sagas.get(run.sagaId)).toMatchObject({ terminationCause: null })
+  })
+
+  it("validates the typed termination request before deriving durable identity", async () => {
+    const run = await fixture("termination-validation")
+    await run.coordinator.initializeSaga(run.initialize)
+
+    await expect(
+      run.coordinator.requestTermination({
+        ...terminationInput(run),
+        cause: "future" as never,
+      }),
+    ).rejects.toThrow(/cause is unsupported/u)
+    for (const [field, value] of [
+      ["actorChecksum", "\udc00"],
+      ["operationId", "\ud800x"],
+      ["requestChecksum", "\ud801"],
+      ["requestId", "\ud800"],
+      ["sagaId", "saga-\udc01"],
+    ] as const) {
+      await expect(
+        run.coordinator.requestTermination({
+          ...terminationInput(run),
+          [field]: value,
+        }),
+      ).rejects.toThrow(/unpaired UTF-16 surrogates/u)
+    }
+    await expect(
+      run.coordinator.requestTermination({
+        ...terminationInput(run),
+        requestId: `${run.sagaId}:termination:\ud83d\ude80:request`,
+      }),
+    ).resolves.toMatchObject({ terminationCause: "cancellation" })
+  })
+
+  it("binds one request identity to its first checksum and cause", async () => {
+    const run = await fixture("termination-request-identity")
+    await run.coordinator.initializeSaga(run.initialize)
+    const input = terminationInput(run, run.proof, "cancellation", "stable-request")
+    await run.coordinator.requestTermination(input)
+
+    await expect(
+      run.coordinator.requestTermination({
+        ...input,
+        requestChecksum: `${input.requestChecksum}:different`,
+      }),
+    ).rejects.toThrow(/immutable operation step|operation-effect receipt/u)
+    await expect(
+      run.coordinator.requestTermination({ ...input, cause: "timeout" }),
+    ).rejects.toThrow(/predates its immutable deadline|immutable saga intent/u)
+  })
+
+  it("rejects oversized operation and saga identities before hashing them", async () => {
+    const run = await fixture("termination-bounded-resource-identity")
+    let digestCalled = false
+    const unusedDigest: DigestFunction = async () => {
+      digestCalled = true
+      return "unused"
+    }
+    const coordinator = new D1SagaCoordinatorStore(run.base, unusedDigest)
+
+    await expect(
+      coordinator.requestTermination({
+        ...terminationInput(run),
+        operationId: "o".repeat(513),
+      }),
+    ).rejects.toThrow(/Operation ID exceeds/u)
+    await expect(
+      coordinator.requestTermination({
+        ...terminationInput(run),
+        sagaId: "s".repeat(513),
+      }),
+    ).rejects.toThrow(/Saga ID exceeds/u)
+    expect(digestCalled).toBe(false)
+  })
+
+  it("rejects an operation plan without the canonical termination step", async () => {
+    const run = await fixture("termination-plan-missing", undefined, undefined, false, true)
+    await run.coordinator.initializeSaga(run.initialize)
+
+    await expect(run.coordinator.requestTermination(terminationInput(run))).rejects.toThrow(
+      /lacks its canonical sealed operation step/u,
+    )
+  })
+
+  it("rejects a termination effect without a predecessor or request time", async () => {
+    const run = await fixture("termination-effect-without-request")
+    await run.coordinator.initializeSaga(run.initialize)
+    const input = terminationInput(run)
+    await run.coordinator.requestTermination(input)
+    const restarted = new D1SagaCoordinatorStore(
+      new QueryFaultDatabase(run.base, { kind: "termination_effect_without_termination" }),
+      digest,
+    )
+
+    await expect(restarted.requestTermination(input)).rejects.toThrow(
+      /no valid predecessor or request time/u,
+    )
+  })
+
+  it("fails closed when a termination transition disappears during exact verification", async () => {
+    const run = await fixture("termination-transition-disappears")
+    await run.coordinator.initializeSaga(run.initialize)
+    const input = terminationInput(run)
+    await run.coordinator.requestTermination(input)
+    const restarted = new D1SagaCoordinatorStore(
+      new QueryFaultDatabase(run.base, { kind: "termination_transition_disappears" }),
+      digest,
+    )
+
+    await expect(restarted.requestTermination(input)).rejects.toThrow(
+      /lost its immutable transition/u,
+    )
+  })
+
+  it("fails closed when an explicit concurrent winner loses its authoritative projection", async () => {
+    for (const [kind, row, message] of [
+      [
+        "termination_winner_projection_missing",
+        undefined,
+        /winner has no current saga projection/u,
+      ],
+      [
+        "termination_winner_projection",
+        "initial",
+        /has no explicit termination request to replay/u,
+      ],
+      ["termination_existing_step_incomplete", undefined, /lacks its canonical operation outcome/u],
+    ] as const) {
+      const run = await fixture(`termination-winner-${kind}`)
+      await run.coordinator.initializeSaga(run.initialize)
+      await run.coordinator.requestTermination(terminationInput(run))
+      const fault =
+        row === "initial"
+          ? ({ kind, row: initialTerminationProjection(run) } as const)
+          : ({ kind } as const)
+      const restarted = new D1SagaCoordinatorStore(new QueryFaultDatabase(run.base, fault), digest)
+
+      await expect(
+        restarted.requestTermination(
+          terminationInput(run, run.proof, "timeout", "competing-request"),
+        ),
+      ).rejects.toThrow(message)
+    }
+  })
+
+  it("returns authoritative absent, failed, and successful saga states without mutation", async () => {
+    const absent = await fixture("termination-saga-absent")
+    await expect(absent.coordinator.requestTermination(terminationInput(absent))).rejects.toThrow(
+      /saga does not exist/u,
+    )
+
+    const failed = await fixture("termination-saga-failed")
+    await failed.coordinator.initializeSaga(failed.initialize)
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const attemptId = `${failed.sagaId}:a:forward:${attempt}`
+      await terminalReceipt(failed, "not_applied", attemptId)
+      await failed.coordinator.settleActionFromReceipt(actionInput(failed, attemptId))
+    }
+    const failedSaga = await failed.sagas.get(failed.sagaId)
+    await expect(failed.coordinator.requestTermination(terminationInput(failed))).resolves.toEqual(
+      failedSaga,
+    )
+
+    const succeeded = await fixture("termination-saga-succeeded")
+    await succeeded.coordinator.initializeSaga(succeeded.initialize)
+    const attemptId = `${succeeded.sagaId}:a:forward:1`
+    await terminalReceipt(succeeded, "confirmed", attemptId)
+    await succeeded.coordinator.settleActionFromReceipt(actionInput(succeeded, attemptId))
+    const succeededSaga = await succeeded.sagas.get(succeeded.sagaId)
+    await expect(
+      succeeded.coordinator.requestTermination(terminationInput(succeeded)),
+    ).resolves.toEqual(succeededSaga)
+  })
+
+  it.each([
+    0, 1, 2, 3, 4, 5,
+  ])("rolls every termination row back when coupled statement %i fails", async (index) => {
+    const run = await fixture(`termination-rollback-${index}`)
+    await run.coordinator.initializeSaga(run.initialize)
+    const before = coupledProjectionRows(run.base.database)
+    const faulted = new D1SagaCoordinatorStore(
+      new FaultDatabase(run.base, { index, kind: "rollback_before" }),
+      digest,
+    )
+
+    await expect(faulted.requestTermination(terminationInput(run))).rejects.toThrow(
+      /bounded coupled retry budget/u,
+    )
+    expect(coupledProjectionRows(run.base.database)).toEqual(before)
+    expect(await run.sagas.get(run.sagaId)).toMatchObject({ terminationCause: null })
+  })
+
+  it("fails closed on missing or contradictory immutable termination history", async () => {
+    for (const [kind, message] of [
+      ["termination_transition_missing", /lacks its immutable receipt/u],
+      ["termination_transition_mismatch", /contradictory operation transition/u],
+      ["termination_effect_missing", /lacks its exact coupled effect receipt/u],
+      ["termination_effect_ambiguous", /ambiguous coupled effect receipts/u],
+      ["termination_effect_mismatch", /historical saga effect record is contradictory/u],
+      ["termination_audit_missing", /lacks its exact audit event/u],
+      ["termination_audit_mismatch", /transition receipt|audit event/u],
+      ["termination_prior_missing", /lacks its prior immutable saga version/u],
+      ["termination_prior_mismatch", /contradictory saga version chain/u],
+      ["termination_step_missing", /step membership|operation step|sealed plan/u],
+      ["termination_step_mismatch", /immutable operation step/u],
+      ["termination_projection_missing", /has no current projection/u],
+    ] as const) {
+      const run = await fixture(`termination-history-${kind}`)
+      await run.coordinator.initializeSaga(run.initialize)
+      const input = terminationInput(run)
+      await run.coordinator.requestTermination(input)
+      const restarted = new D1SagaCoordinatorStore(
+        new QueryFaultDatabase(run.base, { kind }),
+        digest,
+      )
+
+      await expect(restarted.requestTermination(input)).rejects.toThrow(message)
+    }
+  })
+
+  it("fails closed on a self-consistent projection that contradicts termination intent", async () => {
+    const run = await fixture("termination-projection-mismatch")
+    await run.coordinator.initializeSaga(run.initialize)
+    const input = terminationInput(run)
+    await run.coordinator.requestTermination(input)
+    const row = await contradictoryTerminationProjection(run)
+    const restarted = new D1SagaCoordinatorStore(
+      new QueryFaultDatabase(run.base, { kind: "termination_projection", row }),
+      digest,
+    )
+
+    await expect(restarted.requestTermination(input)).rejects.toThrow(/immutable saga intent/u)
   })
 
   it("atomically initializes both ledgers and begins an action with synchronized attempts", async () => {

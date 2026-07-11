@@ -17,6 +17,7 @@ import { sealSagaHandlerRegistry } from "../src/saga-registry.js"
 import {
   D1SagaStore,
   SAGA_INIT_OPERATION_STEP_ID,
+  SAGA_TERMINATION_OPERATION_STEP_ID,
   type SagaEffectContext,
   sagaActionOperationStepId,
 } from "../src/saga-store.js"
@@ -406,6 +407,22 @@ describe("real workerd D1 saga projection", () => {
       stepId: "write",
     })
     expect(unknownSaga.steps.write?.forward.state).toBe("unknown")
+    const terminationInput = {
+      actorChecksum: "workerd-coordinator-actor",
+      cause: "cancellation" as const,
+      operationId,
+      proof,
+      requestChecksum: "workerd-coordinator-cancellation-checksum",
+      requestId: "workerd-coordinator-cancellation-request",
+      sagaId,
+    }
+    const terminated = await coordinator.requestTermination(terminationInput)
+    expect(terminated).toMatchObject({
+      stateVersion: 3,
+      status: "compensating",
+      terminationCause: "cancellation",
+    })
+    await expect(coordinator.requestTermination(terminationInput)).resolves.toEqual(terminated)
     await leases.release({ proof })
     const observer = await leases.acquire({
       acquisitionId: "workerd-coordinator-observer-acquisition",
@@ -500,12 +517,44 @@ describe("real workerd D1 saga projection", () => {
       }>()
     expect(counts).toEqual({
       attempts: 3,
-      effects: 4,
+      effects: 5,
       operation_attempts: 1,
       operation_result: outcome.outcomeChecksum,
       operation_state: "succeeded",
       outcomes: 2,
-      saga_version: 3,
+      saga_version: 4,
+    })
+    const terminationEvidence = await env.DB.prepare(
+      `SELECT
+        (SELECT count(*) FROM "nozzle_operation_transitions"
+         WHERE "operation_id" = ?1 AND "step_id" = ?2) AS "transitions",
+        (SELECT count(*) FROM "nozzle_operation_effects"
+         WHERE "operation_id" = ?1 AND "step_id" = ?2
+           AND "resource_kind" = 'saga' AND "resource_id" = ?3
+           AND "effect_kind" = 'termination:cancellation') AS "effects",
+        (SELECT count(*) FROM "nozzle_audit_log"
+         WHERE "operation_id" = ?1 AND "step_id" = ?2
+           AND json_extract("event_json", '$.eventType') =
+             'saga.termination.requested') AS "audit_events",
+        (SELECT json_extract("record_json", '$.state')
+         FROM "nozzle_operation_steps"
+         WHERE "operation_id" = ?1 AND "step_id" = ?2) AS "operation_state",
+        (SELECT "state_version" FROM "nozzle_sagas" WHERE "saga_id" = ?3) AS "saga_version"`,
+    )
+      .bind(operationId, SAGA_TERMINATION_OPERATION_STEP_ID, sagaId)
+      .first<{
+        audit_events: number
+        effects: number
+        operation_state: string
+        saga_version: number
+        transitions: number
+      }>()
+    expect(terminationEvidence).toEqual({
+      audit_events: 1,
+      effects: 1,
+      operation_state: "succeeded",
+      saga_version: 4,
+      transitions: 1,
     })
     await leases.release({ proof })
     const successor = await leases.acquire({

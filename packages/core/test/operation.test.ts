@@ -1,6 +1,7 @@
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 import {
+  type AtomicStepOutcome,
   type AuditEvent,
   appendAuditEvent,
   assertLeaseAuthorized,
@@ -25,6 +26,7 @@ import {
   type OperationRecord,
   type OperationStepPlanInput,
   operationStatus,
+  recordAtomicStepOutcome,
   recordSagaStepTerminalClassification,
   recordStepFailure,
   recordStepReconciliation,
@@ -118,6 +120,29 @@ function begin(
     leaseProof: leaseProof(lease),
     observedPreconditionChecksum: input.precondition ?? `pre-${stepId}`,
     serverTimeMs: input.serverTimeMs ?? 110,
+    stepId,
+  })
+}
+
+function atomicOutcome(
+  operation: OperationRecord,
+  activeLease: FencedLeaseRecord,
+  outcome: AtomicStepOutcome,
+  overrides: {
+    attemptId?: string
+    idempotencyKey?: string
+    observedPreconditionChecksum?: string
+    proof?: ReturnType<typeof leaseProof>
+    stepId?: string
+  } = {},
+): OperationRecord {
+  const stepId = overrides.stepId ?? "one"
+  return recordAtomicStepOutcome(operation, {
+    attemptId: overrides.attemptId ?? "atomic-attempt-1",
+    idempotencyKey: overrides.idempotencyKey ?? `idempotency-${stepId}`,
+    leaseProof: overrides.proof ?? leaseProof(activeLease),
+    observedPreconditionChecksum: overrides.observedPreconditionChecksum ?? `pre-${stepId}`,
+    outcome,
     stepId,
   })
 }
@@ -648,6 +673,316 @@ describe("sealed irreversible authorization", () => {
         digest,
       ),
     ).rejects.toThrow("lease keys do not match")
+  })
+})
+
+describe("atomic internal operation outcomes", () => {
+  const success: AtomicStepOutcome = {
+    observedPostconditionChecksum: "post-one",
+    resultChecksum: "atomic-result",
+    state: "succeeded",
+  }
+
+  it("moves a pristine pending reversible step directly to each valid terminal state", async () => {
+    const activeLease = acquire()
+    const operation = createOperationRecord(
+      await plan([step("one"), step("two", { dependsOn: ["one"] })]),
+    )
+    expect(() =>
+      atomicOutcome(
+        operation,
+        activeLease,
+        {
+          observedPostconditionChecksum: "post-two",
+          resultChecksum: "result-two",
+          state: "succeeded",
+        },
+        { stepId: "two" },
+      ),
+    ).toThrow("dependency has not succeeded")
+
+    const first = atomicOutcome(operation, activeLease, success)
+    const completed = atomicOutcome(
+      first,
+      activeLease,
+      {
+        observedPostconditionChecksum: "post-two",
+        resultChecksum: "result-two",
+        state: "succeeded",
+      },
+      { stepId: "two" },
+    )
+    expect(operation.steps.one?.state).toBe("pending")
+    expect(first.steps.one).toEqual({
+      costCounters: {},
+      fencingToken: activeLease.fencingToken,
+      lastAttemptId: "atomic-attempt-1",
+      progressCounters: {},
+      resultChecksum: "atomic-result",
+      startedAttempts: 1,
+      state: "succeeded",
+    })
+    expect(first.steps.one?.activeAttemptId).toBeUndefined()
+    expect(Object.isFrozen(first)).toBe(true)
+    expect(Object.isFrozen(first.steps)).toBe(true)
+    expect(Object.isFrozen(first.steps.one)).toBe(true)
+    expect(Object.isFrozen(first.steps.one?.costCounters)).toBe(true)
+    expect(Object.isFrozen(first.steps.one?.progressCounters)).toBe(true)
+    expect(operationStatus(completed)).toBe("succeeded")
+
+    const failed = atomicOutcome(createOperationRecord(await plan()), activeLease, {
+      errorChecksum: "atomic-failure",
+      state: "failed",
+    })
+    expect(failed.steps.one).toEqual({
+      costCounters: {},
+      errorChecksum: "atomic-failure",
+      fencingToken: activeLease.fencingToken,
+      lastAttemptId: "atomic-attempt-1",
+      progressCounters: {},
+      startedAttempts: 1,
+      state: "failed",
+    })
+    expect(operationStatus(failed)).toBe("failed")
+
+    const intervention = atomicOutcome(createOperationRecord(await plan()), activeLease, {
+      evidenceChecksum: "atomic-intervention",
+      state: "intervention_required",
+    })
+    expect(intervention.steps.one).toEqual({
+      costCounters: {},
+      fencingToken: activeLease.fencingToken,
+      lastAttemptId: "atomic-attempt-1",
+      progressCounters: {},
+      reconciliationEvidenceChecksum: "atomic-intervention",
+      startedAttempts: 1,
+      state: "intervention_required",
+    })
+    expect(operationStatus(intervention)).toBe("intervention_required")
+  })
+
+  it("replays only the exact terminal attempt, fence, and logical evidence", async () => {
+    const activeLease = acquire()
+    for (const outcome of [
+      success,
+      { errorChecksum: "atomic-failure", state: "failed" },
+      { evidenceChecksum: "atomic-intervention", state: "intervention_required" },
+    ] satisfies readonly AtomicStepOutcome[]) {
+      const committed = atomicOutcome(createOperationRecord(await plan()), activeLease, outcome)
+      expect(atomicOutcome(committed, activeLease, outcome)).toBe(committed)
+      expect(() =>
+        atomicOutcome(committed, activeLease, outcome, { attemptId: "different-attempt" }),
+      ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+      expect(() =>
+        atomicOutcome(committed, activeLease, outcome, {
+          proof: { ...leaseProof(activeLease), fencingToken: activeLease.fencingToken + 1 },
+        }),
+      ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+    }
+
+    const succeeded = atomicOutcome(createOperationRecord(await plan()), activeLease, success)
+    for (const replacement of [
+      { ...succeeded.steps.one, unexpected: "field" },
+      { ...succeeded.steps.one, activeAttemptId: "atomic-attempt-1" },
+      { ...succeeded.steps.one, authorizationChecksum: "unexpected-authorization" },
+      { ...succeeded.steps.one, costCounters: { calls: 1 } },
+      { ...succeeded.steps.one, errorChecksum: "unexpected-error" },
+      { ...succeeded.steps.one, fencingToken: activeLease.fencingToken + 1 },
+      { ...succeeded.steps.one, lastAttemptId: "different-attempt" },
+      { ...succeeded.steps.one, progressCounters: { phases: 1 } },
+      { ...succeeded.steps.one, reconciliationEvidenceChecksum: "unexpected-evidence" },
+      { ...succeeded.steps.one, resultChecksum: "different-result" },
+      { ...succeeded.steps.one, startedAttempts: 2 },
+    ]) {
+      const contradictory = {
+        ...succeeded,
+        steps: { ...succeeded.steps, one: replacement },
+      } as OperationRecord
+      expect(() => atomicOutcome(contradictory, activeLease, success)).toThrowError(
+        expect.objectContaining({ code: "OperationInterventionRequiredError" }),
+      )
+    }
+    expect(() =>
+      atomicOutcome(succeeded, activeLease, {
+        observedPostconditionChecksum: "post-one",
+        resultChecksum: "different-result",
+        state: "succeeded",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+    expect(() =>
+      atomicOutcome(succeeded, activeLease, {
+        errorChecksum: "different-terminal-state",
+        state: "failed",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+  })
+
+  it("requires exact plan bindings, a positive lease proof, and well-formed outcome evidence", async () => {
+    const activeLease = acquire()
+    const operation = createOperationRecord(await plan())
+    expect(() =>
+      atomicOutcome(operation, activeLease, success, { idempotencyKey: "different-key" }),
+    ).toThrow("different idempotency key")
+    expect(() =>
+      atomicOutcome(operation, activeLease, success, {
+        observedPreconditionChecksum: "different-precondition",
+      }),
+    ).toThrow("precondition")
+    expect(() =>
+      atomicOutcome(operation, activeLease, success, {
+        proof: { ...leaseProof(activeLease), leaseKey: "different-lease" },
+      }),
+    ).toThrow("wrong lease key")
+    expect(() =>
+      atomicOutcome(operation, activeLease, {
+        ...success,
+        observedPostconditionChecksum: "different-postcondition",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+    const irreversible = createOperationRecord(
+      await plan([step("one", { checkpoint: "irreversible" })]),
+    )
+    expect(() => atomicOutcome(irreversible, activeLease, success)).toThrow("requires a reversible")
+    for (const effectProtocol of ["provider_receipt", "saga_receipt"] as const) {
+      const receiptOwned = createOperationRecord(await plan([step("one", { effectProtocol })]))
+      expect(() => atomicOutcome(receiptOwned, activeLease, success)).toThrow(
+        "cannot bypass a receipt-owned step",
+      )
+    }
+
+    for (const proof of [
+      { ...leaseProof(activeLease), leaseKey: "" },
+      { ...leaseProof(activeLease), holderId: "" },
+      { ...leaseProof(activeLease), acquisitionId: "" },
+      { ...leaseProof(activeLease), fencingToken: 0 },
+    ]) {
+      expect(() => atomicOutcome(operation, activeLease, success, { proof })).toThrowError(
+        expect.objectContaining({ code: "ConfigurationError" }),
+      )
+    }
+    for (const outcome of [
+      null as unknown as AtomicStepOutcome,
+      { state: "future" } as unknown as AtomicStepOutcome,
+      { ...success, resultChecksum: "" },
+      { ...success, observedPostconditionChecksum: "" },
+      { errorChecksum: "", state: "failed" },
+      { evidenceChecksum: "", state: "intervention_required" },
+    ] satisfies readonly AtomicStepOutcome[]) {
+      expect(() => atomicOutcome(operation, activeLease, outcome)).toThrowError(
+        expect.objectContaining({ code: "ConfigurationError" }),
+      )
+    }
+  })
+
+  it("fails closed for attempted or conditionally omitted steps and malformed pending evidence", async () => {
+    const activeLease = acquire()
+    const operation = createOperationRecord(await plan())
+    const running = begin(operation, activeLease).operation
+    const retryable = recordStepFailure(running, {
+      attemptId: "attempt-1",
+      errorChecksum: "known-absence",
+      outcome: "definitely_not_applied",
+      stepId: "one",
+    })
+    const unknown = recordStepFailure(running, {
+      attemptId: "attempt-1",
+      errorChecksum: "unknown-effect",
+      outcome: "unknown",
+      stepId: "one",
+    })
+    const conditional = createOperationRecord(
+      await plan([step("one"), step("optional", { activation: "conditional" })]),
+    )
+    const notRequired = markOperationStepNotRequired(conditional, {
+      evidenceChecksum: "branch-decision",
+      stepId: "optional",
+    })
+    for (const attempted of [running, retryable, unknown]) {
+      expect(() => atomicOutcome(attempted, activeLease, success)).toThrowError(
+        expect.objectContaining({ code: "OperationResumeRequiredError" }),
+      )
+    }
+    expect(() =>
+      atomicOutcome(
+        notRequired,
+        activeLease,
+        {
+          observedPostconditionChecksum: "post-optional",
+          resultChecksum: "result-optional",
+          state: "succeeded",
+        },
+        { stepId: "optional" },
+      ),
+    ).toThrowError(expect.objectContaining({ code: "OperationResumeRequiredError" }))
+
+    const pending = operation.steps.one
+    for (const replacement of [
+      { ...pending, unexpected: "field" },
+      { ...pending, startedAttempts: 1 },
+      { ...pending, costCounters: { calls: 1 } },
+      { ...pending, progressCounters: { phases: 1 } },
+      { ...pending, activeAttemptId: "attempt" },
+      { ...pending, authorizationChecksum: "authorization" },
+      { ...pending, errorChecksum: "error" },
+      { ...pending, fencingToken: 1 },
+      { ...pending, lastAttemptId: "attempt" },
+      { ...pending, reconciliationEvidenceChecksum: "evidence" },
+      { ...pending, resultChecksum: "result" },
+    ]) {
+      const malformed = { ...operation, steps: { one: replacement } } as OperationRecord
+      expect(() => atomicOutcome(malformed, activeLease, success)).toThrowError(
+        expect.objectContaining({ code: "OperationInterventionRequiredError" }),
+      )
+    }
+  })
+
+  it("preserves one terminal attempt and rejects every changed replay across arbitrary fences", async () => {
+    const sealedPlan = await plan()
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 1, max: Number.MAX_SAFE_INTEGER - 1 }),
+        fc.nat({ max: 1_000_000 }),
+        fc.nat({ max: 1_000_000 }),
+        (fencingToken, attemptNumber, resultNumber) => {
+          const proof = {
+            acquisitionId: `acquisition-${fencingToken}`,
+            fencingToken,
+            holderId: `holder-${fencingToken}`,
+            leaseKey: "fleet:example",
+          }
+          const input = {
+            attemptId: `attempt-${attemptNumber}`,
+            idempotencyKey: "idempotency-one",
+            leaseProof: proof,
+            observedPreconditionChecksum: "pre-one",
+            outcome: {
+              observedPostconditionChecksum: "post-one",
+              resultChecksum: `result-${resultNumber}`,
+              state: "succeeded" as const,
+            },
+            stepId: "one",
+          }
+          const committed = recordAtomicStepOutcome(createOperationRecord(sealedPlan), input)
+          expect(recordAtomicStepOutcome(committed, input)).toBe(committed)
+          expect(committed.steps.one).toMatchObject({
+            fencingToken,
+            lastAttemptId: input.attemptId,
+            startedAttempts: 1,
+            state: "succeeded",
+          })
+          expect(() =>
+            recordAtomicStepOutcome(committed, {
+              ...input,
+              outcome: {
+                ...input.outcome,
+                resultChecksum: `${input.outcome.resultChecksum}-other`,
+              },
+            }),
+          ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+        },
+      ),
+      { numRuns: 200 },
+    )
   })
 })
 
