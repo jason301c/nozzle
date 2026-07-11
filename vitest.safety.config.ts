@@ -28,6 +28,7 @@ export default defineConfig({
         "packages/control/src/saga-plan.ts",
         "packages/control/src/saga-registry.ts",
         "packages/control/src/saga-store.ts",
+        "packages/control/src/saga-terminal.ts",
         "packages/core/src/hash.ts",
         "packages/core/src/migration.ts",
         "packages/core/src/movement.ts",
