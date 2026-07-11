@@ -1,10 +1,13 @@
 import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite"
 import {
   appendAuditEvent,
+  beginOperationStep,
   type DigestFunction,
   type IrreversibleAuthorization,
   leaseProof,
+  type OperationPlan,
   type OperationStepPlanInput,
+  operationStatus,
   sagaActionIdempotencyKey,
   sealIrreversibleAuthorization,
   sealOperationPlan,
@@ -19,7 +22,11 @@ import type {
   TransactionalControlDatabase,
 } from "../src/database.js"
 import { D1LeaseStore } from "../src/lease-store.js"
-import { D1OperationStore, operationTransitionIdentity } from "../src/operation-store.js"
+import {
+  D1OperationStore,
+  operationStepRecordJson,
+  operationTransitionIdentity,
+} from "../src/operation-store.js"
 import { D1SagaAttemptStore, sagaActionInputChecksum } from "../src/saga-attempt-store.js"
 import {
   D1SagaCoordinatorStore,
@@ -145,6 +152,61 @@ class FixedStatement implements ControlStatement {
 
   async run(): Promise<ControlRunResult> {
     return { meta: { changes: 0 }, success: true }
+  }
+}
+
+class OperationPlanViewStatement implements ControlStatement {
+  #statement: ControlStatement
+  readonly #plan: OperationPlan
+
+  constructor(statement: ControlStatement, plan: OperationPlan) {
+    this.#statement = statement
+    this.#plan = plan
+  }
+
+  bind(...values: readonly ControlBindingValue[]): ControlStatement {
+    this.#statement = this.#statement.bind(...values)
+    return this
+  }
+
+  async all<T>(): Promise<ControlQueryResult<T>> {
+    return this.#statement.all<T>()
+  }
+
+  async first<T>(): Promise<T | null> {
+    const row = await this.#statement.first<Record<string, unknown>>()
+    if (row === null) return null
+    return {
+      ...row,
+      operation_type: this.#plan.operationType,
+      plan_checksum: this.#plan.planChecksum,
+      plan_json: JSON.stringify(this.#plan),
+    } as T
+  }
+
+  async run(): Promise<ControlRunResult> {
+    return this.#statement.run()
+  }
+}
+
+class OperationPlanViewDatabase implements TransactionalControlDatabase {
+  readonly #base: DatabaseAdapter
+  readonly #plan: OperationPlan
+
+  constructor(base: DatabaseAdapter, plan: OperationPlan) {
+    this.#base = base
+    this.#plan = plan
+  }
+
+  batch(statements: readonly ControlStatement[]): Promise<readonly ControlRunResult[]> {
+    return this.#base.batch(statements)
+  }
+
+  prepare(sql: string): ControlStatement {
+    const statement = this.#base.prepare(sql)
+    return sql.includes('FROM "nozzle_operations" WHERE "operation_id" = ?1')
+      ? new OperationPlanViewStatement(statement, this.#plan)
+      : statement
   }
 }
 
@@ -962,6 +1024,7 @@ interface Fixture {
   readonly leases: D1LeaseStore
   readonly operationId: string
   readonly operations: D1OperationStore
+  readonly plan: OperationPlan
   readonly proof: ReturnType<typeof leaseProof>
   readonly sagaId: string
   readonly sagas: D1SagaStore
@@ -979,6 +1042,7 @@ async function fixture(
   omitActionPlan = false,
   omitTerminationPlan = false,
   irreversibleAction = false,
+  operationType?: string,
 ): Promise<Fixture> {
   const base = new DatabaseAdapter()
   databases.push(base)
@@ -1052,7 +1116,7 @@ async function fixture(
       idempotencyKey: `${operationId}:key`,
       inputChecksum: await digest(new TextEncoder().encode(operationInputJson)),
       operationId,
-      operationType: `saga:${descriptor.descriptorId}@1`,
+      operationType: operationType ?? `saga:${descriptor.descriptorId}@1`,
       steps: (
         [
           {
@@ -1176,6 +1240,7 @@ async function fixture(
     leases,
     operationId,
     operations,
+    plan,
     proof,
     sagaId,
     sagas,
@@ -1405,6 +1470,24 @@ function coupledProjectionRows(database: DatabaseSync) {
       .prepare(`SELECT * FROM "nozzle_operation_transitions" ORDER BY rowid`)
       .all(),
   }
+}
+
+function allControlRows(database: DatabaseSync): Readonly<Record<string, readonly unknown[]>> {
+  const tables = database
+    .prepare(
+      `SELECT "name" FROM "sqlite_schema"
+       WHERE "type" = 'table' AND "name" LIKE 'nozzle_%'
+       ORDER BY "name"`,
+    )
+    .all() as { readonly name: string }[]
+  return Object.freeze(
+    Object.fromEntries(
+      tables.map(({ name }) => [
+        name,
+        database.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all(),
+      ]),
+    ),
+  )
 }
 
 function acceptedAttemptRow(database: DatabaseSync, attemptId: string): Record<string, unknown> {
@@ -1647,6 +1730,162 @@ describe("D1SagaCoordinatorStore", () => {
     await expect(
       run.coordinator.settleActionFromReceipt(actionInput(run, attemptId)),
     ).resolves.toMatchObject({ status: "succeeded" })
+  })
+
+  it("rejects every generic reserved-saga mutation outside initialization acceptance", async () => {
+    const run = await fixture("generic-mutation-authority")
+    const mutations: readonly (readonly [string, () => Promise<unknown>])[] = [
+      [
+        "action acceptance",
+        () =>
+          run.operations.beginStep({
+            actorChecksum: "generic-authority-actor",
+            attemptId: `${run.sagaId}:a:forward:generic`,
+            idempotencyKey: sagaActionIdempotencyKey(run.sagaId, "a", "forward"),
+            observedPreconditionChecksum: `${run.operationId}:forward:precondition`,
+            operationId: run.operationId,
+            proof: run.proof,
+            stepId: sagaActionOperationStepId("a", "forward"),
+          }),
+      ],
+      [
+        "termination acceptance",
+        () =>
+          run.operations.beginStep({
+            actorChecksum: "generic-authority-actor",
+            attemptId: `${run.sagaId}:termination:generic`,
+            idempotencyKey: `${run.operationId}:termination:key`,
+            observedPreconditionChecksum: `${run.operationId}:termination:precondition`,
+            operationId: run.operationId,
+            proof: run.proof,
+            stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
+          }),
+      ],
+      [
+        "settlement acceptance",
+        () =>
+          run.operations.beginStep({
+            actorChecksum: "generic-authority-actor",
+            attemptId: `${run.sagaId}:settle:generic`,
+            idempotencyKey: `${run.operationId}:settle:key`,
+            observedPreconditionChecksum: `${run.operationId}:settle:precondition`,
+            operationId: run.operationId,
+            proof: run.proof,
+            stepId: SAGA_SETTLE_OPERATION_STEP_ID,
+          }),
+      ],
+      [
+        "initialization outcome",
+        () =>
+          run.operations.completeStep({
+            actorChecksum: "generic-authority-actor",
+            attemptId: run.initialize.attemptId,
+            observedPostconditionChecksum: run.initialize.observedPostconditionChecksum,
+            operationId: run.operationId,
+            proof: run.proof,
+            resultChecksum: run.initialize.resultChecksum,
+            stepId: SAGA_INIT_OPERATION_STEP_ID,
+          }),
+      ],
+      [
+        "termination failure",
+        () =>
+          run.operations.failStep({
+            actorChecksum: "generic-authority-actor",
+            attemptId: `${run.sagaId}:termination:generic`,
+            errorChecksum: "generic-termination-error",
+            operationId: run.operationId,
+            outcome: "permanent",
+            proof: run.proof,
+            stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
+          }),
+      ],
+      [
+        "settlement reconciliation",
+        () =>
+          run.operations.reconcileStep({
+            actorChecksum: "generic-authority-actor",
+            evidenceChecksum: "generic-settlement-evidence",
+            operationId: run.operationId,
+            outcome: "not_applied",
+            proof: run.proof,
+            reconciliationId: "generic-settlement-reconciliation",
+            stepId: SAGA_SETTLE_OPERATION_STEP_ID,
+          }),
+      ],
+      [
+        "initialization recovery",
+        () =>
+          run.operations.recoverRunningStep({
+            actorChecksum: "generic-authority-actor",
+            operationId: run.operationId,
+            proof: run.proof,
+            recoveryId: "generic-initialization-recovery",
+            stepId: SAGA_INIT_OPERATION_STEP_ID,
+          }),
+      ],
+      [
+        "branch classification",
+        () =>
+          run.operations.markStepNotRequired({
+            actorChecksum: "generic-authority-actor",
+            decisionId: "generic-branch-decision",
+            evidenceChecksum: "generic-branch-evidence",
+            operationId: run.operationId,
+            proof: run.proof,
+            stepId: sagaActionOperationStepId("a", "forward"),
+          }),
+      ],
+    ]
+
+    for (const [label, mutation] of mutations) {
+      const before = allControlRows(run.base.database)
+      await expect(mutation(), label).rejects.toThrow(
+        /must be consumed through D1SagaCoordinatorStore/u,
+      )
+      expect(allControlRows(run.base.database), label).toEqual(before)
+    }
+
+    let stepIdReads = 0
+    const beforeSwitch = allControlRows(run.base.database)
+    await expect(
+      run.operations.beginStep({
+        actorChecksum: "generic-authority-actor",
+        attemptId: run.initialize.attemptId,
+        idempotencyKey: `${run.operationId}:init:key`,
+        observedPreconditionChecksum: `${run.operationId}:init:precondition`,
+        operationId: run.operationId,
+        proof: run.proof,
+        get stepId() {
+          stepIdReads += 1
+          return stepIdReads === 1 ? SAGA_INIT_OPERATION_STEP_ID : SAGA_SETTLE_OPERATION_STEP_ID
+        },
+      }),
+    ).resolves.toMatchObject({ disposition: "in_progress" })
+    expect(stepIdReads).toBe(1)
+    expect(allControlRows(run.base.database)).toEqual(beforeSwitch)
+
+    const beforeProxy = allControlRows(run.base.database)
+    await expect(
+      run.operations.beginStep({
+        actorChecksum: "generic-authority-actor",
+        attemptId: run.initialize.attemptId,
+        idempotencyKey: `${run.operationId}:init:key`,
+        observedPreconditionChecksum: `${run.operationId}:init:precondition`,
+        operationId: run.operationId,
+        proof: new Proxy(run.proof, {}),
+        stepId: SAGA_INIT_OPERATION_STEP_ID,
+      }),
+    ).rejects.toThrow(/could not be captured safely/u)
+    expect(allControlRows(run.base.database)).toEqual(beforeProxy)
+
+    await expect(run.coordinator.initializeSaga(run.initialize)).resolves.toMatchObject({
+      sagaId: run.sagaId,
+      status: "planned",
+    })
+    await expect(run.coordinator.beginAction(actionInput(run))).resolves.toMatchObject({
+      disposition: "execute",
+    })
   })
 
   it("fails closed on corrupted active projections before either classification path", async () => {
@@ -3619,6 +3858,38 @@ describe("D1SagaCoordinatorStore", () => {
     expect(coupledProjectionRows(run.base.database)).toEqual(beforeReplay)
   })
 
+  it("replays a receipt-backed legacy initialization before enforcing the reserved type", async () => {
+    const run = await fixture(
+      "legacy-initialization-replay",
+      undefined,
+      undefined,
+      false,
+      false,
+      false,
+      "saga",
+    )
+    const writerPlan = await sealOperationPlan(
+      {
+        capabilitySnapshotChecksum: run.plan.capabilitySnapshotChecksum,
+        idempotencyKey: run.plan.idempotencyKey,
+        inputChecksum: run.plan.inputChecksum,
+        operationId: run.plan.operationId,
+        operationType: `saga:${run.initialize.descriptor.descriptorId}@1`,
+        steps: run.plan.steps,
+      },
+      digest,
+    )
+    const legacyWriter = new D1SagaCoordinatorStore(
+      new OperationPlanViewDatabase(run.base, writerPlan),
+      digest,
+    )
+    const initialized = await legacyWriter.initializeSaga(run.initialize)
+    const beforeReplay = allControlRows(run.base.database)
+
+    await expect(run.coordinator.initializeSaga(run.initialize)).resolves.toEqual(initialized)
+    expect(allControlRows(run.base.database)).toEqual(beforeReplay)
+  })
+
   it("converges on one concurrent initialization winner after stale outer reads", async () => {
     const run = await fixture("concurrent-initialization-winner")
     let winner: unknown
@@ -3845,18 +4116,60 @@ describe("D1SagaCoordinatorStore", () => {
       wrongOperationCoordinator.beginAction(actionInput(wrongOperation)),
     ).rejects.toThrow(/different operation/u)
 
-    const divergent = await fixture("divergent")
+    const noncanonical = await fixture(
+      "legacy-generic-divergence",
+      undefined,
+      undefined,
+      false,
+      false,
+      false,
+      "saga",
+    )
+    await expect(noncanonical.coordinator.initializeSaga(noncanonical.initialize)).rejects.toThrow(
+      /new saga must use the reserved saga operation type/iu,
+    )
+
+    const divergent = await fixture("raw-projection-divergence")
     await divergent.coordinator.initializeSaga(divergent.initialize)
     const attemptId = `${divergent.sagaId}:a:forward:1`
-    await divergent.operations.beginStep({
-      actorChecksum: "coordinator-test-actor",
+    const operation = await divergent.operations.get(divergent.operationId)
+    if (operation === undefined) throw new Error("Divergence fixture operation is missing.")
+    const authorized = await divergent.leases.authorizeAt(divergent.proof)
+    const decision = beginOperationStep(operation.operation, {
       attemptId,
       idempotencyKey: sagaActionIdempotencyKey(divergent.sagaId, "a", "forward"),
+      lease: authorized.record,
+      leaseProof: divergent.proof,
       observedPreconditionChecksum: `${divergent.operationId}:forward:precondition`,
-      operationId: divergent.operationId,
-      proof: divergent.proof,
+      serverTimeMs: authorized.serverTimeMs,
       stepId: sagaActionOperationStepId("a", "forward"),
     })
+    if (decision.disposition !== "execute") {
+      throw new Error("Divergence fixture action did not start.")
+    }
+    const operationStepId = sagaActionOperationStepId("a", "forward")
+    const operationStep = decision.operation.steps[operationStepId]
+    if (operationStep === undefined) throw new Error("Divergence fixture step is missing.")
+    divergent.base.database.exec(
+      `DROP TRIGGER "nozzle_control_step_state_update";
+       DROP TRIGGER "nozzle_control_operation_status_update";`,
+    )
+    divergent.base.database
+      .prepare(
+        `UPDATE "nozzle_operation_steps"
+         SET "record_json" = ?, "state" = ?, "fencing_token" = ?
+         WHERE "operation_id" = ? AND "step_id" = ?`,
+      )
+      .run(
+        operationStepRecordJson(operationStep),
+        operationStep.state,
+        operationStep.fencingToken ?? null,
+        divergent.operationId,
+        operationStepId,
+      )
+    divergent.base.database
+      .prepare(`UPDATE "nozzle_operations" SET "status" = ? WHERE "operation_id" = ?`)
+      .run(operationStatus(decision.operation), divergent.operationId)
     await expect(
       divergent.coordinator.beginAction(actionInput(divergent, attemptId)),
     ).rejects.toThrow(/begin decisions diverged/u)

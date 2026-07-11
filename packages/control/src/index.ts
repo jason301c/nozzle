@@ -11,5 +11,10 @@ export * from "./saga-handler.js"
 export * from "./saga-input.js"
 export * from "./saga-plan.js"
 export * from "./saga-registry.js"
-export * from "./saga-store.js"
+export {
+  SAGA_INIT_OPERATION_STEP_ID,
+  SAGA_SETTLE_OPERATION_STEP_ID,
+  SAGA_TERMINATION_OPERATION_STEP_ID,
+  sagaActionOperationStepId,
+} from "./saga-store.js"
 export * from "./schema.js"

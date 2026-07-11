@@ -26,6 +26,7 @@ import {
 } from "@nozzle/core"
 import type { ControlRunResult, TransactionalControlDatabase } from "./database.js"
 import { D1LeaseStore } from "./lease-store.js"
+import { SAGA_INIT_OPERATION_STEP_ID } from "./saga-store.js"
 
 const MAX_CREATE_ATTEMPTS = 16
 const MAX_TRANSITION_ATTEMPTS = 16
@@ -324,6 +325,43 @@ function validateMutationResults(
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function isReservedSagaOperation(operation: OperationRecord): boolean {
+  return operation.plan.operationType.startsWith("saga:")
+}
+
+function sagaCoordinatorRequired(): never {
+  return intervention(
+    "Reserved saga operation mutations must be consumed through D1SagaCoordinatorStore.",
+  )
+}
+
+function snapshotBeginStepInput(
+  input: BeginStoredOperationStepInput,
+): BeginStoredOperationStepInput {
+  try {
+    const actorChecksum = input.actorChecksum
+    const attemptId = input.attemptId
+    const idempotencyKey = input.idempotencyKey
+    const irreversibleAuthorization = input.irreversibleAuthorization
+    const observedPreconditionChecksum = input.observedPreconditionChecksum
+    const operationId = input.operationId
+    const proof = Object.freeze(structuredClone(input.proof))
+    const stepId = input.stepId
+    return Object.freeze({
+      actorChecksum,
+      attemptId,
+      idempotencyKey,
+      ...(irreversibleAuthorization === undefined ? {} : { irreversibleAuthorization }),
+      observedPreconditionChecksum,
+      operationId,
+      proof,
+      stepId,
+    })
+  } catch {
+    return configuration("Operation step input could not be captured safely.")
+  }
 }
 
 export function operationTransitionIdentity(kind: string, parts: readonly string[]): string {
@@ -1092,41 +1130,48 @@ export class D1OperationStore {
   }
 
   async beginStep(input: BeginStoredOperationStepInput): Promise<StepInvocationDecision> {
-    const irreversibleAuthorization = input.irreversibleAuthorization
-    nonEmpty(input.operationId, "Operation ID")
-    nonEmpty(input.actorChecksum, "Transition actor checksum")
+    const snapshot = snapshotBeginStepInput(input)
+    const irreversibleAuthorization = snapshot.irreversibleAuthorization
+    nonEmpty(snapshot.operationId, "Operation ID")
+    nonEmpty(snapshot.actorChecksum, "Transition actor checksum")
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt += 1) {
-      const before = await this.get(input.operationId)
+      const before = await this.get(snapshot.operationId)
       if (!before) return resume("The operation does not exist.")
-      const authorized = await this.#leases.authorizeAt(input.proof)
+      if (
+        isReservedSagaOperation(before.operation) &&
+        snapshot.stepId !== SAGA_INIT_OPERATION_STEP_ID
+      ) {
+        return sagaCoordinatorRequired()
+      }
+      const authorized = await this.#leases.authorizeAt(snapshot.proof)
       const decision = beginOperationStep(before.operation, {
-        attemptId: input.attemptId,
-        idempotencyKey: input.idempotencyKey,
+        attemptId: snapshot.attemptId,
+        idempotencyKey: snapshot.idempotencyKey,
         ...(irreversibleAuthorization === undefined ? {} : { irreversibleAuthorization }),
         lease: authorized.record,
-        leaseProof: input.proof,
-        observedPreconditionChecksum: input.observedPreconditionChecksum,
+        leaseProof: snapshot.proof,
+        observedPreconditionChecksum: snapshot.observedPreconditionChecksum,
         serverTimeMs: authorized.serverTimeMs,
-        stepId: input.stepId,
+        stepId: snapshot.stepId,
       })
       if (decision.disposition !== "execute") return decision
       const after: LoadedOperation = Object.freeze({ ...before, operation: decision.operation })
       const persisted = await this.#persistTransition({
-        actorChecksum: input.actorChecksum,
+        actorChecksum: snapshot.actorChecksum,
         after,
         auditEventType: "step.attempt.accepted",
         auditPayloadChecksum: (
           before.operation.plan.steps.find(
-            (step) => step.stepId === input.stepId,
+            (step) => step.stepId === snapshot.stepId,
           ) as OperationStepPlan
         ).inputChecksum,
         before,
-        proof: input.proof,
-        stepId: input.stepId,
+        proof: snapshot.proof,
+        stepId: snapshot.stepId,
         transitionId: operationTransitionIdentity("accepted", [
-          input.operationId,
-          input.stepId,
-          input.attemptId,
+          snapshot.operationId,
+          snapshot.stepId,
+          snapshot.attemptId,
         ]),
       })
       if (persisted)
@@ -1150,6 +1195,7 @@ export class D1OperationStore {
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt += 1) {
       const before = await this.get(input.operationId)
       if (!before) return resume("The operation does not exist.")
+      if (isReservedSagaOperation(before.operation)) return sagaCoordinatorRequired()
       const afterOperation = markOperationStepNotRequired(before.operation, input)
       if (afterOperation === before.operation) return before.operation
       await this.#leases.authorizeAt(input.proof)
@@ -1181,6 +1227,7 @@ export class D1OperationStore {
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt += 1) {
       const before = await this.get(input.operationId)
       if (!before) return resume("The operation does not exist.")
+      if (isReservedSagaOperation(before.operation)) return sagaCoordinatorRequired()
       const record = before.operation.steps[input.stepId]
       if (record?.state !== "running") {
         const receipt = await this.#transition(transitionId)
@@ -1363,6 +1410,7 @@ export class D1OperationStore {
     for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt += 1) {
       const before = await this.get(input.operationId)
       if (!before) return resume("The operation does not exist.")
+      if (isReservedSagaOperation(before.operation)) return sagaCoordinatorRequired()
       const planStep = before.operation.plan.steps.find(
         (candidate) => candidate.stepId === input.stepId,
       ) as OperationStepPlan | undefined

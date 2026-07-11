@@ -1960,6 +1960,9 @@ export class D1SagaCoordinatorStore {
       const existing = await this.#saga(input.sagaId, input.operationId)
       const replay = await this.#initializedProjection(input)
       if (replay !== undefined) return replay
+      if (!beforeOperation.operation.plan.operationType.startsWith("saga:")) {
+        return intervention("A new saga must use the reserved saga operation type.")
+      }
       const fresh = createSagaRecord({
         deadlineAtMs: input.deadlineAtMs,
         descriptor: input.descriptor,
