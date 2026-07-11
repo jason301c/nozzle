@@ -5,7 +5,7 @@ import type { D1DatabaseLike, D1PreparedStatementLike, D1ResultLike } from "../s
 import { eq } from "../src/expression.js"
 import type { ExecutionPlan } from "../src/plan.js"
 import { SchemaRegistry } from "../src/schema.js"
-import { createScopedDatabase, type PlannedQuery } from "../src/scoped.js"
+import { createScopedDatabase, type PlannedQuery, type ScopedPlanTransport } from "../src/scoped.js"
 
 const projects = sqliteTable("projects", {
   id: text().primaryKey(),
@@ -96,6 +96,68 @@ describe("ScopedDatabase", () => {
         schemaId: "schema-v1",
       }),
     ).toThrow("partition key does not match")
+  })
+
+  it("rejects missing, conflicting, and incomplete execution backends", () => {
+    const database = new Database()
+    const resolveRoute = async () => ({
+      bucketId: 42,
+      partitionDigestHex: PARTITION_DIGEST,
+      partitionValue: "workspace-fictional",
+      routeEpoch: 7,
+      shardId: "shard-fictional",
+    })
+    const base = {
+      partitionKey: "workspaceId",
+      registry,
+      resolveRoute,
+      schemaId: "schema-v1",
+    } as const
+    const validTransport: ScopedPlanTransport = {
+      async batch(plans) {
+        return plans.map(() => ({ success: true, results: [], meta }))
+      },
+      async execute() {
+        return { success: true, results: [], meta }
+      },
+    }
+
+    for (const options of [
+      base,
+      { ...base, resolveDatabase: () => database, transport: validTransport },
+      { ...base, transport: null },
+      { ...base, transport: {} },
+      { ...base, transport: { execute() {} } },
+      { ...base, transport: { batch() {} } },
+    ]) {
+      expect(() => createScopedDatabase(options as never)).toThrow(
+        "requires exactly one direct database resolver or routed transport",
+      )
+    }
+  })
+
+  it("lists registered tables in immutable code-unit order", () => {
+    const alpha = sqliteTable("alpha", {
+      id: text().primaryKey(),
+      workspaceId: text("workspace_id").notNull(),
+    })
+    const zulu = sqliteTable("zulu", {
+      id: text().primaryKey(),
+      workspaceId: text("workspace_id").notNull(),
+    })
+    const names = (schema: Record<string, unknown>) =>
+      new SchemaRegistry({ partitionKey: "workspaceId", schema })
+        .tables()
+        .map((table) => table.tableName)
+
+    const reverseInput = new SchemaRegistry({
+      partitionKey: "workspaceId",
+      schema: { zulu, alpha },
+    }).tables()
+
+    expect(reverseInput.map((table) => table.tableName)).toEqual(["alpha", "zulu"])
+    expect(Object.isFrozen(reverseInput)).toBe(true)
+    expect(names({ alpha, zulu })).toEqual(["alpha", "zulu"])
   })
 
   it("resolves and caches routing lazily on first execution", async () => {
@@ -197,6 +259,102 @@ describe("ScopedDatabase", () => {
     await expect(update.toPlan()).resolves.toMatchObject({ operation: "update" })
     await expect(deletion.toPlan()).resolves.toMatchObject({ operation: "delete" })
     expect(resolveRoute).toHaveBeenCalledTimes(1)
+  })
+
+  it("executes direct insert, update, and delete mutations", async () => {
+    const database = new Database()
+    database.results = [
+      { success: true, results: [{ routeEpoch: 7 }], meta },
+      { success: true, results: [], meta },
+    ]
+    const { db } = create(database)
+
+    await expect(db.insert(projects).values({ id: "direct-1", name: "Direct" })).resolves.toEqual(
+      database.results[1],
+    )
+    await expect(db.update(projects).set({ name: "Updated" })).resolves.toEqual(database.results[1])
+    await expect(db.delete(projects)).resolves.toEqual(database.results[1])
+    expect(database.batchSizes).toEqual([2, 2, 2])
+  })
+
+  it("executes routed reads, mutations, and complete batches", async () => {
+    const mutationResult = { success: true, results: [], meta } as const
+    const transport: ScopedPlanTransport = {
+      batch: vi.fn(async (plans: readonly ExecutionPlan[]) => plans.map(() => mutationResult)),
+      execute: vi.fn(async (plan: ExecutionPlan) =>
+        plan.operation === "select"
+          ? {
+              success: true as const,
+              results: [
+                {
+                  id: "routed-1",
+                  workspaceId: "workspace-fictional",
+                  name: "Routed",
+                },
+              ],
+              meta,
+            }
+          : mutationResult,
+      ),
+    }
+    const db = createScopedDatabase({
+      partitionKey: "workspaceId",
+      registry,
+      resolveRoute: async () => ({
+        bucketId: 42,
+        partitionDigestHex: PARTITION_DIGEST,
+        partitionValue: "workspace-fictional",
+        routeEpoch: 7,
+        shardId: "shard-fictional",
+      }),
+      schemaId: "schema-v1",
+      transport,
+    })
+
+    await expect(db.select().from(projects)).resolves.toEqual([
+      { id: "routed-1", workspaceId: "workspace-fictional", name: "Routed" },
+    ])
+    await expect(db.insert(projects).values({ id: "routed-1", name: "Routed" })).resolves.toEqual(
+      mutationResult,
+    )
+    await expect(db.update(projects).set({ name: "Updated" })).resolves.toEqual(mutationResult)
+    await expect(db.delete(projects)).resolves.toEqual(mutationResult)
+    await expect(
+      db.batch([
+        db.insert(projects).values({ id: "routed-2", name: "Batch" }),
+        db.delete(projects),
+      ]),
+    ).resolves.toEqual([mutationResult, mutationResult])
+    expect(transport.execute).toHaveBeenCalledTimes(4)
+    expect(transport.batch).toHaveBeenCalledTimes(1)
+  })
+
+  it("rejects an incomplete routed batch", async () => {
+    const transport: ScopedPlanTransport = {
+      async batch() {
+        return []
+      },
+      async execute() {
+        return { success: true, results: [], meta }
+      },
+    }
+    const db = createScopedDatabase({
+      partitionKey: "workspaceId",
+      registry,
+      resolveRoute: async () => ({
+        bucketId: 42,
+        partitionDigestHex: PARTITION_DIGEST,
+        partitionValue: "workspace-fictional",
+        routeEpoch: 7,
+        shardId: "shard-fictional",
+      }),
+      schemaId: "schema-v1",
+      transport,
+    })
+
+    await expect(db.batch([db.delete(projects)])).rejects.toMatchObject({
+      code: "ShardUnavailableError",
+    })
   })
 
   it("executes a portable multi-statement batch with one authorization statement", async () => {
@@ -324,6 +482,86 @@ describe("ScopedDatabase", () => {
 
     database.results = [{ success: true, results: [{ routeEpoch: 7 }], meta }]
     await expect(db.batch([query])).rejects.toMatchObject({ code: "ShardUnavailableError" })
+  })
+
+  it("compares typed partition values without conflating encodings", async () => {
+    const blobProjects = sqliteTable("blob_projects", {
+      id: text().primaryKey(),
+      workspaceId: blob("workspace_id", { mode: "buffer" }).notNull(),
+    })
+    const textProjects = sqliteTable("text_projects", {
+      id: text().primaryKey(),
+      workspaceId: text("workspace_id").notNull(),
+    })
+    const typedRegistry = new SchemaRegistry({
+      partitionKey: "workspaceId",
+      schema: { blobProjects, textProjects },
+    })
+    const result = { success: true, results: [], meta } as const
+    const transport: ScopedPlanTransport = {
+      async batch(plans) {
+        return plans.map(() => result)
+      },
+      async execute() {
+        return result
+      },
+    }
+    const createTyped = (partitionValue: unknown) =>
+      createScopedDatabase({
+        partitionKey: "workspaceId",
+        registry: typedRegistry,
+        resolveRoute: async () => ({
+          bucketId: 42,
+          partitionDigestHex: PARTITION_DIGEST,
+          partitionValue,
+          routeEpoch: 7,
+          shardId: "shard-fictional",
+        }),
+        schemaId: "schema-v1",
+        transport,
+      })
+    const executor = createTyped(Buffer.from([1, 2]))
+    const blobPlan = await executor.delete(blobProjects).toPlan()
+    const sameBlobPlan = await createTyped(Buffer.from([1, 2]))
+      .delete(blobProjects)
+      .toPlan()
+    const otherBlobPlan = await createTyped(Buffer.from([1, 3]))
+      .delete(blobProjects)
+      .toPlan()
+    const textPlan = await createTyped("workspace-fictional").delete(textProjects).toPlan()
+    const nullPlan = await createTyped(null).delete(textProjects).toPlan()
+
+    await expect(executor.batch([planned(blobPlan), planned(sameBlobPlan)])).resolves.toEqual([
+      result,
+      result,
+    ])
+    for (const plans of [
+      [blobPlan, otherBlobPlan],
+      [textPlan, blobPlan],
+      [nullPlan, blobPlan],
+    ] as const) {
+      await expect(executor.batch(plans.map(planned))).rejects.toMatchObject({
+        code: "CrossShardTransactionUnsupportedError",
+      })
+    }
+  })
+
+  it("fails closed if a hostile batch changes shape after admission", async () => {
+    const database = new Database()
+    const { db } = create(database)
+    let lengthReads = 0
+    const queries = new Proxy([db.delete(projects)], {
+      get(target, property, receiver) {
+        if (property === "length") {
+          lengthReads += 1
+          return lengthReads <= 2 ? 1 : 0
+        }
+        return Reflect.get(target, property, receiver)
+      },
+    })
+
+    await expect(db.batch(queries)).rejects.toThrow("cannot be empty")
+    expect(lengthReads).toBe(3)
   })
 })
 

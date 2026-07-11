@@ -31,12 +31,6 @@ function identifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`
 }
 
-function compareCodeUnits(left: string, right: string): number {
-  if (left < right) return -1
-  if (left > right) return 1
-  return 0
-}
-
 class Parameters {
   readonly values: D1BindingValue[] = []
 
@@ -51,9 +45,6 @@ class Parameters {
 
 function decodePlanValue(value: PlanValue): D1BindingValue {
   if (typeof value !== "object" || value === null) return value
-  if (!/^(?:[0-9a-f]{2})*$/u.test(value.hex)) {
-    throw new NozzleError("UnsafeQueryRequiredError", "A BLOB plan value is malformed.")
-  }
   const bytes = new Uint8Array(value.hex.length / 2)
   for (let index = 0; index < bytes.length; index += 1) {
     bytes[index] = Number.parseInt(value.hex.slice(index * 2, index * 2 + 2), 16)
@@ -105,17 +96,18 @@ function compileData(plan: ExecutionPlan): CompiledStatement {
       break
     }
     case "insert": {
-      const entries = Object.entries(plan.values).sort(([left], [right]) =>
-        compareCodeUnits(left, right),
-      )
+      const entries = Object.keys(plan.values)
+        .sort()
+        .map((column) => [column, plan.values[column] as PlanValue] as const)
       const columns = entries.map(([column]) => identifier(column)).join(", ")
       const values = entries.map(([, value]) => parameters.bind(value)).join(", ")
       sql = `INSERT INTO ${identifier(plan.table)} (${columns}) SELECT ${values} WHERE ${ownershipExists(plan, parameters)}`
       break
     }
     case "update": {
-      const assignments = Object.entries(plan.values)
-        .sort(([left], [right]) => compareCodeUnits(left, right))
+      const assignments = Object.keys(plan.values)
+        .sort()
+        .map((column) => [column, plan.values[column] as PlanValue] as const)
         .map(([column, value]) => `${identifier(column)} = ${parameters.bind(value)}`)
         .join(", ")
       sql = `UPDATE ${identifier(plan.table)} SET ${assignments} WHERE ${whereClause(plan, parameters)}`

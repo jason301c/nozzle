@@ -4,7 +4,9 @@
     "composite": false,
     "declaration": false,
     "declarationMap": false,
+    "incremental": true,
     "noEmit": true,
+    "tsBuildInfoFile": ".tsconfig.test.tsbuildinfo",
     "types": ["node", "vitest/globals"]
   },
   "include": [

@@ -74,4 +74,28 @@ describe("NozzleError", () => {
     expect(JSON.stringify(serialized)).not.toContain("fictional-secret-value")
     expect(isNozzleError({ code: "ConfigurationError" })).toBe(false)
   })
+
+  it("preserves the public serialization of known Nozzle errors", () => {
+    const error = new NozzleError("ConfigurationError", "The fictional field is invalid.", {
+      details: {
+        field: "region",
+        password: "fictional-password",
+      },
+    })
+
+    const serialized = serializeError(error)
+
+    expect(serialized).toEqual(error.toJSON())
+    expect(serialized).toMatchObject({
+      code: "ConfigurationError",
+      details: {
+        field: "region",
+        password: "[redacted]",
+      },
+      family: "configuration",
+      message: "The fictional field is invalid.",
+      retryable: false,
+    })
+    expect(JSON.stringify(serialized)).not.toContain("fictional-password")
+  })
 })

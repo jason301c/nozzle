@@ -196,9 +196,7 @@ export class NozzleError extends Error {
     this.family = definition.family
     this.retryable = options.retryable ?? definition.retryable
     this.remediation = options.remediation ?? definition.remediation
-    this.details = Object.freeze(
-      (redact(options.details ?? {}) as Readonly<Record<string, unknown>>) ?? {},
-    )
+    this.details = Object.freeze(redact(options.details ?? {}) as Readonly<Record<string, unknown>>)
   }
 
   toJSON(): SerializedNozzleError {

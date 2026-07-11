@@ -49,12 +49,6 @@ function sqliteStorageType(sqlType: string): SQLiteStorageType {
   return "numeric"
 }
 
-function compareCodeUnits(left: string, right: string): number {
-  if (left < right) return -1
-  if (left > right) return 1
-  return 0
-}
-
 export class SchemaRegistry<TSchema extends Record<string, unknown> = Record<string, unknown>> {
   readonly #columns = new WeakMap<object, ColumnMetadata>()
   readonly #tables = new WeakMap<object, TableMetadata>()
@@ -219,9 +213,9 @@ export class SchemaRegistry<TSchema extends Record<string, unknown> = Record<str
 
   tables(): readonly TableMetadata[] {
     return Object.freeze(
-      [...this.#tablesByName.values()].sort((left, right) =>
-        compareCodeUnits(left.tableName, right.tableName),
-      ),
+      [...this.#tablesByName.keys()]
+        .sort()
+        .map((tableName) => this.#tablesByName.get(tableName) as TableMetadata),
     )
   }
 
