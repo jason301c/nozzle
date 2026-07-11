@@ -15,6 +15,7 @@ describe("@nozzle/control public API", () => {
       "loadSagaAttemptIdentityRow",
       "loadSagaAttemptOutcomeRow",
       "SagaHistoryAuditFolder",
+      "SagaHistoryTransitionFolder",
       "SAGA_ATTEMPT_IDENTITY_ROW_SELECT",
       "SAGA_ATTEMPT_OUTCOME_ROW_SELECT",
       "SAGA_ATTEMPT_PAYLOAD_ROW_SELECT",

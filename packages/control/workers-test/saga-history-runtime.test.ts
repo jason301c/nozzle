@@ -1,8 +1,20 @@
 import { env } from "cloudflare:test"
-import { appendAuditEvent, type DigestFunction } from "@nozzle/core"
+import {
+  appendAuditEvent,
+  beginOperationStep,
+  createOperationRecord,
+  type DigestFunction,
+  decideLeaseAcquisition,
+  leaseProof,
+  type OperationStepRecord,
+  operationStatus,
+  recordStepSuccess,
+  sealOperationPlan,
+} from "@nozzle/core"
 import { beforeAll, describe, expect, it } from "vitest"
+import { operationStepRecordJson, operationTransitionIdentity } from "../src/operation-store.js"
 import { D1SagaHistoryReader } from "../src/saga-history.js"
-import { SagaHistoryAuditFolder } from "../src/saga-history-fold.js"
+import { SagaHistoryAuditFolder, SagaHistoryTransitionFolder } from "../src/saga-history-fold.js"
 
 declare global {
   namespace Cloudflare {
@@ -27,7 +39,7 @@ beforeAll(async () => {
   for (const statement of [
     `CREATE TABLE "nozzle_operations" (
       "operation_id" TEXT PRIMARY KEY, "environment_id" TEXT, "input_checksum" TEXT,
-      "plan_checksum" TEXT, "status" TEXT, "updated_at_ms" INTEGER
+      "plan_checksum" TEXT, "plan_json" TEXT, "status" TEXT, "updated_at_ms" INTEGER
     )`,
     `CREATE TABLE "nozzle_sagas" (
       "saga_id" TEXT PRIMARY KEY, "operation_id" TEXT, "descriptor_checksum" TEXT,
@@ -68,11 +80,12 @@ beforeAll(async () => {
     await env.DB.prepare(statement).run()
   }
   await run(
-    `INSERT INTO "nozzle_operations" VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO "nozzle_operations" VALUES (?, ?, ?, ?, ?, ?, ?)`,
     "history-operation",
     "history-environment",
     "operation-input",
     "operation-plan",
+    "{}",
     "running",
     11,
   )
@@ -162,6 +175,235 @@ describe("real workerd D1 saga history paging", () => {
       nextCursor: null,
       rows: [],
     })
+  })
+
+  it("loads the immutable plan and folds queried operation history in workerd", async () => {
+    const operationId = "runtime-fold-operation"
+    const sagaId = "runtime-fold-saga"
+    const environmentId = "runtime-fold-environment"
+    const plan = await sealOperationPlan(
+      {
+        capabilitySnapshotChecksum: "runtime-capabilities",
+        idempotencyKey: "runtime-operation-key",
+        inputChecksum: "runtime-operation-input",
+        operationId,
+        operationType: "saga:runtime-fold@1",
+        steps: [
+          {
+            checkpoint: "reversible",
+            dependsOn: [],
+            effectProtocol: "opaque",
+            idempotencyKey: "runtime-init-key",
+            inputChecksum: "runtime-init-input",
+            leaseKey: `saga:${sagaId}`,
+            postconditionChecksum: "runtime-init-postcondition",
+            preconditionChecksum: "runtime-init-precondition",
+            recoveryInstructions: "Reconstruct the runtime initialization receipt.",
+            retryClassification: "idempotent",
+            stepId: "saga:init",
+          },
+        ],
+      },
+      digest,
+    )
+    const initial = createOperationRecord(plan)
+    const leaseDecision = decideLeaseAcquisition(undefined, {
+      acquisitionId: "runtime-acquisition",
+      holderId: "runtime-holder",
+      leaseKey: `saga:${sagaId}`,
+      serverTimeMs: 1,
+      ttlMs: 100,
+    })
+    if (!leaseDecision.acquired) throw new Error("Runtime fixture lease was not acquired")
+    const lease = leaseDecision.record
+    const invocation = beginOperationStep(initial, {
+      attemptId: "runtime-init-attempt",
+      idempotencyKey: "runtime-init-key",
+      lease,
+      leaseProof: leaseProof(lease),
+      observedPreconditionChecksum: "runtime-init-precondition",
+      serverTimeMs: 2,
+      stepId: "saga:init",
+    })
+    if (invocation.disposition !== "execute") {
+      throw new Error("Runtime fixture initialization did not start")
+    }
+    const running = invocation.operation
+    const succeeded = recordStepSuccess(running, {
+      attemptId: "runtime-init-attempt",
+      observedPostconditionChecksum: "runtime-init-postcondition",
+      resultChecksum: "runtime-init-result",
+      stepId: "saga:init",
+    })
+    const created = await appendAuditEvent(
+      undefined,
+      {
+        actorChecksum: "runtime-actor",
+        environmentId,
+        eventType: "operation.created",
+        fencingToken: null,
+        idempotencyKey: `${operationId}:created`,
+        operationId,
+        payloadChecksum: plan.inputChecksum,
+        serverTimeMs: 1,
+        stepId: null,
+      },
+      digest,
+    )
+    const acceptedId = operationTransitionIdentity("accepted", [
+      operationId,
+      "saga:init",
+      "runtime-init-attempt",
+    ])
+    const accepted = await appendAuditEvent(
+      created,
+      {
+        actorChecksum: "runtime-actor",
+        environmentId,
+        eventType: "step.attempt.accepted",
+        fencingToken: 1,
+        idempotencyKey: acceptedId,
+        operationId,
+        payloadChecksum: "runtime-init-input",
+        serverTimeMs: 2,
+        stepId: "saga:init",
+      },
+      digest,
+    )
+    const succeededId = operationTransitionIdentity("succeeded", [
+      operationId,
+      "saga:init",
+      "runtime-init-attempt",
+    ])
+    const initialized = await appendAuditEvent(
+      accepted,
+      {
+        actorChecksum: "runtime-actor",
+        environmentId,
+        eventType: "saga.initialized",
+        fencingToken: 1,
+        idempotencyKey: succeededId,
+        operationId,
+        payloadChecksum: "runtime-init-evidence",
+        serverTimeMs: 3,
+        stepId: "saga:init",
+      },
+      digest,
+    )
+
+    await run(
+      `INSERT INTO "nozzle_operations" VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      operationId,
+      environmentId,
+      plan.inputChecksum,
+      plan.planChecksum,
+      JSON.stringify(plan),
+      operationStatus(succeeded),
+      3,
+    )
+    await run(
+      `INSERT INTO "nozzle_sagas" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      sagaId,
+      operationId,
+      "runtime-descriptor",
+      "runtime-saga-input",
+      0,
+      "succeeded",
+      "runtime-effect-0",
+      "runtime-record-0",
+      3,
+    )
+    for (const audit of [created, accepted, initialized]) {
+      await run(
+        `INSERT INTO "nozzle_audit_log" VALUES (?, ?, ?, ?)`,
+        environmentId,
+        audit.sequence,
+        audit.eventHash,
+        JSON.stringify(audit),
+      )
+    }
+    const proof = leaseProof(lease)
+    for (const transition of [
+      {
+        after: running,
+        audit: accepted,
+        before: initial,
+        transitionId: acceptedId,
+      },
+      {
+        after: succeeded,
+        audit: initialized,
+        before: running,
+        transitionId: succeededId,
+      },
+    ]) {
+      await run(
+        `INSERT INTO "nozzle_operation_transitions" VALUES
+         (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        transition.transitionId,
+        operationId,
+        "saga:init",
+        operationStepRecordJson(transition.before.steps["saga:init"] as OperationStepRecord),
+        operationStepRecordJson(transition.after.steps["saga:init"] as OperationStepRecord),
+        operationStatus(transition.before),
+        operationStatus(transition.after),
+        transition.audit.eventHash,
+        proof.fencingToken,
+        proof.leaseKey,
+        proof.holderId,
+        proof.acquisitionId,
+        transition.audit.serverTimeMs,
+      )
+    }
+    await run(
+      `INSERT INTO "nozzle_operation_effects" VALUES
+       (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      "runtime-effect-0",
+      succeededId,
+      operationId,
+      "saga:init",
+      "saga",
+      sagaId,
+      "create",
+      null,
+      0,
+      "runtime-init-evidence",
+      "runtime-record-0",
+      JSON.stringify({ stateVersion: 0 }),
+      proof.leaseKey,
+      proof.holderId,
+      proof.acquisitionId,
+      proof.fencingToken,
+      3,
+    )
+
+    const reader = new D1SagaHistoryReader(env.DB)
+    const anchor = await reader.captureAnchor(operationId, sagaId)
+    const loadedPlan = await reader.operationPlan(anchor, digest)
+    expect(loadedPlan).toEqual(plan)
+    const auditFolder = new SagaHistoryAuditFolder(anchor, digest)
+    const firstAuditPage = await reader.auditPage(anchor)
+    expect(firstAuditPage).toMatchObject({ complete: false, nextCursor: 2 })
+    await auditFolder.append(firstAuditPage)
+    const finalAuditPage = await reader.auditPage(anchor, firstAuditPage.nextCursor as number)
+    expect(finalAuditPage).toMatchObject({ complete: true, nextCursor: null })
+    await auditFolder.append(finalAuditPage)
+
+    const transitionFolder = new SagaHistoryTransitionFolder(
+      anchor,
+      auditFolder.proof(),
+      loadedPlan,
+      digest,
+    )
+    const transitions = await reader.transitionPage(anchor)
+    expect(transitions).toMatchObject({ complete: true, nextCursor: null })
+    await transitionFolder.append(transitions)
+    expect(transitionFolder.proof()).toMatchObject({
+      operation: succeeded,
+      operationStatus: "succeeded",
+      transitionCount: 2,
+    })
+    await expect(reader.assertAnchorCurrent(anchor)).resolves.toBeUndefined()
   })
 
   it("folds a checksum-verified audit chain in the workerd runtime", async () => {

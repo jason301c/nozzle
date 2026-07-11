@@ -1,4 +1,5 @@
 import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite"
+import { type DigestFunction, type OperationPlan, sealOperationPlan } from "@nozzle/core"
 import { describe, expect, it } from "vitest"
 import type {
   ControlBindingValue,
@@ -18,6 +19,40 @@ import {
 } from "../src/saga-history.js"
 
 type ScriptedResult = unknown | (() => unknown)
+
+const digest: DigestFunction = async (input) => {
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", input.slice().buffer))
+  return Array.from(hash, (byte) => byte.toString(16).padStart(2, "0")).join("")
+}
+
+async function sealedHistoryPlan(
+  overrides: Partial<Pick<OperationPlan, "inputChecksum" | "operationId" | "operationType">> = {},
+) {
+  return sealOperationPlan(
+    {
+      capabilitySnapshotChecksum: "capability-snapshot",
+      idempotencyKey: "operation-key",
+      inputChecksum: overrides.inputChecksum ?? "operation-input",
+      operationId: overrides.operationId ?? "operation-a",
+      operationType: overrides.operationType ?? "saga:fixture@1",
+      steps: [
+        {
+          checkpoint: "reversible",
+          dependsOn: [],
+          idempotencyKey: "saga-init-key",
+          inputChecksum: "saga-init-input",
+          leaseKey: "saga:saga-a",
+          postconditionChecksum: "saga-init-postcondition",
+          preconditionChecksum: "saga-init-precondition",
+          recoveryInstructions: "Reconstruct the immutable saga initialization receipt.",
+          retryClassification: "idempotent",
+          stepId: "saga:init",
+        },
+      ],
+    },
+    digest,
+  )
+}
 
 interface ScriptedCall {
   readonly kind: "all" | "first"
@@ -523,6 +558,95 @@ describe("D1SagaHistoryReader", () => {
     } finally {
       database.database.close()
     }
+  })
+
+  it("loads the canonical immutable operation plan bound to an anchor", async () => {
+    const plan = await sealedHistoryPlan()
+    const inputAnchor = Object.freeze({ ...anchor, operationPlanChecksum: plan.planChecksum })
+    const database = new ScriptedDatabase([
+      {
+        kind: "first",
+        result: {
+          input_checksum: plan.inputChecksum,
+          operation_id: plan.operationId,
+          plan_checksum: plan.planChecksum,
+          plan_json: JSON.stringify(plan),
+        },
+        sql: `SELECT "operation_id", "input_checksum", "plan_checksum", "plan_json"`,
+      },
+    ])
+    const loaded = await new D1SagaHistoryReader(database).operationPlan(inputAnchor, digest)
+    expect(loaded).toEqual(plan)
+    expect(Object.isFrozen(loaded)).toBe(true)
+    database.expectComplete()
+  })
+
+  it("rejects missing, malformed, oversized, noncanonical, or non-saga operation plans", async () => {
+    const plan = await sealedHistoryPlan()
+    const inputAnchor = Object.freeze({ ...anchor, operationPlanChecksum: plan.planChecksum })
+    await expect(
+      new D1SagaHistoryReader(new ScriptedDatabase([])).operationPlan(
+        inputAnchor,
+        undefined as unknown as DigestFunction,
+      ),
+    ).rejects.toMatchObject({ code: "ConfigurationError" })
+
+    const anchoredRow = {
+      input_checksum: plan.inputChecksum,
+      operation_id: plan.operationId,
+      plan_checksum: plan.planChecksum,
+      plan_json: JSON.stringify(plan),
+    }
+    const malformedRows: readonly [unknown, RegExp][] = [
+      [null, /disappeared/u],
+      [{ ...anchoredRow, extra: true }, /fields/u],
+      [{ ...anchoredRow, operation_id: "other" }, /contradicts/u],
+      [{ ...anchoredRow, input_checksum: "other" }, /contradicts/u],
+      [{ ...anchoredRow, plan_checksum: "other" }, /contradicts/u],
+      [{ ...anchoredRow, plan_json: "{" }, /contradicts/u],
+      [{ ...anchoredRow, plan_json: JSON.stringify("x".repeat(2_000_000)) }, /contradicts/u],
+      [{ ...anchoredRow, plan_json: JSON.stringify(plan, null, 2) }, /not canonical/u],
+    ]
+    for (const [result, message] of malformedRows) {
+      const database = new ScriptedDatabase([
+        {
+          kind: "first",
+          result,
+          sql: `SELECT "operation_id", "input_checksum", "plan_checksum", "plan_json"`,
+        },
+      ])
+      await expect(
+        new D1SagaHistoryReader(database).operationPlan(inputAnchor, digest),
+      ).rejects.toMatchObject({
+        code: "OperationInterventionRequiredError",
+        message: expect.stringMatching(message),
+      })
+      database.expectComplete()
+    }
+
+    const generic = await sealedHistoryPlan({ operationType: "generic" })
+    const genericDatabase = new ScriptedDatabase([
+      {
+        kind: "first",
+        result: {
+          input_checksum: generic.inputChecksum,
+          operation_id: generic.operationId,
+          plan_checksum: generic.planChecksum,
+          plan_json: JSON.stringify(generic),
+        },
+        sql: `SELECT "operation_id", "input_checksum", "plan_checksum", "plan_json"`,
+      },
+    ])
+    await expect(
+      new D1SagaHistoryReader(genericDatabase).operationPlan(
+        { ...inputAnchor, operationPlanChecksum: generic.planChecksum },
+        digest,
+      ),
+    ).rejects.toMatchObject({
+      code: "OperationInterventionRequiredError",
+      message: expect.stringMatching(/not canonical/u),
+    })
+    genericDatabase.expectComplete()
   })
 
   it("matches SQLite BINARY keyset order across a UTF-16 ordering boundary", async () => {

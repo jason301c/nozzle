@@ -1,4 +1,9 @@
-import { NozzleError } from "@nozzle/core"
+import {
+  type DigestFunction,
+  loadOperationPlan,
+  NozzleError,
+  type OperationPlan,
+} from "@nozzle/core"
 import type { TransactionalControlDatabase } from "./database.js"
 import {
   SAGA_ATTEMPT_IDENTITY_ROW_SELECT,
@@ -44,6 +49,13 @@ interface HistoryIdentityRow {
 interface AuditHeadRow {
   readonly event_hash: string
   readonly sequence: number
+}
+
+interface OperationPlanRow {
+  readonly input_checksum: string
+  readonly operation_id: string
+  readonly plan_checksum: string
+  readonly plan_json: string
 }
 
 interface TransitionSummaryRow {
@@ -189,6 +201,13 @@ const AUDIT_ROW_KEYS = [
   "event_json",
   "sequence",
 ] as const satisfies readonly (keyof SagaHistoryAuditRow)[]
+
+const OPERATION_PLAN_ROW_KEYS = [
+  "input_checksum",
+  "operation_id",
+  "plan_checksum",
+  "plan_json",
+] as const satisfies readonly (keyof OperationPlanRow)[]
 
 const TRANSITION_ROW_KEYS = [
   "acquisition_id",
@@ -830,6 +849,50 @@ export class D1SagaHistoryReader {
     ) {
       return resume("The operation or saga-attempt history advanced beyond its verified anchor.")
     }
+  }
+
+  async operationPlan(
+    inputAnchor: SagaHistoryAnchor,
+    digest: DigestFunction,
+  ): Promise<OperationPlan> {
+    const anchor = loadSagaHistoryAnchor(inputAnchor)
+    if (typeof digest !== "function")
+      configuration("A saga-history operation-plan digest is required.")
+    const candidate = await this.#database
+      .prepare(
+        `SELECT "operation_id", "input_checksum", "plan_checksum", "plan_json"
+         FROM "nozzle_operations" WHERE "operation_id" = ?1`,
+      )
+      .bind(anchor.operationId)
+      .first<OperationPlanRow>()
+    if (candidate === null) {
+      return intervention("The anchored saga operation plan disappeared.")
+    }
+    const row = captured<OperationPlanRow>(
+      candidate,
+      OPERATION_PLAN_ROW_KEYS,
+      "Persisted saga-history operation plan",
+    )
+    if (
+      row.operation_id !== anchor.operationId ||
+      row.input_checksum !== anchor.operationInputChecksum ||
+      row.plan_checksum !== anchor.operationPlanChecksum ||
+      !validJson(row.plan_json) ||
+      UTF8_ENCODER.encode(row.plan_json).byteLength > 2_000_000
+    ) {
+      return intervention("The persisted saga operation plan contradicts its history anchor.")
+    }
+    const plan = await loadOperationPlan(JSON.parse(row.plan_json) as OperationPlan, digest)
+    if (
+      plan.operationId !== anchor.operationId ||
+      plan.inputChecksum !== anchor.operationInputChecksum ||
+      plan.planChecksum !== anchor.operationPlanChecksum ||
+      !plan.operationType.startsWith("saga:") ||
+      JSON.stringify(plan) !== row.plan_json
+    ) {
+      return intervention("The persisted saga operation plan is not canonical for its anchor.")
+    }
+    return plan
   }
 
   async auditPage(
