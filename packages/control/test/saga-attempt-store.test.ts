@@ -15,6 +15,7 @@ import type {
 } from "../src/database.js"
 import { D1LeaseStore } from "../src/lease-store.js"
 import { D1OperationStore, operationTransitionIdentity } from "../src/operation-store.js"
+import { loadSagaAttemptRecordRow } from "../src/saga-attempt-codec.js"
 import {
   D1SagaAttemptStore,
   sagaActionInputChecksum,
@@ -1748,6 +1749,133 @@ describe("D1SagaAttemptStore", () => {
       )
       await expect(faulted.get(run.actionAttemptId)).rejects.toThrow(message)
     }
+  })
+
+  it("loads exact saga receipt rows from one owned snapshot", async () => {
+    const accepted = await fixture("codec-accepted")
+    await attempts.accept({
+      attemptId: accepted.actionAttemptId,
+      inputJson: accepted.actionInputJson,
+      phase: "forward",
+      proof: accepted.proof(),
+      purpose: "effect",
+      sagaId: accepted.sagaId,
+      sagaStepId: "a",
+    })
+    const acceptedRow = rawAttempt(database.database, accepted.actionAttemptId)
+    const loadedAccepted = await loadSagaAttemptRecordRow(acceptedRow, digest)
+    expect(loadedAccepted).toMatchObject({
+      attemptId: accepted.actionAttemptId,
+      protocolVersion: 2,
+      state: "accepted",
+    })
+    expect(Object.isFrozen(loadedAccepted)).toBe(true)
+
+    const switching = { ...acceptedRow }
+    let inputReads = 0
+    Object.defineProperty(switching, "input_json", {
+      enumerable: true,
+      get() {
+        inputReads += 1
+        return inputReads === 1 ? acceptedRow.input_json : "{}"
+      },
+    })
+    await expect(
+      loadSagaAttemptRecordRow(switching, digest, accepted.actionAttemptId),
+    ).resolves.toMatchObject({ state: "accepted" })
+    expect(inputReads).toBe(1)
+
+    const mutable = { ...acceptedRow }
+    let digestCalls = 0
+    const mutatingDigest: DigestFunction = async (input) => {
+      digestCalls += 1
+      mutable.input_json = "{}"
+      return digest(input)
+    }
+    await expect(
+      loadSagaAttemptRecordRow(mutable, mutatingDigest, accepted.actionAttemptId),
+    ).resolves.toMatchObject({ inputJson: acceptedRow.input_json })
+    expect(digestCalls).toBeGreaterThan(0)
+
+    const missing = { ...acceptedRow }
+    delete missing.state
+    for (const [candidate, message] of [
+      [missing, /row fields are malformed/u],
+      [{ ...acceptedRow, unchecked: true }, /row fields are malformed/u],
+      [[], /row fields are malformed/u],
+      [new Proxy(acceptedRow, {}), /could not be captured safely/u],
+    ] as const) {
+      await expect(loadSagaAttemptRecordRow(candidate, digest)).rejects.toThrow(message)
+    }
+    await expect(loadSagaAttemptRecordRow(acceptedRow, null as never)).rejects.toMatchObject({
+      code: "ConfigurationError",
+    })
+    await expect(loadSagaAttemptRecordRow(acceptedRow, () => "bad")).rejects.toThrow(
+      /lowercase SHA-256/u,
+    )
+
+    const confirmed = await fixture("codec-confirmed")
+    await attempts.accept({
+      attemptId: confirmed.actionAttemptId,
+      inputJson: confirmed.actionInputJson,
+      phase: "forward",
+      proof: confirmed.proof(),
+      purpose: "effect",
+      sagaId: confirmed.sagaId,
+      sagaStepId: "a",
+    })
+    await attempts.complete({
+      attemptId: confirmed.actionAttemptId,
+      evidenceJson: '{"source":"codec"}',
+      outputJson: '{"ok":true}',
+      proof: confirmed.proof(),
+      state: "confirmed",
+    })
+    const confirmedRow = rawAttempt(database.database, confirmed.actionAttemptId)
+    await expect(loadSagaAttemptRecordRow(confirmedRow, digest)).resolves.toMatchObject({
+      state: "confirmed",
+    })
+    await expect(
+      loadSagaAttemptRecordRow(
+        { ...confirmedRow, error_checksum: "unexpected", error_json: "{}" },
+        digest,
+      ),
+    ).rejects.toThrow(/value columns are contradictory/u)
+
+    const failed = await fixture("codec-failed")
+    await attempts.accept({
+      attemptId: failed.actionAttemptId,
+      inputJson: failed.actionInputJson,
+      phase: "forward",
+      proof: failed.proof(),
+      purpose: "effect",
+      sagaId: failed.sagaId,
+      sagaStepId: "a",
+    })
+    await attempts.complete({
+      attemptId: failed.actionAttemptId,
+      errorJson: '{"code":"failed"}',
+      evidenceJson: '{"source":"codec"}',
+      proof: failed.proof(),
+      state: "failed",
+    })
+    const failedRow = rawAttempt(database.database, failed.actionAttemptId)
+    for (const state of ["failed", "not_applied", "unknown"] as const) {
+      const candidate: Record<string, unknown> = { ...failedRow, state }
+      candidate.outcome_checksum = await outcomeForRow(candidate)
+      await expect(loadSagaAttemptRecordRow(candidate, digest)).resolves.toMatchObject({ state })
+    }
+    const incompatible: Record<string, unknown> = { ...failedRow, state: "indeterminate" }
+    incompatible.outcome_checksum = await outcomeForRow(incompatible)
+    await expect(loadSagaAttemptRecordRow(incompatible, digest)).rejects.toThrow(
+      /incompatible outcome/u,
+    )
+    await expect(
+      loadSagaAttemptRecordRow(
+        { ...failedRow, output_checksum: "unexpected", output_json: "{}" },
+        digest,
+      ),
+    ).rejects.toThrow(/value columns are contradictory/u)
   })
 
   it("fails closed on rejected writes, stale fences, and contradictory committed outcomes", async () => {

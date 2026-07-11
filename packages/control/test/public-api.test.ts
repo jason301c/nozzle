@@ -6,6 +6,8 @@ describe("@nozzle/control public API", () => {
     const exports = control as Readonly<Record<string, unknown>>
 
     expect(exports).not.toHaveProperty("D1SagaStore")
+    expect(exports).not.toHaveProperty("loadSagaAttemptRecordRow")
+    expect(exports).not.toHaveProperty("SAGA_ATTEMPT_ROW_SELECT")
     expect(exports).toMatchObject({
       SAGA_INIT_OPERATION_STEP_ID: "saga:init",
       SAGA_SETTLE_OPERATION_STEP_ID: "saga:settle",

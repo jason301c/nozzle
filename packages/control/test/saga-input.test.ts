@@ -117,7 +117,14 @@ describe("durable saga invocation input", () => {
     await expect(sealSagaInvocationInput(base, undefined as never)).rejects.toThrow(
       /digest is required/u,
     )
-    await expect(sealSagaInvocationInput(base, () => "bad")).rejects.toThrow(/lowercase SHA/u)
+    let digestCalls = 0
+    await expect(
+      sealSagaInvocationInput(base, () => {
+        digestCalls += 1
+        return digestCalls === 1 ? "a".repeat(64) : "bad"
+      }),
+    ).rejects.toThrow(/lowercase SHA/u)
+    expect(digestCalls).toBe(2)
     await expect(
       sealSagaInvocationInput(
         {
