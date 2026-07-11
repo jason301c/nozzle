@@ -142,6 +142,30 @@ class FixedStatement implements ControlStatement {
   }
 }
 
+class FixedRowsStatement implements ControlStatement {
+  readonly #rows: readonly unknown[]
+
+  constructor(rows: readonly unknown[]) {
+    this.#rows = rows
+  }
+
+  bind(): ControlStatement {
+    return this
+  }
+
+  async all<T>(): Promise<ControlQueryResult<T>> {
+    return { meta: {}, results: this.#rows as T[], success: true }
+  }
+
+  async first<T>(): Promise<T | null> {
+    return (this.#rows[0] as T | undefined) ?? null
+  }
+
+  async run(): Promise<ControlRunResult> {
+    return { meta: { changes: 0 }, success: true }
+  }
+}
+
 type BatchFault =
   | { readonly kind: "commit_then_throw" }
   | { readonly index: number; readonly kind: "rollback_before" }
@@ -272,6 +296,33 @@ class AdvanceAfterCommitDatabase implements TransactionalControlDatabase {
   }
 }
 
+class AdvanceBeforeInitializationReceiptReadDatabase implements TransactionalControlDatabase {
+  readonly #advance: () => Promise<void>
+  readonly #base: DatabaseAdapter
+  #pending = true
+
+  constructor(base: DatabaseAdapter, advance: () => Promise<void>) {
+    this.#advance = advance
+    this.#base = base
+  }
+
+  async batch(statements: readonly ControlStatement[]): Promise<readonly ControlRunResult[]> {
+    return this.#base.batch(statements)
+  }
+
+  prepare(sql: string): ControlStatement {
+    const statement = this.#base.prepare(sql)
+    if (
+      this.#pending &&
+      sql === 'SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1'
+    ) {
+      this.#pending = false
+      return new AdvanceBeforeReadStatement(statement, this.#advance)
+    }
+    return statement
+  }
+}
+
 type QueryFault =
   | { readonly kind: "audit_snapshot"; readonly row: unknown }
   | { readonly kind: "saga_projection"; readonly row: unknown }
@@ -293,6 +344,16 @@ type QueryFault =
         | "classified_transition_mismatch"
         | "effect_missing"
         | "effect_mismatch"
+        | "initialized_audit_mismatch"
+        | "initialized_audit_missing"
+        | "initialized_effect_mismatch"
+        | "initialized_effect_missing"
+        | "initialized_saga_missing"
+        | "initialized_step_result_mismatch"
+        | "initialized_transition_disappears"
+        | "initialized_transition_history_mismatch"
+        | "initialized_transition_identity_mismatch"
+        | "initialized_transition_missing"
         | "observation_cause_missing"
         | "observation_saga_missing"
         | "operation_missing"
@@ -312,6 +373,7 @@ class QueryFaultDatabase implements TransactionalControlDatabase {
   readonly #base: DatabaseAdapter
   readonly #fault: QueryFault
   #batched = false
+  #initializationTransitionReads = 0
   #sagaAttemptReads = 0
 
   constructor(base: DatabaseAdapter, fault: QueryFault) {
@@ -326,6 +388,89 @@ class QueryFaultDatabase implements TransactionalControlDatabase {
   }
 
   prepare(sql: string): ControlStatement {
+    if (
+      (this.#fault.kind === "initialized_transition_history_mismatch" ||
+        this.#fault.kind === "initialized_transition_identity_mismatch" ||
+        this.#fault.kind === "initialized_transition_missing") &&
+      sql === 'SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1'
+    ) {
+      if (this.#fault.kind === "initialized_transition_missing") return new FixedStatement(null)
+      const row = this.#base.database
+        .prepare(
+          `SELECT * FROM "nozzle_operation_transitions"
+           WHERE "step_id" = ? ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get(SAGA_INIT_OPERATION_STEP_ID) as Record<string, unknown>
+      return new FixedStatement(
+        this.#fault.kind === "initialized_transition_identity_mismatch"
+          ? { ...row, lease_key: "saga:wrong" }
+          : { ...row, from_record_json: row.to_record_json },
+      )
+    }
+    if (
+      this.#fault.kind === "initialized_transition_disappears" &&
+      sql === 'SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1'
+    ) {
+      this.#initializationTransitionReads += 1
+      if (this.#initializationTransitionReads === 2) return new FixedStatement(null)
+    }
+    if (
+      this.#fault.kind === "initialized_saga_missing" &&
+      sql.includes('FROM "nozzle_sagas" AS "saga"')
+    ) {
+      return new FixedStatement(null)
+    }
+    if (
+      this.#fault.kind === "initialized_step_result_mismatch" &&
+      sql.includes('FROM "nozzle_operation_steps" WHERE "operation_id" = ?1 ORDER BY "step_id"')
+    ) {
+      const rows = this.#base.database
+        .prepare(
+          `SELECT "operation_id", "step_id", "idempotency_key", "lease_key", "plan_json",
+                  "record_json", "state", "fencing_token", "updated_at_ms"
+           FROM "nozzle_operation_steps" ORDER BY "step_id"`,
+        )
+        .all() as Record<string, unknown>[]
+      return new FixedRowsStatement(
+        rows.map((row) => {
+          if (row.step_id !== SAGA_INIT_OPERATION_STEP_ID) return row
+          const record = JSON.parse(row.record_json as string) as Record<string, unknown>
+          return {
+            ...row,
+            record_json: JSON.stringify({ ...record, resultChecksum: "wrong-result" }),
+          }
+        }),
+      )
+    }
+    if (
+      (this.#fault.kind === "initialized_audit_mismatch" ||
+        this.#fault.kind === "initialized_audit_missing") &&
+      sql.includes('SELECT "event_json" FROM "nozzle_audit_log"') &&
+      sql.includes('"event_hash" = ?2')
+    ) {
+      if (this.#fault.kind === "initialized_audit_missing") return new FixedStatement(null)
+      const row = this.#base.database
+        .prepare(
+          `SELECT "event_json" FROM "nozzle_audit_log"
+           ORDER BY "sequence" DESC LIMIT 1 OFFSET 1`,
+        )
+        .get() as Record<string, unknown>
+      return new FixedStatement(row)
+    }
+    if (
+      (this.#fault.kind === "initialized_effect_mismatch" ||
+        this.#fault.kind === "initialized_effect_missing") &&
+      sql === 'SELECT * FROM "nozzle_operation_effects" WHERE "effect_id" = ?1'
+    ) {
+      if (this.#fault.kind === "initialized_effect_missing") return new FixedStatement(null)
+      const row = this.#base.database
+        .prepare(
+          `SELECT * FROM "nozzle_operation_effects"
+           WHERE "step_id" = ? ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get(SAGA_INIT_OPERATION_STEP_ID) as Record<string, unknown>
+      return new FixedStatement({ ...row, evidence_checksum: "wrong-evidence" })
+    }
     if (
       (this.#fault.kind === "classified_from_record_mismatch" ||
         this.#fault.kind === "classified_status_mismatch" ||
@@ -969,6 +1114,19 @@ async function recoverableAction(
 function count(database: DatabaseSync, table: string): number {
   return (database.prepare(`SELECT count(*) AS "count" FROM "${table}"`).get() as { count: number })
     .count
+}
+
+function coupledProjectionRows(database: DatabaseSync) {
+  return {
+    audit: database.prepare(`SELECT * FROM "nozzle_audit_log" ORDER BY rowid`).all(),
+    effects: database.prepare(`SELECT * FROM "nozzle_operation_effects" ORDER BY rowid`).all(),
+    operations: database.prepare(`SELECT * FROM "nozzle_operations" ORDER BY rowid`).all(),
+    sagas: database.prepare(`SELECT * FROM "nozzle_sagas" ORDER BY rowid`).all(),
+    steps: database.prepare(`SELECT * FROM "nozzle_operation_steps" ORDER BY rowid`).all(),
+    transitions: database
+      .prepare(`SELECT * FROM "nozzle_operation_transitions" ORDER BY rowid`)
+      .all(),
+  }
 }
 
 function acceptedAttemptRow(database: DatabaseSync, attemptId: string): Record<string, unknown> {
@@ -2406,18 +2564,90 @@ describe("D1SagaCoordinatorStore", () => {
     expect(count(run.base.database, "nozzle_operation_effects")).toBe(1)
   })
 
-  it("rolls every receipt and projection back when any coupled statement fails", async () => {
-    const run = await fixture("rollback", { index: 3, kind: "rollback_before" })
+  it("replays exact initialization history after progress, restart, and lease takeover", async () => {
+    const run = await fixture("advanced-initialization-replay")
+    await run.coordinator.initializeSaga(run.initialize)
+    const attemptId = `${run.sagaId}:a:forward:1`
+    await run.coordinator.beginAction(actionInput(run, attemptId))
+    const advanced = await run.sagas.get(run.sagaId)
+    expect(advanced).toMatchObject({ stateVersion: 1, status: "running" })
+    const takeoverProof = await reacquire(run, run.proof, "initialization-replay")
+    const beforeReplay = coupledProjectionRows(run.base.database)
+    const restarted = new D1SagaCoordinatorStore(run.base, digest)
+
+    await expect(
+      restarted.initializeSaga({ ...run.initialize, proof: takeoverProof }),
+    ).resolves.toEqual(advanced)
+    expect(coupledProjectionRows(run.base.database)).toEqual(beforeReplay)
+  })
+
+  it("converges on one concurrent initialization winner after stale outer reads", async () => {
+    const run = await fixture("concurrent-initialization-winner")
+    let winner: unknown
+    const outer = new D1SagaCoordinatorStore(
+      new AdvanceBeforeInitializationReceiptReadDatabase(run.base, async () => {
+        winner = await run.coordinator.initializeSaga(run.initialize)
+      }),
+      digest,
+    )
+
+    const replayed = await outer.initializeSaga(run.initialize)
+    expect(replayed).toEqual(winner)
+    const transitionId = operationTransitionIdentity("succeeded", [
+      run.operationId,
+      SAGA_INIT_OPERATION_STEP_ID,
+      run.initialize.attemptId,
+    ])
+    expect(
+      run.base.database
+        .prepare(
+          `SELECT
+             (SELECT count(*) FROM "nozzle_operation_transitions"
+              WHERE "transition_id" = ?1) AS "transitions",
+             (SELECT count(*) FROM "nozzle_operation_effects"
+              WHERE "transition_id" = ?1) AS "effects",
+             (SELECT count(*) FROM "nozzle_audit_log"
+              WHERE "event_hash" = (
+                SELECT "audit_event_hash" FROM "nozzle_operation_transitions"
+                WHERE "transition_id" = ?1
+              )) AS "audits"`,
+        )
+        .get(transitionId),
+    ).toEqual({ audits: 1, effects: 1, transitions: 1 })
+  })
+
+  it.each([
+    0, 1, 2, 3, 4, 5,
+  ])("rolls every initialization row back when coupled statement %i fails", async (index) => {
+    const run = await fixture(`rollback-${index}`, { index, kind: "rollback_before" })
+    const before = coupledProjectionRows(run.base.database)
+    const operationBefore = await run.operations.get(run.operationId)
+
     await expect(run.coordinator.initializeSaga(run.initialize)).rejects.toThrow(
       /bounded coupled retry budget/u,
     )
-    expect(count(run.base.database, "nozzle_sagas")).toBe(0)
-    expect(count(run.base.database, "nozzle_operation_effects")).toBe(0)
-    expect((await run.operations.get(run.operationId))?.operation.steps["saga:init"]).toMatchObject(
-      {
-        state: "running",
-      },
-    )
+    expect(coupledProjectionRows(run.base.database)).toEqual(before)
+    expect(await run.operations.get(run.operationId)).toEqual(operationBefore)
+    expect(await run.sagas.get(run.sagaId)).toBeUndefined()
+  })
+
+  it.each([
+    ["initialized_transition_missing", /exists without its immutable receipt/u],
+    ["initialized_transition_history_mismatch", /transition receipt is contradictory/u],
+    ["initialized_transition_identity_mismatch", /contradictory operation transition/u],
+    ["initialized_transition_disappears", /lost its immutable transition/u],
+    ["initialized_saga_missing", /has no current projection/u],
+    ["initialized_step_result_mismatch", /immutable operation step/u],
+    ["initialized_audit_missing", /lacks its exact audit event/u],
+    ["initialized_audit_mismatch", /active step attempt|audit event is contradictory/u],
+    ["initialized_effect_missing", /operation-effect receipt is missing or contradictory/u],
+    ["initialized_effect_mismatch", /operation-effect receipt is missing or contradictory/u],
+  ] as const)("fails closed on %s initialization history", async (kind, message) => {
+    const run = await fixture(`initialization-history-${kind}`)
+    await run.coordinator.initializeSaga(run.initialize)
+    const restarted = new D1SagaCoordinatorStore(new QueryFaultDatabase(run.base, { kind }), digest)
+
+    await expect(restarted.initializeSaga(run.initialize)).rejects.toThrow(message)
   })
 
   it("fails closed on contradictory receipts, projections, and audit visibility", async () => {

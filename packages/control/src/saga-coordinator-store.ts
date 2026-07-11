@@ -247,6 +247,22 @@ function sameSaga(left: SagaRecord, right: SagaRecord): boolean {
   return encode(left) === encode(right)
 }
 
+function sagaIntentJson(record: SagaRecord): string {
+  return encode({
+    deadlineAtMs: record.deadlineAtMs,
+    descriptor: record.descriptor,
+    idempotencyKey: record.idempotencyKey,
+    inputChecksum: record.inputChecksum,
+    sagaId: record.sagaId,
+    stepInputChecksums: Object.fromEntries(
+      record.descriptor.steps.map((step) => [
+        step.stepId,
+        (record.steps[step.stepId] as SagaRecord["steps"][string]).inputChecksum,
+      ]),
+    ),
+  })
+}
+
 function committedSaga(
   result: CoupledCommitResult | undefined,
   exact: SagaRecord,
@@ -557,6 +573,115 @@ export class D1SagaCoordinatorStore {
       })
     }
     return before
+  }
+
+  async #initializedProjection(
+    initialization: InitializeSagaInput,
+  ): Promise<SagaRecord | undefined> {
+    const transitionId = operationTransitionIdentity("succeeded", [
+      initialization.operationId,
+      SAGA_INIT_OPERATION_STEP_ID,
+      initialization.attemptId,
+    ])
+    const transition = await this.#database
+      .prepare(`SELECT * FROM "nozzle_operation_transitions" WHERE "transition_id" = ?1`)
+      .bind(transitionId)
+      .first<TransitionReceiptRow>()
+    if (transition === null) return undefined
+    const operation = await this.#operation(initialization.operationId)
+    const saga = await this.#saga(initialization.sagaId, initialization.operationId)
+    if (saga === undefined) {
+      return intervention("Saga initialization has no current projection.")
+    }
+    const currentProof = initialization.proof
+    if (
+      !exactColumns(transition as unknown as Record<string, unknown>, {
+        operation_id: initialization.operationId,
+        step_id: SAGA_INIT_OPERATION_STEP_ID,
+        transition_id: transitionId,
+      }) ||
+      transition.lease_key !== currentProof.leaseKey ||
+      currentProof.fencingToken < transition.fencing_token ||
+      (currentProof.fencingToken === transition.fencing_token &&
+        (currentProof.holderId !== transition.holder_id ||
+          currentProof.acquisitionId !== transition.acquisition_id))
+    ) {
+      return intervention("Saga initialization has a contradictory operation transition.")
+    }
+    const auditRow = await this.#database
+      .prepare(
+        `SELECT "event_json" FROM "nozzle_audit_log"
+         WHERE "environment_id" = ?1 AND "event_hash" = ?2`,
+      )
+      .bind(operation.environmentId, transition.audit_event_hash)
+      .first<AuditEventRow>()
+    if (auditRow === null) {
+      return intervention("Saga initialization lacks its exact audit event.")
+    }
+    const audit = await loadAuditEvent(
+      persistedJson(auditRow.event_json, "The saga initialization audit event"),
+      this.#digest,
+    )
+    const operationBefore = await this.#operationBefore(operation, audit.sequence)
+    const expectedSaga = createSagaRecord({
+      deadlineAtMs: initialization.deadlineAtMs,
+      descriptor: initialization.descriptor,
+      idempotencyKey: initialization.idempotencyKey,
+      inputChecksum: initialization.inputChecksum,
+      sagaId: initialization.sagaId,
+      serverTimeMs: 0,
+      stepInputChecksums: initialization.stepInputChecksums,
+    })
+    const expectedOperation = recordStepSuccess(operationBefore, {
+      attemptId: initialization.attemptId,
+      observedPostconditionChecksum: initialization.observedPostconditionChecksum,
+      resultChecksum: initialization.resultChecksum,
+      stepId: SAGA_INIT_OPERATION_STEP_ID,
+    })
+    if (sagaIntentJson(saga) !== sagaIntentJson(expectedSaga)) {
+      return intervention("Saga initialization replay contradicts its immutable intent.")
+    }
+    const effectId = await this.#identity("saga-effect", [
+      transitionId,
+      initialization.sagaId,
+      "create",
+      "0",
+    ])
+    const expectedStep = expectedOperation.steps[SAGA_INIT_OPERATION_STEP_ID] as OperationStepRecord
+    if (
+      operationStepRecordJson(
+        operation.operation.steps[SAGA_INIT_OPERATION_STEP_ID] as OperationStepRecord,
+      ) !== operationStepRecordJson(expectedStep)
+    ) {
+      return intervention("Saga initialization replay contradicts its immutable operation step.")
+    }
+    const committed = await this.#verify(
+      {
+        actorChecksum: audit.actorChecksum,
+        afterOperation: expectedOperation,
+        afterSaga: expectedSaga,
+        auditEventType: "saga.initialized",
+        beforeOperation: Object.freeze({ ...operation, operation: operationBefore }),
+        beforeSaga: undefined,
+        effectId,
+        effectKind: "create",
+        evidenceChecksum: initialization.evidenceChecksum,
+        proof: {
+          acquisitionId: transition.acquisition_id,
+          fencingToken: transition.fencing_token,
+          holderId: transition.holder_id,
+          leaseKey: transition.lease_key,
+        },
+        stepId: SAGA_INIT_OPERATION_STEP_ID,
+        transitionId,
+      },
+      encode(expectedSaga),
+      await this.#recordChecksum(encode(expectedSaga)),
+    )
+    if (committed === undefined) {
+      return intervention("Saga initialization replay lost its immutable transition.")
+    }
+    return committed.saga
   }
 
   async #classifiedProjection(input: {
@@ -1469,6 +1594,8 @@ export class D1SagaCoordinatorStore {
       const beforeOperation = await this.#operation(input.operationId)
       const authorized = await this.#leases.authorizeAt(input.proof)
       const existing = await this.#saga(input.sagaId, input.operationId)
+      const replay = await this.#initializedProjection(input)
+      if (replay !== undefined) return replay
       const fresh = createSagaRecord({
         deadlineAtMs: input.deadlineAtMs,
         descriptor: input.descriptor,
@@ -1485,13 +1612,7 @@ export class D1SagaCoordinatorStore {
         stepId: SAGA_INIT_OPERATION_STEP_ID,
       })
       if (existing !== undefined) {
-        if (
-          !sameSaga(existing, fresh) ||
-          !sameOperation(beforeOperation.operation, afterOperation)
-        ) {
-          return intervention("Saga initialization replay contradicts durable state.")
-        }
-        return existing
+        return intervention("Saga initialization exists without its immutable receipt.")
       }
       if (
         beforeOperation.operation.steps[SAGA_INIT_OPERATION_STEP_ID]?.fencingToken !==
