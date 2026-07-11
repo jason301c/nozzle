@@ -1,11 +1,21 @@
 import {
+  createSagaRecord,
   type DigestFunction,
+  loadOperationPlan,
+  NozzleError,
+  type OperationPlan,
   type SagaActionReference,
+  type SagaRecord,
   sagaActionIdempotencyKey,
+  sealOperationPlan,
   sealSagaDescriptor,
 } from "@nozzle/core"
 import { describe, expect, it } from "vitest"
-import { sealSagaOperationPlan } from "../src/saga-plan.js"
+import {
+  assertTrustedSagaOperationPlan,
+  sealSagaOperationPlan,
+  verifySagaOperationPlan,
+} from "../src/saga-plan.js"
 import { type SagaHandlerRegistration, sealSagaHandlerRegistry } from "../src/saga-registry.js"
 import {
   SAGA_INIT_OPERATION_STEP_ID,
@@ -60,10 +70,10 @@ function registrations(): SagaHandlerRegistration[] {
   ]
 }
 
-async function descriptor() {
+async function descriptor(descriptorId = "checkout", version = 1) {
   return sealSagaDescriptor(
     {
-      descriptorId: "checkout",
+      descriptorId,
       steps: [
         {
           authorizationPolicyChecksum: null,
@@ -96,7 +106,7 @@ async function descriptor() {
           timeoutMs: 1_000,
         },
       ],
-      version: 1,
+      version,
     },
     digest,
   )
@@ -122,6 +132,41 @@ async function fixture() {
     sealedDescriptor,
     stepInputChecksums,
   }
+}
+
+function sagaForInput(
+  input: Awaited<ReturnType<typeof fixture>>["input"],
+  overrides: {
+    readonly descriptor?: SagaRecord["descriptor"]
+    readonly inputChecksum?: string
+    readonly sagaId?: string
+    readonly stepInputChecksums?: Readonly<Record<string, string>>
+  } = {},
+): SagaRecord {
+  return createSagaRecord({
+    deadlineAtMs: 10_000,
+    descriptor: overrides.descriptor ?? input.descriptor,
+    idempotencyKey: "checkout-saga-key",
+    inputChecksum: overrides.inputChecksum ?? input.inputChecksum,
+    sagaId: overrides.sagaId ?? input.sagaId,
+    serverTimeMs: 1_000,
+    stepInputChecksums: overrides.stepInputChecksums ?? input.stepInputChecksums,
+  })
+}
+
+async function resealPlanStep(
+  plan: OperationPlan,
+  stepId: string,
+  changes: Partial<OperationPlan["steps"][number]>,
+): Promise<OperationPlan> {
+  const { planChecksum: _planChecksum, schemaVersion: _schemaVersion, ...input } = plan
+  return sealOperationPlan(
+    {
+      ...input,
+      steps: input.steps.map((step) => (step.stepId === stepId ? { ...step, ...changes } : step)),
+    },
+    digest,
+  )
 }
 
 describe("saga operation plan compiler", () => {
@@ -207,6 +252,226 @@ describe("saga operation plan compiler", () => {
     expect(changedCapability.planChecksum).not.toBe(original.planChecksum)
   })
 
+  it("compiles and binds one owned checksum snapshot even when the caller mutates its map", async () => {
+    const { input } = await fixture()
+    const initialStepInputChecksums = Object.freeze({
+      charge: input.stepInputChecksums.charge,
+      notify: input.stepInputChecksums.notify,
+    })
+    const mutableStepInputChecksums = input.stepInputChecksums as Record<string, string>
+    let mutated = false
+    const mutatingDigest: DigestFunction = async (bytes) => {
+      if (!mutated) {
+        mutated = true
+        mutableStepInputChecksums.charge = "f".repeat(64)
+      }
+      return digest(bytes)
+    }
+
+    const plan = await sealSagaOperationPlan(input, mutatingDigest)
+    const saga = sagaForInput(input, { stepInputChecksums: initialStepInputChecksums })
+    expect(input.stepInputChecksums.charge).toBe("f".repeat(64))
+    expect(
+      plan.steps.find((step) => step.stepId === sagaActionOperationStepId("charge", "forward"))
+        ?.inputChecksum,
+    ).toBe(initialStepInputChecksums.charge)
+    expect(() => assertTrustedSagaOperationPlan(plan, saga)).not.toThrow()
+
+    const loaded = await loadOperationPlan(structuredClone(plan), digest)
+    await verifySagaOperationPlan(loaded, saga, digest)
+    expect(() => assertTrustedSagaOperationPlan(loaded, saga)).not.toThrow()
+  })
+
+  it("reads switching registry, descriptor, and scalar accessors exactly once", async () => {
+    const { input } = await fixture()
+    const otherDescriptor = await descriptor("switched", 2)
+    let descriptorReads = 0
+    let operationIdReads = 0
+    let registryReads = 0
+    const switchingInput = { ...input }
+    Object.defineProperties(switchingInput, {
+      descriptor: {
+        enumerable: true,
+        get: () => {
+          descriptorReads += 1
+          return descriptorReads === 1 ? input.descriptor : otherDescriptor
+        },
+      },
+      operationId: {
+        enumerable: true,
+        get: () => {
+          operationIdReads += 1
+          return operationIdReads === 1 ? input.operationId : "switched-operation"
+        },
+      },
+      registry: {
+        enumerable: true,
+        get: () => {
+          registryReads += 1
+          return registryReads === 1 ? input.registry : ({} as typeof input.registry)
+        },
+      },
+    })
+
+    const plan = await sealSagaOperationPlan(switchingInput, digest)
+    expect({ descriptorReads, operationIdReads, registryReads }).toEqual({
+      descriptorReads: 1,
+      operationIdReads: 1,
+      registryReads: 1,
+    })
+    expect(plan).toMatchObject({
+      operationId: input.operationId,
+      operationType: "saga:checkout@1",
+    })
+    expect(() => assertTrustedSagaOperationPlan(plan, sagaForInput(input))).not.toThrow()
+  })
+
+  it("normalizes hostile snapshot inputs to one stable configuration error", async () => {
+    const { input } = await fixture()
+    const throwingChecksums = Object.defineProperty(
+      { notify: input.stepInputChecksums.notify },
+      "charge",
+      {
+        enumerable: true,
+        get: () => {
+          throw new Error("private accessor detail")
+        },
+      },
+    )
+    const hostileInputs = [
+      { ...input, stepInputChecksums: new Proxy({ ...input.stepInputChecksums }, {}) },
+      {
+        ...input,
+        stepInputChecksums: { ...input.stepInputChecksums, uncloneable: () => undefined },
+      },
+      { ...input, stepInputChecksums: throwingChecksums },
+      new Proxy(input, {
+        get(target, property, receiver) {
+          if (property === "descriptor") throw new Error("private proxy detail")
+          return Reflect.get(target, property, receiver)
+        },
+      }),
+    ]
+
+    for (const hostileInput of hostileInputs) {
+      await expect(
+        sealSagaOperationPlan(hostileInput as typeof input, digest),
+      ).rejects.toMatchObject({
+        code: "ConfigurationError",
+        message: "Saga operation-plan input could not be snapshotted.",
+      })
+    }
+  })
+
+  it("binds saga-plan provenance to the exact saga and revalidates generic loaded plans", async () => {
+    const { input } = await fixture()
+    const plan = await sealSagaOperationPlan(input, digest)
+    const saga = sagaForInput(input)
+    expect(() => assertTrustedSagaOperationPlan(plan, saga)).not.toThrow()
+
+    const loaded = await loadOperationPlan(structuredClone(plan), digest)
+    expect(() => assertTrustedSagaOperationPlan(loaded, saga)).toThrowError(
+      expect.objectContaining({ code: "OperationInterventionRequiredError" }),
+    )
+    await verifySagaOperationPlan(loaded, saga, digest)
+    expect(() => assertTrustedSagaOperationPlan(loaded, saga)).not.toThrow()
+
+    const clonedPlan = structuredClone(plan)
+    const firstStep = clonedPlan.steps[0] as OperationPlan["steps"][number]
+    const reorderedStep = Object.fromEntries(
+      Object.entries(firstStep).reverse(),
+    ) as unknown as OperationPlan["steps"][number]
+    const reorderedCandidate: OperationPlan = {
+      ...clonedPlan,
+      steps: [reorderedStep, ...clonedPlan.steps.slice(1)],
+    }
+    const reordered = await loadOperationPlan(reorderedCandidate, digest)
+    await verifySagaOperationPlan(reordered, saga, digest)
+    expect(() => assertTrustedSagaOperationPlan(reordered, saga)).not.toThrow()
+
+    const otherDescriptor = await descriptor("checkout-other", 2)
+    const wrongSagas = [
+      sagaForInput(input, { descriptor: otherDescriptor }),
+      sagaForInput(input, { inputChecksum: "a".repeat(64) }),
+      sagaForInput(input, { sagaId: "checkout-other" }),
+      sagaForInput(input, {
+        stepInputChecksums: { ...input.stepInputChecksums, charge: "b".repeat(64) },
+      }),
+    ]
+    for (const wrongSaga of wrongSagas) {
+      expect(() => assertTrustedSagaOperationPlan(plan, wrongSaga)).toThrowError(
+        expect.objectContaining({ code: "OperationInterventionRequiredError" }),
+      )
+      const genericLoaded = await loadOperationPlan(structuredClone(plan), digest)
+      await expect(verifySagaOperationPlan(genericLoaded, wrongSaga, digest)).rejects.toMatchObject(
+        {
+          code: "OperationInterventionRequiredError",
+        },
+      )
+    }
+  })
+
+  it("rejects every independently sealed change to canonical saga-derived plan values", async () => {
+    const { input } = await fixture()
+    const plan = await sealSagaOperationPlan(input, digest)
+    const saga = sagaForInput(input)
+    const changedPlans = await Promise.all([
+      resealPlanStep(plan, SAGA_INIT_OPERATION_STEP_ID, {
+        inputChecksum: "a".repeat(64),
+      }),
+      resealPlanStep(plan, SAGA_TERMINATION_OPERATION_STEP_ID, {
+        preconditionChecksum: "b".repeat(64),
+      }),
+      resealPlanStep(plan, SAGA_SETTLE_OPERATION_STEP_ID, {
+        postconditionChecksum: "c".repeat(64),
+      }),
+      resealPlanStep(plan, sagaActionOperationStepId("charge", "forward"), {
+        preconditionChecksum: "d".repeat(64),
+      }),
+      resealPlanStep(plan, sagaActionOperationStepId("charge", "forward"), {
+        postconditionChecksum: "e".repeat(64),
+      }),
+      resealPlanStep(plan, sagaActionOperationStepId("charge", "compensation"), {
+        inputChecksum: "f".repeat(64),
+      }),
+    ])
+
+    for (const changed of changedPlans) {
+      await expect(verifySagaOperationPlan(changed, saga, digest)).rejects.toMatchObject({
+        code: "OperationInterventionRequiredError",
+      })
+      expect(() => assertTrustedSagaOperationPlan(changed, saga)).toThrowError(
+        expect.objectContaining({ code: "OperationInterventionRequiredError" }),
+      )
+    }
+  })
+
+  it("fails closed for unverified plan objects and invalid verification digests", async () => {
+    const { input } = await fixture()
+    const plan = await sealSagaOperationPlan(input, digest)
+    const saga = sagaForInput(input)
+
+    await expect(
+      verifySagaOperationPlan(structuredClone(plan), saga, digest),
+    ).rejects.toMatchObject({ code: "OperationInterventionRequiredError" })
+
+    const loaded = await loadOperationPlan(structuredClone(plan), digest)
+    await expect(verifySagaOperationPlan(loaded, saga, () => "bad")).rejects.toMatchObject({
+      code: "OperationInterventionRequiredError",
+    })
+    await expect(
+      verifySagaOperationPlan(loaded, saga, () => {
+        throw new NozzleError("OperationInterventionRequiredError", "caller-controlled detail")
+      }),
+    ).rejects.toMatchObject({
+      code: "OperationInterventionRequiredError",
+      message: "The saga operation plan could not be integrity-verified.",
+    })
+    expect(() => assertTrustedSagaOperationPlan(loaded, saga)).toThrowError(
+      expect.objectContaining({ code: "OperationInterventionRequiredError" }),
+    )
+  })
+
   it("rejects incomplete bindings, untrusted inputs, missing handlers, and invalid digests", async () => {
     const { input, sealedDescriptor } = await fixture()
     for (const stepInputChecksums of [
@@ -214,6 +479,8 @@ describe("saga operation plan compiler", () => {
       { charge: "7".repeat(64), notify: "8".repeat(64), extra: "f".repeat(64) },
       { charge: "bad", notify: "8".repeat(64) },
       [] as never,
+      null as never,
+      undefined as never,
     ]) {
       await expect(
         sealSagaOperationPlan({ ...input, stepInputChecksums }, digest),

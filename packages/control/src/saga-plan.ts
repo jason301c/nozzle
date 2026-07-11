@@ -1,11 +1,13 @@
 import {
   assertTrustedSagaDescriptor,
+  createOperationRecord,
   type DigestFunction,
   NozzleError,
   type OperationPlan,
   type OperationStepPlanInput,
   type SagaActionPhase,
   type SagaDescriptor,
+  type SagaRecord,
   sagaActionIdempotencyKey,
   sealOperationPlan,
 } from "@nozzle/core"
@@ -21,6 +23,15 @@ const PLAN_VALUE_DOMAIN = "nozzle.saga-operation-plan-value.v1"
 const CHECKSUM = /^[0-9a-f]{64}$/u
 const MAX_IDENTITY_BYTES = 512
 
+interface SagaOperationPlanIdentity {
+  readonly descriptorChecksum: string
+  readonly inputChecksum: string
+  readonly sagaId: string
+  readonly stepInputChecksumsJson: string
+}
+
+const TRUSTED_SAGA_OPERATION_PLANS = new WeakMap<OperationPlan, SagaOperationPlanIdentity>()
+
 export interface SealSagaOperationPlanInput {
   readonly capabilitySnapshotChecksum: string
   readonly descriptor: SagaDescriptor
@@ -33,8 +44,53 @@ export interface SealSagaOperationPlanInput {
   readonly stepInputChecksums: Readonly<Record<string, string>>
 }
 
+type BuildSagaOperationPlanInput = Omit<SealSagaOperationPlanInput, "registry">
+
+type SagaOperationPlanInputSnapshot = Readonly<SealSagaOperationPlanInput>
+
 function configuration(message: string): never {
   throw new NozzleError("ConfigurationError", message)
+}
+
+function intervention(message: string): never {
+  throw new NozzleError("OperationInterventionRequiredError", message)
+}
+
+function snapshotStepInputChecksums(value: unknown): Readonly<Record<string, string>> {
+  const cloned = structuredClone(value)
+  if (typeof cloned !== "object" || cloned === null || Array.isArray(cloned)) {
+    return cloned as Readonly<Record<string, string>>
+  }
+  return Object.freeze(Object.fromEntries(Object.entries(cloned)))
+}
+
+function snapshotSagaOperationPlanInput(
+  input: SealSagaOperationPlanInput,
+): SagaOperationPlanInputSnapshot {
+  try {
+    const capabilitySnapshotChecksum = input.capabilitySnapshotChecksum
+    const descriptor = input.descriptor
+    const inputChecksum = input.inputChecksum
+    const leaseKey = input.leaseKey
+    const operationId = input.operationId
+    const operationIdempotencyKey = input.operationIdempotencyKey
+    const registry = input.registry
+    const sagaId = input.sagaId
+    const stepInputChecksums = snapshotStepInputChecksums(input.stepInputChecksums)
+    return Object.freeze({
+      capabilitySnapshotChecksum,
+      descriptor,
+      inputChecksum,
+      leaseKey,
+      operationId,
+      operationIdempotencyKey,
+      registry,
+      sagaId,
+      stepInputChecksums,
+    })
+  } catch {
+    configuration("Saga operation-plan input could not be snapshotted.")
+  }
 }
 
 function boundedText(value: unknown, label: string): asserts value is string {
@@ -104,8 +160,36 @@ function validateStepInputs(
   for (const stepId of expected) checksum(stepInputChecksums[stepId], "Saga step input checksum")
 }
 
+function stepInputChecksumsJson(
+  descriptor: SagaDescriptor,
+  stepInputChecksums: Readonly<Record<string, string>>,
+): string {
+  return JSON.stringify(
+    descriptor.steps.map((step) => [step.stepId, stepInputChecksums[step.stepId]] as const),
+  )
+}
+
+function bindSagaOperationPlan(
+  plan: OperationPlan,
+  input: Pick<
+    BuildSagaOperationPlanInput,
+    "descriptor" | "inputChecksum" | "sagaId" | "stepInputChecksums"
+  >,
+): OperationPlan {
+  TRUSTED_SAGA_OPERATION_PLANS.set(
+    plan,
+    Object.freeze({
+      descriptorChecksum: input.descriptor.descriptorChecksum,
+      inputChecksum: input.inputChecksum,
+      sagaId: input.sagaId,
+      stepInputChecksumsJson: stepInputChecksumsJson(input.descriptor, input.stepInputChecksums),
+    }),
+  )
+  return plan
+}
+
 async function actionStep(
-  input: SealSagaOperationPlanInput,
+  input: BuildSagaOperationPlanInput,
   step: SagaDescriptor["steps"][number],
   phase: SagaActionPhase,
   digest: DigestFunction,
@@ -154,14 +238,12 @@ async function actionStep(
   })
 }
 
-export async function sealSagaOperationPlan(
-  input: SealSagaOperationPlanInput,
+async function buildSagaOperationPlan(
+  input: BuildSagaOperationPlanInput,
   digest: DigestFunction,
 ): Promise<OperationPlan> {
   if (typeof digest !== "function") configuration("A saga operation-plan digest is required.")
   assertTrustedSagaDescriptor(input.descriptor)
-  assertTrustedSagaHandlerRegistry(input.registry)
-  input.registry.assertDescriptor(input.descriptor)
   boundedText(input.operationId, "Operation ID")
   boundedText(input.operationIdempotencyKey, "Operation idempotency key")
   boundedText(input.sagaId, "Saga ID")
@@ -292,4 +374,82 @@ export async function sealSagaOperationPlan(
     },
     digest,
   )
+}
+
+export async function sealSagaOperationPlan(
+  input: SealSagaOperationPlanInput,
+  digest: DigestFunction,
+): Promise<OperationPlan> {
+  const snapshot = snapshotSagaOperationPlanInput(input)
+  assertTrustedSagaHandlerRegistry(snapshot.registry)
+  snapshot.registry.assertDescriptor(snapshot.descriptor)
+  return bindSagaOperationPlan(await buildSagaOperationPlan(snapshot, digest), snapshot)
+}
+
+interface SagaPlanBindingSnapshot {
+  readonly descriptor: SagaDescriptor
+  readonly inputChecksum: string
+  readonly sagaId: string
+  readonly stepInputChecksums: Readonly<Record<string, string>>
+}
+
+function snapshotSagaPlanBinding(saga: SagaRecord): SagaPlanBindingSnapshot {
+  const descriptor = saga.descriptor
+  const inputChecksum = saga.inputChecksum
+  const sagaId = saga.sagaId
+  const steps = saga.steps
+  const stepInputChecksums = Object.freeze(
+    Object.fromEntries(
+      descriptor.steps.map((step) => [step.stepId, steps[step.stepId]?.inputChecksum as string]),
+    ),
+  )
+  return Object.freeze({ descriptor, inputChecksum, sagaId, stepInputChecksums })
+}
+
+export function assertTrustedSagaOperationPlan(plan: OperationPlan, saga: SagaRecord): void {
+  let verified = false
+  try {
+    const snapshot = snapshotSagaPlanBinding(saga)
+    assertTrustedSagaDescriptor(snapshot.descriptor)
+    const identity = TRUSTED_SAGA_OPERATION_PLANS.get(plan)
+    verified =
+      identity !== undefined &&
+      identity.descriptorChecksum === snapshot.descriptor.descriptorChecksum &&
+      identity.inputChecksum === snapshot.inputChecksum &&
+      identity.sagaId === snapshot.sagaId &&
+      identity.stepInputChecksumsJson ===
+        stepInputChecksumsJson(snapshot.descriptor, snapshot.stepInputChecksums)
+  } catch {
+    verified = false
+  }
+  if (!verified) intervention("The operation plan is not integrity-verified for this exact saga.")
+}
+
+export async function verifySagaOperationPlan(
+  plan: OperationPlan,
+  saga: SagaRecord,
+  digest: DigestFunction,
+): Promise<void> {
+  let canonical = false
+  try {
+    createOperationRecord(plan)
+    const snapshot = snapshotSagaPlanBinding(saga)
+    const leaseKey = plan.steps[0]?.leaseKey as string
+    const buildInput: BuildSagaOperationPlanInput = {
+      capabilitySnapshotChecksum: plan.capabilitySnapshotChecksum,
+      descriptor: snapshot.descriptor,
+      inputChecksum: snapshot.inputChecksum,
+      leaseKey,
+      operationId: plan.operationId,
+      operationIdempotencyKey: plan.idempotencyKey,
+      sagaId: snapshot.sagaId,
+      stepInputChecksums: snapshot.stepInputChecksums,
+    }
+    const expected = await buildSagaOperationPlan(buildInput, digest)
+    canonical = expected.planChecksum === plan.planChecksum
+    if (canonical) bindSagaOperationPlan(plan, buildInput)
+  } catch {
+    intervention("The saga operation plan could not be integrity-verified.")
+  }
+  if (!canonical) intervention("The operation plan contradicts the canonical saga plan.")
 }
