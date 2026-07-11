@@ -13,6 +13,7 @@ import {
   type OperationPlan,
   type OperationRecord,
   type OperationStepPlanInput,
+  recordSagaStepTerminalClassification,
   recordStepFailure,
   recordStepReconciliation,
   recordStepSuccess,
@@ -156,6 +157,20 @@ describe("persisted operation record integrity", () => {
       outcome: "not_applied",
       stepId: "one",
     })
+    const sagaUnknown = recordStepFailure(
+      await started({ effectProtocol: "saga_receipt", retryClassification: "reconcile_first" }),
+      {
+        attemptId: "attempt-1",
+        errorChecksum: "saga-unknown-error",
+        outcome: "unknown",
+        stepId: "one",
+      },
+    )
+    const reconciledSagaTerminal = recordSagaStepTerminalClassification(sagaUnknown, {
+      outcome: "not_applied",
+      receiptOutcomeChecksum: "saga-terminal-receipt",
+      stepId: "one",
+    })
     const conditional = createOperationRecord(
       await sealOperationPlan(
         {
@@ -197,6 +212,7 @@ describe("persisted operation record integrity", () => {
       crashUnknown,
       reconciledCrash,
       reconciledNever,
+      reconciledSagaTerminal,
       notRequired,
     ]) {
       const loaded = await roundTrip(operation)

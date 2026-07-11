@@ -20,12 +20,13 @@ import {
   type SagaEffectContext,
   sagaActionOperationStepId,
 } from "../src/saga-store.js"
-import { CONTROL_SCHEMA_STATEMENTS } from "../src/schema.js"
+import { CONTROL_SCHEMA_STATEMENTS, CONTROL_SCHEMA_VERSION_ONE_STATEMENTS } from "../src/schema.js"
 
 declare global {
   namespace Cloudflare {
     interface Env {
       DB: D1Database
+      UPGRADE_DB: D1Database
     }
   }
 }
@@ -42,6 +43,65 @@ beforeAll(async () => {
 })
 
 describe("real workerd D1 saga projection", () => {
+  it("upgrades and reruns the complete historical version-one schema artifact", async () => {
+    for (const statement of CONTROL_SCHEMA_VERSION_ONE_STATEMENTS) {
+      await env.UPGRADE_DB.prepare(statement).run()
+    }
+    const beforeIdentity = await env.UPGRADE_DB.prepare(
+      `SELECT "schema_version", "installed_at_ms" FROM "nozzle_control_meta"`,
+    ).first()
+    const legacyGuards = await env.UPGRADE_DB.prepare(
+      `SELECT "name" FROM "sqlite_schema"
+       WHERE "type" = 'trigger'
+         AND "name" IN ('nozzle_control_saga_attempt_insert',
+                        'nozzle_control_saga_outcome_insert')
+       ORDER BY "name"`,
+    ).all()
+    expect(legacyGuards.results).toEqual([
+      { name: "nozzle_control_saga_attempt_insert" },
+      { name: "nozzle_control_saga_outcome_insert" },
+    ])
+    for (const statement of CONTROL_SCHEMA_STATEMENTS) {
+      await env.UPGRADE_DB.prepare(statement).run()
+    }
+    for (const statement of CONTROL_SCHEMA_STATEMENTS) {
+      await env.UPGRADE_DB.prepare(statement).run()
+    }
+
+    const identity = await env.UPGRADE_DB.prepare(
+      `SELECT "schema_version", "installed_at_ms" FROM "nozzle_control_meta"`,
+    ).first()
+    const versions = await env.UPGRADE_DB.prepare(
+      `SELECT "schema_version" FROM "nozzle_control_schema_versions"
+       ORDER BY "schema_version"`,
+    ).all()
+    const replacementGuards = await env.UPGRADE_DB.prepare(
+      `SELECT "name" FROM "sqlite_schema"
+       WHERE "type" = 'trigger'
+         AND "name" IN ('nozzle_control_saga_attempt_insert',
+                        'nozzle_control_saga_attempt_insert_v2',
+                        'nozzle_control_saga_outcome_insert',
+                        'nozzle_control_saga_outcome_insert_v2',
+                        'nozzle_control_saga_protocol_insert_v2',
+                        'nozzle_control_saga_protocol_binding_insert_v2',
+                        'nozzle_control_saga_protocol_action_insert_v2',
+                        'nozzle_control_saga_protocol_observation_insert_v2',
+                        'nozzle_control_saga_protocol_compensation_insert_v2')
+       ORDER BY "name"`,
+    ).all()
+    expect(identity).toEqual(beforeIdentity)
+    expect(versions.results).toEqual([{ schema_version: 1 }, { schema_version: 2 }])
+    expect(replacementGuards.results).toEqual([
+      { name: "nozzle_control_saga_attempt_insert_v2" },
+      { name: "nozzle_control_saga_outcome_insert_v2" },
+      { name: "nozzle_control_saga_protocol_action_insert_v2" },
+      { name: "nozzle_control_saga_protocol_binding_insert_v2" },
+      { name: "nozzle_control_saga_protocol_compensation_insert_v2" },
+      { name: "nozzle_control_saga_protocol_insert_v2" },
+      { name: "nozzle_control_saga_protocol_observation_insert_v2" },
+    ])
+  })
+
   it("seals a deploy-time handler registry and complete conditional saga plan", async () => {
     const forwardAction = {
       actionId: "workerd.registry.forward",
@@ -154,7 +214,7 @@ describe("real workerd D1 saga projection", () => {
     ).resolves.toEqual({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" })
   })
 
-  it("atomically couples saga initialization and action begin in real D1", async () => {
+  it("atomically couples an observed unknown action across both real D1 ledgers", async () => {
     const operationId = "workerd-coordinator-operation"
     const sagaId = "workerd-coordinator-saga"
     const leaseKey = `saga:${sagaId}`
@@ -271,7 +331,7 @@ describe("real workerd D1 saga projection", () => {
       ttlMs: 60_000,
     })
     if (!acquired.acquired) throw new Error("Coordinator lease acquisition failed.")
-    const proof = leaseProof(acquired.record)
+    let proof = leaseProof(acquired.record)
     const initAttemptId = `${sagaId}:init:1`
     const initPlan = plan.steps.find((step) => step.stepId === SAGA_INIT_OPERATION_STEP_ID)
     if (initPlan === undefined) throw new Error("Coordinator init plan is missing.")
@@ -320,15 +380,23 @@ describe("real workerd D1 saga projection", () => {
       sagaId,
       sagaStepId: "write",
     })
-    const outcome = await attempts.complete({
+    expect(
+      await env.DB.prepare(
+        `SELECT "protocol_version" FROM "nozzle_saga_action_attempt_protocols"
+         WHERE "attempt_id" = ?1`,
+      )
+        .bind(actionAttemptId)
+        .first(),
+    ).toEqual({ protocol_version: 2 })
+    const unknown = await attempts.complete({
       attemptId: actionAttemptId,
+      errorJson: '{"dispatch":"unknown"}',
       evidenceJson: '{"source":"workerd-coordinator"}',
-      outputJson: '{"written":true}',
       proof,
-      state: "confirmed",
+      state: "unknown",
     })
-    if (outcome.state !== "confirmed") throw new Error("Expected a confirmed action outcome.")
-    const settled = await coordinator.settleActionFromReceipt({
+    if (unknown.state !== "unknown") throw new Error("Expected an unknown action outcome.")
+    const unknownSaga = await coordinator.settleActionFromReceipt({
       actorChecksum: "workerd-coordinator-actor",
       attemptId: actionAttemptId,
       operationId,
@@ -337,7 +405,66 @@ describe("real workerd D1 saga projection", () => {
       sagaId,
       stepId: "write",
     })
+    expect(unknownSaga.steps.write?.forward.state).toBe("unknown")
+    await leases.release({ proof })
+    const observer = await leases.acquire({
+      acquisitionId: "workerd-coordinator-observer-acquisition",
+      holderId: "workerd-coordinator-observer",
+      leaseKey,
+      ttlMs: 60_000,
+    })
+    if (!observer.acquired) throw new Error("Coordinator observer lease acquisition failed.")
+    proof = leaseProof(observer.record)
+    const forbiddenObservationAttemptId = `${actionAttemptId}:forbidden-observation`
+    await attempts.accept({
+      attemptId: forbiddenObservationAttemptId,
+      inputJson: JSON.stringify({ effectAttemptId: actionAttemptId }),
+      phase: "forward",
+      proof,
+      purpose: "observation",
+      sagaId,
+      sagaStepId: "write",
+    })
+    await expect(
+      env.DB.prepare(
+        `INSERT INTO "nozzle_saga_action_attempt_outcomes"
+         ("attempt_id", "state", "evidence_checksum", "evidence_json", "output_checksum",
+          "output_json", "error_checksum", "error_json", "outcome_checksum", "completed_at_ms")
+         VALUES (?1, 'failed', 'forbidden-evidence', '{}', NULL, NULL, 'forbidden-error', '{}',
+                 'forbidden-outcome', 1)`,
+      )
+        .bind(forbiddenObservationAttemptId)
+        .run(),
+    ).rejects.toThrow(/NOZZLE_CONTROL_SAGA_OUTCOME_FENCED/u)
+    const observationAttemptId = `${actionAttemptId}:observation`
+    await attempts.accept({
+      attemptId: observationAttemptId,
+      inputJson: JSON.stringify({ effectAttemptId: actionAttemptId }),
+      phase: "forward",
+      proof,
+      purpose: "observation",
+      sagaId,
+      sagaStepId: "write",
+    })
+    const outcome = await attempts.complete({
+      attemptId: observationAttemptId,
+      evidenceJson: '{"source":"workerd-observer"}',
+      outputJson: '{"written":true}',
+      proof,
+      state: "confirmed",
+    })
+    if (outcome.state !== "confirmed") throw new Error("Expected an applied observation outcome.")
+    const settled = await coordinator.settleObservationFromReceipt({
+      actorChecksum: "workerd-coordinator-actor",
+      attemptId: observationAttemptId,
+      operationId,
+      phase: "forward",
+      proof,
+      sagaId,
+      stepId: "write",
+    })
     expect(settled.steps.write?.forward).toMatchObject({
+      observationEvidenceChecksum: outcome.outcomeChecksum,
       resultChecksum: outcome.outputChecksum,
       state: "succeeded",
     })
@@ -354,23 +481,41 @@ describe("real workerd D1 saga projection", () => {
          WHERE "operation_id" = ?2 AND "step_id" = ?3) AS "operation_state",
         (SELECT json_extract("record_json", '$.resultChecksum')
          FROM "nozzle_operation_steps"
-         WHERE "operation_id" = ?2 AND "step_id" = ?3) AS "operation_result"`,
+         WHERE "operation_id" = ?2 AND "step_id" = ?3) AS "operation_result",
+        (SELECT count(*) FROM "nozzle_saga_action_attempts"
+         WHERE "saga_id" = ?1) AS "attempts",
+        (SELECT count(*) FROM "nozzle_saga_action_attempt_outcomes" AS "outcome"
+         JOIN "nozzle_saga_action_attempts" AS "attempt" USING ("attempt_id")
+         WHERE "attempt"."saga_id" = ?1) AS "outcomes"`,
     )
       .bind(sagaId, operationId, sagaActionOperationStepId("write", "forward"))
       .first<{
         effects: number
+        attempts: number
         operation_attempts: number
         operation_result: string
         operation_state: string
+        outcomes: number
         saga_version: number
       }>()
     expect(counts).toEqual({
-      effects: 3,
+      attempts: 3,
+      effects: 4,
       operation_attempts: 1,
       operation_result: outcome.outcomeChecksum,
       operation_state: "succeeded",
-      saga_version: 2,
+      outcomes: 2,
+      saga_version: 3,
     })
+    await leases.release({ proof })
+    const successor = await leases.acquire({
+      acquisitionId: "workerd-coordinator-successor-acquisition",
+      holderId: "workerd-coordinator-successor",
+      leaseKey,
+      ttlMs: 60_000,
+    })
+    expect(successor.acquired).toBe(true)
+    for (const statement of CONTROL_SCHEMA_STATEMENTS) await env.DB.prepare(statement).run()
   })
 
   it("atomically advances a saga only through exact fenced operation transitions", async () => {
@@ -409,6 +554,7 @@ describe("real workerd D1 saga projection", () => {
     const leases = new D1LeaseStore(env.DB)
     const sagas = new D1SagaStore(env.DB, digest)
     const attempts = new D1SagaAttemptStore(env.DB, digest)
+    const coordinator = new D1SagaCoordinatorStore(env.DB, digest)
     await operations.create({
       actorChecksum: "workerd-saga-actor",
       capabilitySnapshotJson,
@@ -554,27 +700,13 @@ describe("real workerd D1 saga projection", () => {
       state: "confirmed",
     })
     if (outcome.state !== "confirmed") throw new Error("Expected confirmed saga action receipt.")
-    await operations.completeStep({
+    saga = await coordinator.settleActionFromReceipt({
       actorChecksum: "workerd-saga-actor",
       attemptId: writeAttempt,
-      observedPostconditionChecksum: `workerd-saga:${writeOperationStepId}:postcondition`,
       operationId,
-      proof,
-      resultChecksum: outcome.outcomeChecksum,
-      stepId: writeOperationStepId,
-    })
-    saga = await sagas.recordActionSuccess({
-      attemptId: writeAttempt,
-      effect: context(
-        "workerd-saga:write:success",
-        writeOperationStepId,
-        operationTransitionIdentity("succeeded", [operationId, writeOperationStepId, writeAttempt]),
-      ),
-      evidenceChecksum: outcome.outcomeChecksum,
       phase: "forward",
-      resultChecksum: outcome.outputChecksum,
+      proof,
       sagaId,
-      serverTimeMs: 1_002,
       stepId: "write",
     })
 

@@ -1,4 +1,4 @@
-export const CONTROL_SCHEMA_VERSION = 1 as const
+export const CONTROL_SCHEMA_VERSION = 2 as const
 
 export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_audit_log",
@@ -22,6 +22,7 @@ export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_route_overrides",
   "nozzle_route_versions",
   "nozzle_saga_action_attempt_outcomes",
+  "nozzle_saga_action_attempt_protocols",
   "nozzle_saga_action_attempts",
   "nozzle_sagas",
   "nozzle_schema_artifacts",
@@ -30,14 +31,579 @@ export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_topology_versions",
 ] as const)
 
-export const CONTROL_SCHEMA_STATEMENTS = Object.freeze([
+function triggerInstallStatement(definition: string): string {
+  return `${definition.replace("CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS ")};`
+}
+
+function triggerDefinitionGuard(definition: string): string {
+  const nameEnd = definition.indexOf('"', 'CREATE TRIGGER "'.length)
+  const name = definition.slice('CREATE TRIGGER "'.length, nameEnd)
+  const expected = definition.replaceAll("'", "''")
+  return `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE COALESCE((
+  SELECT "sql" FROM "sqlite_schema" WHERE "type" = 'trigger' AND "name" = '${name}'
+), '') <> '${expected}';`
+}
+
+const SAGA_ATTEMPT_V2_BINDING = `EXISTS (
+  SELECT 1
+  FROM "nozzle_sagas" AS "saga"
+  JOIN "nozzle_operation_steps" AS "step"
+    ON "step"."operation_id" = NEW."operation_id"
+   AND "step"."step_id" = NEW."operation_step_id"
+  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = NEW."lease_key"
+  WHERE "saga"."saga_id" = NEW."saga_id"
+    AND "saga"."operation_id" = NEW."operation_id"
+    AND NEW."operation_step_id" = 'saga:' || NEW."phase" || ':' || NEW."saga_step_id"
+    AND json_extract("step"."plan_json", '$.stepId') = "step"."step_id"
+    AND json_extract("step"."plan_json", '$.idempotencyKey') = "step"."idempotency_key"
+    AND json_extract("step"."plan_json", '$.leaseKey') = "step"."lease_key"
+    AND json_extract("step"."plan_json", '$.effectProtocol') = 'saga_receipt'
+    AND json_extract("step"."record_json", '$.state') = "step"."state"
+    AND json_extract("step"."record_json", '$.fencingToken') IS "step"."fencing_token"
+    AND EXISTS (
+      SELECT 1
+      FROM json_each(json_extract("saga"."descriptor_json", '$.steps')) AS "descriptor_step"
+      WHERE json_extract("descriptor_step"."value", '$.stepId') = NEW."saga_step_id"
+        AND NEW."action_key" = CASE
+          WHEN NEW."purpose" = 'effect' AND NEW."phase" = 'forward' THEN
+            json_extract("descriptor_step"."value", '$.forwardAction.actionId') || '@' ||
+            json_extract("descriptor_step"."value", '$.forwardAction.version') || ':' ||
+            json_extract("descriptor_step"."value", '$.forwardAction.artifactChecksum')
+          WHEN NEW."purpose" = 'effect' AND NEW."phase" = 'compensation' THEN
+            json_extract("descriptor_step"."value", '$.compensationAction.actionId') || '@' ||
+            json_extract("descriptor_step"."value", '$.compensationAction.version') || ':' ||
+            json_extract("descriptor_step"."value", '$.compensationAction.artifactChecksum')
+          WHEN NEW."purpose" = 'observation' AND NEW."phase" = 'forward' THEN
+            json_extract("descriptor_step"."value", '$.forwardObservation.actionId') || '@' ||
+            json_extract("descriptor_step"."value", '$.forwardObservation.version') || ':' ||
+            json_extract("descriptor_step"."value", '$.forwardObservation.artifactChecksum')
+          ELSE
+            json_extract("descriptor_step"."value", '$.compensationObservation.actionId') || '@' ||
+            json_extract("descriptor_step"."value", '$.compensationObservation.version') || ':' ||
+            json_extract("descriptor_step"."value", '$.compensationObservation.artifactChecksum')
+        END
+    )
+    AND (
+      (NEW."purpose" = 'effect' AND NEW."phase" = 'forward'
+       AND NEW."causal_attempt_id" IS NULL)
+      OR
+      (NEW."purpose" = 'observation' AND EXISTS (
+        SELECT 1
+        FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "causal_step"
+        JOIN "nozzle_saga_action_attempts" AS "cause"
+          ON "cause"."attempt_id" = NEW."causal_attempt_id"
+        LEFT JOIN "nozzle_saga_action_attempt_outcomes" AS "cause_outcome"
+          ON "cause_outcome"."attempt_id" = "cause"."attempt_id"
+        WHERE "causal_step"."key" = NEW."saga_step_id"
+          AND NEW."causal_attempt_id" = json_extract(
+            "causal_step"."value", '$.' || NEW."phase" || '.lastAttemptId'
+          )
+          AND "cause"."saga_id" = NEW."saga_id"
+          AND "cause"."operation_id" = NEW."operation_id"
+          AND "cause"."operation_step_id" = NEW."operation_step_id"
+          AND "cause"."saga_step_id" = NEW."saga_step_id"
+          AND "cause"."phase" = NEW."phase"
+          AND "cause"."purpose" = 'effect'
+          AND ("cause_outcome"."state" = 'unknown' OR "cause_outcome"."state" IS NULL)
+          AND json_extract("step"."record_json", '$.lastAttemptId') = NEW."causal_attempt_id"
+          AND (
+            ("cause_outcome"."state" IS NULL
+             AND json_extract(
+               "causal_step"."value", '$.' || NEW."phase" || '.errorChecksum'
+             ) = "cause"."acceptance_checksum"
+             AND json_extract("step"."record_json", '$.errorChecksum') =
+               "cause"."acceptance_checksum")
+            OR (
+              json_extract(
+                "causal_step"."value", '$.' || NEW."phase" || '.errorChecksum'
+              ) = "cause_outcome"."error_checksum"
+              AND json_extract("step"."record_json", '$.errorChecksum') =
+                "cause_outcome"."outcome_checksum"
+            )
+          )
+      ))
+      OR
+      (NEW."purpose" = 'effect' AND NEW."phase" = 'compensation' AND EXISTS (
+        SELECT 1
+        FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "causal_step"
+        JOIN "nozzle_saga_action_attempts" AS "cause"
+          ON "cause"."attempt_id" = NEW."causal_attempt_id"
+        JOIN "nozzle_saga_action_attempt_outcomes" AS "cause_outcome"
+          ON "cause_outcome"."attempt_id" = "cause"."attempt_id"
+        WHERE "causal_step"."key" = NEW."saga_step_id"
+          AND NEW."causal_attempt_id" = json_extract(
+            "causal_step"."value", '$.forward.lastAttemptId'
+          )
+          AND json_extract("causal_step"."value", '$.forward.state') = 'succeeded'
+          AND json_extract("causal_step"."value", '$.forward.resultChecksum') =
+            "cause_outcome"."output_checksum"
+          AND "cause"."saga_id" = NEW."saga_id"
+          AND "cause"."operation_id" = NEW."operation_id"
+          AND "cause"."operation_step_id" = 'saga:forward:' || NEW."saga_step_id"
+          AND "cause"."saga_step_id" = NEW."saga_step_id"
+          AND "cause"."phase" = 'forward'
+          AND "cause"."purpose" = 'effect'
+          AND "cause_outcome"."state" = 'confirmed'
+      ))
+    )
+    AND EXISTS (
+      SELECT 1 FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "saga_step"
+      WHERE "saga_step"."key" = NEW."saga_step_id"
+        AND NEW."idempotency_key" = CASE
+          WHEN NEW."purpose" = 'observation' THEN
+            json_extract("saga_step"."value", '$.' || NEW."phase" || '.idempotencyKey') ||
+              ':observation'
+          ELSE json_extract(
+            "saga_step"."value", '$.' || NEW."phase" || '.idempotencyKey'
+          )
+        END
+        AND (
+          NEW."purpose" <> 'effect' OR NEW."phase" <> 'forward' OR
+          NEW."input_checksum" = json_extract("saga_step"."value", '$.inputChecksum')
+        )
+        AND (
+          (NEW."purpose" = 'effect'
+           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.state') = 'running'
+           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.activeAttemptId') = NEW."attempt_id")
+          OR
+          (NEW."purpose" = 'observation'
+           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.state') = 'unknown')
+        )
+    )
+    AND "step"."lease_key" = NEW."lease_key"
+    AND (
+      (NEW."purpose" = 'effect'
+       AND "step"."state" = 'running'
+       AND json_extract("step"."record_json", '$.activeAttemptId') = NEW."attempt_id"
+       AND "step"."fencing_token" = NEW."fencing_token")
+      OR
+      (NEW."purpose" = 'observation'
+       AND "step"."state" = 'unknown'
+       AND "step"."fencing_token" < NEW."fencing_token")
+    )
+    AND "lease"."holder_id" = NEW."holder_id"
+    AND "lease"."acquisition_id" = NEW."acquisition_id"
+    AND "lease"."fencing_token" = NEW."fencing_token"
+    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+)`
+
+const SAGA_ATTEMPT_INSERT_V2_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_attempt_insert_v2"
+BEFORE INSERT ON "nozzle_saga_action_attempts"
+WHEN NOT ${SAGA_ATTEMPT_V2_BINDING}
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_ATTEMPT_FENCED'); END`
+
+const SAGA_OUTCOME_INSERT_V2_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_outcome_insert_v2"
+BEFORE INSERT ON "nozzle_saga_action_attempt_outcomes"
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_saga_action_attempts" AS "attempt"
+  JOIN "nozzle_saga_action_attempt_protocols" AS "protocol"
+    ON "protocol"."attempt_id" = "attempt"."attempt_id"
+  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = "attempt"."lease_key"
+  WHERE "attempt"."attempt_id" = NEW."attempt_id"
+    AND "protocol"."protocol_version" IN (1, 2)
+    AND (
+      ("attempt"."purpose" = 'effect'
+       AND NEW."state" IN ('confirmed', 'failed', 'not_applied', 'unknown'))
+      OR
+      ("attempt"."purpose" = 'observation'
+       AND NEW."state" IN ('confirmed', 'indeterminate', 'not_applied'))
+    )
+    AND "lease"."holder_id" = "attempt"."holder_id"
+    AND "lease"."acquisition_id" = "attempt"."acquisition_id"
+    AND "lease"."fencing_token" = "attempt"."fencing_token"
+    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_FENCED'); END`
+
+const SAGA_PROTOCOL_INSERT_V2_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_protocol_insert_v2"
+BEFORE INSERT ON "nozzle_saga_action_attempt_protocols"
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_saga_action_attempts" AS "attempt"
+  WHERE "attempt"."attempt_id" = NEW."attempt_id"
+    AND "attempt"."accepted_at_ms" = NEW."classified_at_ms"
+    AND (
+      NEW."protocol_version" = 1
+      OR EXISTS (
+        SELECT 1 FROM "nozzle_control_schema_versions"
+        WHERE "schema_version" = 2
+      )
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_PROTOCOL_FENCED'); END`
+
+const SAGA_PROTOCOL_BINDING_INSERT_V2_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_protocol_binding_insert_v2"
+BEFORE INSERT ON "nozzle_saga_action_attempt_protocols"
+WHEN NEW."protocol_version" = 2 AND NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_saga_action_attempts" AS "attempt"
+  JOIN "nozzle_sagas" AS "saga" ON "saga"."saga_id" = "attempt"."saga_id"
+  JOIN "nozzle_operation_steps" AS "step"
+    ON "step"."operation_id" = "attempt"."operation_id"
+   AND "step"."step_id" = "attempt"."operation_step_id"
+  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = "attempt"."lease_key"
+  WHERE "attempt"."attempt_id" = NEW."attempt_id"
+    AND "saga"."operation_id" = "attempt"."operation_id"
+    AND "attempt"."operation_step_id" =
+      'saga:' || "attempt"."phase" || ':' || "attempt"."saga_step_id"
+    AND json_extract("step"."plan_json", '$.stepId') = "step"."step_id"
+    AND json_extract("step"."plan_json", '$.idempotencyKey') = "step"."idempotency_key"
+    AND json_extract("step"."plan_json", '$.leaseKey') = "step"."lease_key"
+    AND json_extract("step"."plan_json", '$.effectProtocol') = 'saga_receipt'
+    AND json_extract("step"."record_json", '$.state') = "step"."state"
+    AND json_extract("step"."record_json", '$.fencingToken') IS "step"."fencing_token"
+    AND EXISTS (
+      SELECT 1
+      FROM json_each(json_extract("saga"."descriptor_json", '$.steps')) AS "descriptor_step"
+      WHERE json_extract("descriptor_step"."value", '$.stepId') = "attempt"."saga_step_id"
+        AND "attempt"."action_key" = CASE
+          WHEN "attempt"."purpose" = 'effect' AND "attempt"."phase" = 'forward' THEN
+            json_extract("descriptor_step"."value", '$.forwardAction.actionId') || '@' ||
+            json_extract("descriptor_step"."value", '$.forwardAction.version') || ':' ||
+            json_extract("descriptor_step"."value", '$.forwardAction.artifactChecksum')
+          WHEN "attempt"."purpose" = 'effect' AND "attempt"."phase" = 'compensation' THEN
+            json_extract("descriptor_step"."value", '$.compensationAction.actionId') || '@' ||
+            json_extract("descriptor_step"."value", '$.compensationAction.version') || ':' ||
+            json_extract("descriptor_step"."value", '$.compensationAction.artifactChecksum')
+          WHEN "attempt"."purpose" = 'observation' AND "attempt"."phase" = 'forward' THEN
+            json_extract("descriptor_step"."value", '$.forwardObservation.actionId') || '@' ||
+            json_extract("descriptor_step"."value", '$.forwardObservation.version') || ':' ||
+            json_extract("descriptor_step"."value", '$.forwardObservation.artifactChecksum')
+          ELSE
+            json_extract("descriptor_step"."value", '$.compensationObservation.actionId') || '@' ||
+            json_extract("descriptor_step"."value", '$.compensationObservation.version') || ':' ||
+            json_extract("descriptor_step"."value", '$.compensationObservation.artifactChecksum')
+        END
+    )
+    AND "step"."lease_key" = "attempt"."lease_key"
+    AND "lease"."holder_id" = "attempt"."holder_id"
+    AND "lease"."acquisition_id" = "attempt"."acquisition_id"
+    AND "lease"."fencing_token" = "attempt"."fencing_token"
+    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_PROTOCOL_FENCED'); END`
+
+const SAGA_PROTOCOL_ACTION_INSERT_V2_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_protocol_action_insert_v2"
+BEFORE INSERT ON "nozzle_saga_action_attempt_protocols"
+WHEN NEW."protocol_version" = 2 AND NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_saga_action_attempts" AS "attempt"
+  JOIN "nozzle_sagas" AS "saga" ON "saga"."saga_id" = "attempt"."saga_id"
+  JOIN "nozzle_operation_steps" AS "step"
+    ON "step"."operation_id" = "attempt"."operation_id"
+   AND "step"."step_id" = "attempt"."operation_step_id"
+  JOIN json_each(json_extract("saga"."record_json", '$.steps')) AS "saga_step"
+    ON "saga_step"."key" = "attempt"."saga_step_id"
+  WHERE "attempt"."attempt_id" = NEW."attempt_id"
+    AND "attempt"."idempotency_key" = CASE
+      WHEN "attempt"."purpose" = 'observation' THEN
+        json_extract("saga_step"."value", '$.' || "attempt"."phase" || '.idempotencyKey') ||
+          ':observation'
+      ELSE json_extract(
+        "saga_step"."value", '$.' || "attempt"."phase" || '.idempotencyKey'
+      )
+    END
+    AND (
+      "attempt"."purpose" <> 'effect' OR "attempt"."phase" <> 'forward' OR
+      "attempt"."input_checksum" = json_extract("saga_step"."value", '$.inputChecksum')
+    )
+    AND (
+      ("attempt"."purpose" = 'effect'
+       AND json_extract(
+         "saga_step"."value", '$.' || "attempt"."phase" || '.state'
+       ) = 'running'
+       AND json_extract(
+         "saga_step"."value", '$.' || "attempt"."phase" || '.activeAttemptId'
+       ) = "attempt"."attempt_id")
+      OR
+      ("attempt"."purpose" = 'observation'
+       AND json_extract(
+         "saga_step"."value", '$.' || "attempt"."phase" || '.state'
+       ) = 'unknown')
+    )
+    AND (
+      ("attempt"."purpose" = 'effect'
+       AND "step"."state" = 'running'
+       AND json_extract("step"."record_json", '$.activeAttemptId') = "attempt"."attempt_id"
+       AND "step"."fencing_token" = "attempt"."fencing_token")
+      OR
+      ("attempt"."purpose" = 'observation'
+       AND "step"."state" = 'unknown'
+       AND "step"."fencing_token" < "attempt"."fencing_token")
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_PROTOCOL_FENCED'); END`
+
+const SAGA_PROTOCOL_OBSERVATION_INSERT_V2_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_protocol_observation_insert_v2"
+BEFORE INSERT ON "nozzle_saga_action_attempt_protocols"
+WHEN NEW."protocol_version" = 2
+  AND EXISTS (
+    SELECT 1 FROM "nozzle_saga_action_attempts" AS "attempt"
+    WHERE "attempt"."attempt_id" = NEW."attempt_id" AND "attempt"."purpose" = 'observation'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM "nozzle_saga_action_attempts" AS "attempt"
+    JOIN "nozzle_sagas" AS "saga" ON "saga"."saga_id" = "attempt"."saga_id"
+    JOIN "nozzle_operation_steps" AS "step"
+      ON "step"."operation_id" = "attempt"."operation_id"
+     AND "step"."step_id" = "attempt"."operation_step_id"
+    JOIN json_each(json_extract("saga"."record_json", '$.steps')) AS "causal_step"
+      ON "causal_step"."key" = "attempt"."saga_step_id"
+    JOIN "nozzle_saga_action_attempts" AS "cause"
+      ON "cause"."attempt_id" = "attempt"."causal_attempt_id"
+    LEFT JOIN "nozzle_saga_action_attempt_outcomes" AS "cause_outcome"
+      ON "cause_outcome"."attempt_id" = "cause"."attempt_id"
+    WHERE "attempt"."attempt_id" = NEW."attempt_id"
+      AND "attempt"."causal_attempt_id" = json_extract(
+        "causal_step"."value", '$.' || "attempt"."phase" || '.lastAttemptId'
+      )
+      AND "cause"."saga_id" = "attempt"."saga_id"
+      AND "cause"."operation_id" = "attempt"."operation_id"
+      AND "cause"."operation_step_id" = "attempt"."operation_step_id"
+      AND "cause"."saga_step_id" = "attempt"."saga_step_id"
+      AND "cause"."phase" = "attempt"."phase"
+      AND "cause"."purpose" = 'effect'
+      AND ("cause_outcome"."state" = 'unknown' OR "cause_outcome"."state" IS NULL)
+      AND json_extract("step"."record_json", '$.lastAttemptId') = "attempt"."causal_attempt_id"
+      AND (
+        ("cause_outcome"."state" IS NULL
+         AND json_extract(
+           "causal_step"."value", '$.' || "attempt"."phase" || '.errorChecksum'
+         ) = "cause"."acceptance_checksum"
+         AND json_extract("step"."record_json", '$.errorChecksum') =
+           "cause"."acceptance_checksum")
+        OR
+        (json_extract(
+           "causal_step"."value", '$.' || "attempt"."phase" || '.errorChecksum'
+         ) = "cause_outcome"."error_checksum"
+         AND json_extract("step"."record_json", '$.errorChecksum') =
+           "cause_outcome"."outcome_checksum")
+      )
+  )
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_PROTOCOL_FENCED'); END`
+
+const SAGA_PROTOCOL_COMPENSATION_INSERT_V2_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_protocol_compensation_insert_v2"
+BEFORE INSERT ON "nozzle_saga_action_attempt_protocols"
+WHEN NEW."protocol_version" = 2
+  AND EXISTS (
+    SELECT 1 FROM "nozzle_saga_action_attempts" AS "attempt"
+    WHERE "attempt"."attempt_id" = NEW."attempt_id"
+      AND "attempt"."purpose" = 'effect'
+      AND "attempt"."phase" = 'compensation'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM "nozzle_saga_action_attempts" AS "attempt"
+    JOIN "nozzle_sagas" AS "saga" ON "saga"."saga_id" = "attempt"."saga_id"
+    JOIN json_each(json_extract("saga"."record_json", '$.steps')) AS "causal_step"
+      ON "causal_step"."key" = "attempt"."saga_step_id"
+    JOIN "nozzle_saga_action_attempts" AS "cause"
+      ON "cause"."attempt_id" = "attempt"."causal_attempt_id"
+    JOIN "nozzle_saga_action_attempt_outcomes" AS "cause_outcome"
+      ON "cause_outcome"."attempt_id" = "cause"."attempt_id"
+    WHERE "attempt"."attempt_id" = NEW."attempt_id"
+      AND "attempt"."causal_attempt_id" =
+        json_extract("causal_step"."value", '$.forward.lastAttemptId')
+      AND json_extract("causal_step"."value", '$.forward.state') = 'succeeded'
+      AND json_extract("causal_step"."value", '$.forward.resultChecksum') =
+        "cause_outcome"."output_checksum"
+      AND "cause"."saga_id" = "attempt"."saga_id"
+      AND "cause"."operation_id" = "attempt"."operation_id"
+      AND "cause"."operation_step_id" =
+        'saga:forward:' || "attempt"."saga_step_id"
+      AND "cause"."saga_step_id" = "attempt"."saga_step_id"
+      AND "cause"."phase" = 'forward'
+      AND "cause"."purpose" = 'effect'
+      AND "cause_outcome"."state" = 'confirmed'
+  )
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_PROTOCOL_FENCED'); END`
+
+const SAGA_PROTOCOL_UPDATE_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_protocol_update"
+BEFORE UPDATE ON "nozzle_saga_action_attempt_protocols"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_PROTOCOL_IMMUTABLE'); END`
+
+const SAGA_PROTOCOL_DELETE_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_protocol_delete"
+BEFORE DELETE ON "nozzle_saga_action_attempt_protocols"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_PROTOCOL_IMMUTABLE'); END`
+
+const SAGA_PROTOCOL_IDENTITY_AUDIT = `INSERT INTO "nozzle_control_schema_versions"
+  ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE EXISTS (
+  SELECT 1
+  FROM "nozzle_saga_action_attempt_protocols" AS "protocol"
+  LEFT JOIN "nozzle_saga_action_attempts" AS "attempt"
+    ON "attempt"."attempt_id" = "protocol"."attempt_id"
+  WHERE "attempt"."attempt_id" IS NULL
+    OR "protocol"."classified_at_ms" <> "attempt"."accepted_at_ms"
+);`
+
+const SAGA_PROTOCOL_UNPUBLISHED_V2_AUDIT = `INSERT INTO "nozzle_control_schema_versions"
+  ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 2
+)
+AND EXISTS (
+  SELECT 1 FROM "nozzle_saga_action_attempt_protocols" WHERE "protocol_version" = 2
+);`
+
+const SAGA_ATTEMPT_INSERT_V1_ARTIFACT = `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_attempt_insert"
+BEFORE INSERT ON "nozzle_saga_action_attempts"
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_sagas" AS "saga"
+  JOIN "nozzle_operation_steps" AS "step"
+    ON "step"."operation_id" = NEW."operation_id"
+   AND "step"."step_id" = NEW."operation_step_id"
+  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = NEW."lease_key"
+  WHERE "saga"."saga_id" = NEW."saga_id"
+    AND "saga"."operation_id" = NEW."operation_id"
+    AND (
+      (NEW."purpose" = 'effect' AND NEW."phase" = 'forward'
+       AND NEW."causal_attempt_id" IS NULL)
+      OR
+      (NEW."purpose" = 'observation' AND EXISTS (
+        SELECT 1
+        FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "causal_step"
+        JOIN "nozzle_saga_action_attempts" AS "cause"
+          ON "cause"."attempt_id" = NEW."causal_attempt_id"
+        LEFT JOIN "nozzle_saga_action_attempt_outcomes" AS "cause_outcome"
+          ON "cause_outcome"."attempt_id" = "cause"."attempt_id"
+        WHERE "causal_step"."key" = NEW."saga_step_id"
+          AND NEW."causal_attempt_id" = json_extract(
+            "causal_step"."value", '$.' || NEW."phase" || '.lastAttemptId'
+          )
+          AND "cause"."saga_id" = NEW."saga_id"
+          AND "cause"."operation_id" = NEW."operation_id"
+          AND "cause"."operation_step_id" = NEW."operation_step_id"
+          AND "cause"."saga_step_id" = NEW."saga_step_id"
+          AND "cause"."phase" = NEW."phase"
+          AND "cause"."purpose" = 'effect'
+          AND ("cause_outcome"."state" = 'unknown' OR "cause_outcome"."state" IS NULL)
+      ))
+      OR
+      (NEW."purpose" = 'effect' AND NEW."phase" = 'compensation' AND EXISTS (
+        SELECT 1
+        FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "causal_step"
+        JOIN "nozzle_saga_action_attempts" AS "cause"
+          ON "cause"."attempt_id" = NEW."causal_attempt_id"
+        WHERE "causal_step"."key" = NEW."saga_step_id"
+          AND NEW."causal_attempt_id" = json_extract(
+            "causal_step"."value", '$.forward.lastAttemptId'
+          )
+          AND json_extract("causal_step"."value", '$.forward.state') = 'succeeded'
+          AND json_extract("causal_step"."value", '$.forward.resultChecksum') IS NOT NULL
+          AND "cause"."saga_id" = NEW."saga_id"
+          AND "cause"."operation_id" = NEW."operation_id"
+          AND "cause"."saga_step_id" = NEW."saga_step_id"
+          AND "cause"."phase" = 'forward'
+          AND "cause"."purpose" = 'effect'
+      ))
+    )
+    AND EXISTS (
+      SELECT 1 FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "saga_step"
+      WHERE "saga_step"."key" = NEW."saga_step_id"
+        AND (
+          (NEW."purpose" = 'effect'
+           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.state') = 'running'
+           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.activeAttemptId') = NEW."attempt_id")
+          OR
+          (NEW."purpose" = 'observation'
+           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.state') = 'unknown')
+        )
+    )
+    AND "step"."lease_key" = NEW."lease_key"
+    AND (
+      (NEW."purpose" = 'effect'
+       AND "step"."state" = 'running'
+       AND json_extract("step"."record_json", '$.activeAttemptId') = NEW."attempt_id"
+       AND "step"."fencing_token" = NEW."fencing_token")
+      OR
+      (NEW."purpose" = 'observation'
+       AND "step"."state" = 'unknown'
+       AND "step"."fencing_token" < NEW."fencing_token")
+    )
+    AND "lease"."holder_id" = NEW."holder_id"
+    AND "lease"."acquisition_id" = NEW."acquisition_id"
+    AND "lease"."fencing_token" = NEW."fencing_token"
+    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_ATTEMPT_FENCED'); END;`
+
+const SAGA_OUTCOME_INSERT_V1_ARTIFACT = `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_outcome_insert"
+BEFORE INSERT ON "nozzle_saga_action_attempt_outcomes"
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_saga_action_attempts" AS "attempt"
+  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = "attempt"."lease_key"
+  WHERE "attempt"."attempt_id" = NEW."attempt_id"
+    AND "lease"."holder_id" = "attempt"."holder_id"
+    AND "lease"."acquisition_id" = "attempt"."acquisition_id"
+    AND "lease"."fencing_token" = "attempt"."fencing_token"
+    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_FENCED'); END;`
+
+const SAGA_PROTOCOL_CLASSIFY_V2_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_protocol_classify_v2"
+AFTER INSERT ON "nozzle_saga_action_attempts"
+BEGIN
+  INSERT INTO "nozzle_saga_action_attempt_protocols"
+    ("attempt_id", "protocol_version", "classified_at_ms")
+  VALUES (
+    NEW."attempt_id",
+    CASE WHEN EXISTS (
+      SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 2
+    ) THEN 2 ELSE 1 END,
+    NEW."accepted_at_ms"
+  );
+END`
+
+const CONTROL_SCHEMA_BOOTSTRAP_STATEMENTS = Object.freeze([
   `CREATE TABLE IF NOT EXISTS "nozzle_control_meta" (
   "schema_version" INTEGER PRIMARY KEY NOT NULL CHECK ("schema_version" = 1),
   "installed_at_ms" INTEGER NOT NULL CHECK ("installed_at_ms" >= 0)
 );`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_control_schema_versions" (
+  "schema_version" INTEGER PRIMARY KEY NOT NULL CHECK ("schema_version" >= 1),
+  "published_at_ms" INTEGER NOT NULL CHECK ("published_at_ms" >= 0)
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 1, "installed_at_ms" FROM "nozzle_control_meta"
+WHERE true
+ON CONFLICT ("schema_version") DO NOTHING;`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 2
+);`,
   `INSERT INTO "nozzle_control_meta" ("schema_version", "installed_at_ms")
 VALUES (1, CAST(unixepoch('subsec') * 1000 AS INTEGER))
 ON CONFLICT ("schema_version") DO NOTHING;`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 1, "installed_at_ms" FROM "nozzle_control_meta"
+WHERE true
+ON CONFLICT ("schema_version") DO NOTHING;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_meta_update"
+BEFORE UPDATE ON "nozzle_control_meta"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_INSTALL_IDENTITY_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_meta_delete"
+BEFORE DELETE ON "nozzle_control_meta"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_INSTALL_IDENTITY_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_schema_version_update"
+BEFORE UPDATE ON "nozzle_control_schema_versions"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SCHEMA_VERSION_IMMUTABLE'); END;`,
+  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_schema_version_delete"
+BEFORE DELETE ON "nozzle_control_schema_versions"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SCHEMA_VERSION_IMMUTABLE'); END;`,
+])
+
+export const CONTROL_SCHEMA_STATEMENTS = Object.freeze([
+  ...CONTROL_SCHEMA_BOOTSTRAP_STATEMENTS,
   `CREATE TABLE IF NOT EXISTS "nozzle_fleets" (
   "fleet_id" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("fleet_id")) BETWEEN 1 AND 255),
   "account_id_checksum" TEXT NOT NULL CHECK (length(trim("account_id_checksum")) > 0),
@@ -397,6 +963,12 @@ ON CONFLICT ("singleton") DO NOTHING;`,
   CHECK (("state" <> 'confirmed') = ("error_checksum" IS NOT NULL)),
   CHECK ("output_json" IS NULL OR "error_json" IS NULL)
 );`,
+  `CREATE TABLE IF NOT EXISTS "nozzle_saga_action_attempt_protocols" (
+  "attempt_id" TEXT PRIMARY KEY NOT NULL
+    REFERENCES "nozzle_saga_action_attempts" ("attempt_id"),
+  "protocol_version" INTEGER NOT NULL CHECK ("protocol_version" IN (1, 2)),
+  "classified_at_ms" INTEGER NOT NULL CHECK ("classified_at_ms" >= 0)
+);`,
   `CREATE TABLE IF NOT EXISTS "nozzle_d1_resources" (
   "resource_id" TEXT PRIMARY KEY NOT NULL CHECK (length(trim("resource_id")) > 0),
   "generation_id" TEXT NOT NULL CHECK (length(trim("generation_id")) > 0),
@@ -661,107 +1233,48 @@ BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_EFFECT_REQUIRED'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_delete"
 BEFORE DELETE ON "nozzle_sagas"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_PERSISTENT'); END;`,
-  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_attempt_insert"
-BEFORE INSERT ON "nozzle_saga_action_attempts"
-WHEN NOT EXISTS (
-  SELECT 1
-  FROM "nozzle_sagas" AS "saga"
-  JOIN "nozzle_operation_steps" AS "step"
-    ON "step"."operation_id" = NEW."operation_id"
-   AND "step"."step_id" = NEW."operation_step_id"
-  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = NEW."lease_key"
-  WHERE "saga"."saga_id" = NEW."saga_id"
-    AND "saga"."operation_id" = NEW."operation_id"
-    AND (
-      (NEW."purpose" = 'effect' AND NEW."phase" = 'forward'
-       AND NEW."causal_attempt_id" IS NULL)
-      OR
-      (NEW."purpose" = 'observation' AND EXISTS (
-        SELECT 1
-        FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "causal_step"
-        JOIN "nozzle_saga_action_attempts" AS "cause"
-          ON "cause"."attempt_id" = NEW."causal_attempt_id"
-        LEFT JOIN "nozzle_saga_action_attempt_outcomes" AS "cause_outcome"
-          ON "cause_outcome"."attempt_id" = "cause"."attempt_id"
-        WHERE "causal_step"."key" = NEW."saga_step_id"
-          AND NEW."causal_attempt_id" = json_extract(
-            "causal_step"."value", '$.' || NEW."phase" || '.lastAttemptId'
-          )
-          AND "cause"."saga_id" = NEW."saga_id"
-          AND "cause"."operation_id" = NEW."operation_id"
-          AND "cause"."operation_step_id" = NEW."operation_step_id"
-          AND "cause"."saga_step_id" = NEW."saga_step_id"
-          AND "cause"."phase" = NEW."phase"
-          AND "cause"."purpose" = 'effect'
-          AND ("cause_outcome"."state" = 'unknown' OR "cause_outcome"."state" IS NULL)
-      ))
-      OR
-      (NEW."purpose" = 'effect' AND NEW."phase" = 'compensation' AND EXISTS (
-        SELECT 1
-        FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "causal_step"
-        JOIN "nozzle_saga_action_attempts" AS "cause"
-          ON "cause"."attempt_id" = NEW."causal_attempt_id"
-        WHERE "causal_step"."key" = NEW."saga_step_id"
-          AND NEW."causal_attempt_id" = json_extract(
-            "causal_step"."value", '$.forward.lastAttemptId'
-          )
-          AND json_extract("causal_step"."value", '$.forward.state') = 'succeeded'
-          AND json_extract("causal_step"."value", '$.forward.resultChecksum') IS NOT NULL
-          AND "cause"."saga_id" = NEW."saga_id"
-          AND "cause"."operation_id" = NEW."operation_id"
-          AND "cause"."saga_step_id" = NEW."saga_step_id"
-          AND "cause"."phase" = 'forward'
-          AND "cause"."purpose" = 'effect'
-      ))
-    )
-    AND EXISTS (
-      SELECT 1 FROM json_each(json_extract("saga"."record_json", '$.steps')) AS "saga_step"
-      WHERE "saga_step"."key" = NEW."saga_step_id"
-        AND (
-          (NEW."purpose" = 'effect'
-           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.state') = 'running'
-           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.activeAttemptId') = NEW."attempt_id")
-          OR
-          (NEW."purpose" = 'observation'
-           AND json_extract("saga_step"."value", '$.' || NEW."phase" || '.state') = 'unknown')
-        )
-    )
-    AND "step"."lease_key" = NEW."lease_key"
-    AND (
-      (NEW."purpose" = 'effect'
-       AND "step"."state" = 'running'
-       AND json_extract("step"."record_json", '$.activeAttemptId') = NEW."attempt_id"
-       AND "step"."fencing_token" = NEW."fencing_token")
-      OR
-      (NEW."purpose" = 'observation'
-       AND "step"."state" = 'unknown'
-       AND "step"."fencing_token" < NEW."fencing_token")
-    )
-    AND "lease"."holder_id" = NEW."holder_id"
-    AND "lease"."acquisition_id" = NEW."acquisition_id"
-    AND "lease"."fencing_token" = NEW."fencing_token"
-    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
-)
-BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_ATTEMPT_FENCED'); END;`,
+  triggerInstallStatement(SAGA_ATTEMPT_INSERT_V2_DEFINITION),
+  triggerDefinitionGuard(SAGA_ATTEMPT_INSERT_V2_DEFINITION),
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_attempt_update"
 BEFORE UPDATE ON "nozzle_saga_action_attempts"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_ATTEMPT_IMMUTABLE'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_attempt_delete"
 BEFORE DELETE ON "nozzle_saga_action_attempts"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_ATTEMPT_PERSISTENT'); END;`,
-  `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_outcome_insert"
-BEFORE INSERT ON "nozzle_saga_action_attempt_outcomes"
-WHEN NOT EXISTS (
-  SELECT 1
-  FROM "nozzle_saga_action_attempts" AS "attempt"
-  JOIN "nozzle_leases" AS "lease" ON "lease"."lease_key" = "attempt"."lease_key"
-  WHERE "attempt"."attempt_id" = NEW."attempt_id"
-    AND "lease"."holder_id" = "attempt"."holder_id"
-    AND "lease"."acquisition_id" = "attempt"."acquisition_id"
-    AND "lease"."fencing_token" = "attempt"."fencing_token"
-    AND "lease"."expires_at_ms" > CAST(unixepoch('subsec') * 1000 AS INTEGER)
-)
-BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_FENCED'); END;`,
+  triggerInstallStatement(SAGA_OUTCOME_INSERT_V2_DEFINITION),
+  triggerDefinitionGuard(SAGA_OUTCOME_INSERT_V2_DEFINITION),
+  triggerInstallStatement(SAGA_PROTOCOL_INSERT_V2_DEFINITION),
+  triggerDefinitionGuard(SAGA_PROTOCOL_INSERT_V2_DEFINITION),
+  triggerInstallStatement(SAGA_PROTOCOL_BINDING_INSERT_V2_DEFINITION),
+  triggerDefinitionGuard(SAGA_PROTOCOL_BINDING_INSERT_V2_DEFINITION),
+  triggerInstallStatement(SAGA_PROTOCOL_ACTION_INSERT_V2_DEFINITION),
+  triggerDefinitionGuard(SAGA_PROTOCOL_ACTION_INSERT_V2_DEFINITION),
+  triggerInstallStatement(SAGA_PROTOCOL_OBSERVATION_INSERT_V2_DEFINITION),
+  triggerDefinitionGuard(SAGA_PROTOCOL_OBSERVATION_INSERT_V2_DEFINITION),
+  triggerInstallStatement(SAGA_PROTOCOL_COMPENSATION_INSERT_V2_DEFINITION),
+  triggerDefinitionGuard(SAGA_PROTOCOL_COMPENSATION_INSERT_V2_DEFINITION),
+  triggerInstallStatement(SAGA_PROTOCOL_UPDATE_DEFINITION),
+  triggerDefinitionGuard(SAGA_PROTOCOL_UPDATE_DEFINITION),
+  triggerInstallStatement(SAGA_PROTOCOL_DELETE_DEFINITION),
+  triggerDefinitionGuard(SAGA_PROTOCOL_DELETE_DEFINITION),
+  SAGA_PROTOCOL_IDENTITY_AUDIT,
+  SAGA_PROTOCOL_UNPUBLISHED_V2_AUDIT,
+  triggerInstallStatement(SAGA_PROTOCOL_CLASSIFY_V2_DEFINITION),
+  triggerDefinitionGuard(SAGA_PROTOCOL_CLASSIFY_V2_DEFINITION),
+  `INSERT INTO "nozzle_saga_action_attempt_protocols"
+  ("attempt_id", "protocol_version", "classified_at_ms")
+SELECT "attempt_id", 1, "accepted_at_ms" FROM "nozzle_saga_action_attempts"
+WHERE true
+ON CONFLICT ("attempt_id") DO NOTHING;`,
+  `INSERT INTO "nozzle_saga_action_attempt_protocols"
+  ("attempt_id", "protocol_version", "classified_at_ms")
+SELECT "attempt_id", 0, "accepted_at_ms" FROM "nozzle_saga_action_attempts" AS "attempt"
+WHERE NOT EXISTS (
+  SELECT 1 FROM "nozzle_saga_action_attempt_protocols" AS "protocol"
+  WHERE "protocol"."attempt_id" = "attempt"."attempt_id"
+);`,
+  `DROP TRIGGER IF EXISTS "nozzle_control_saga_attempt_insert";`,
+  `DROP TRIGGER IF EXISTS "nozzle_control_saga_outcome_insert";`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_outcome_update"
 BEFORE UPDATE ON "nozzle_saga_action_attempt_outcomes"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_IMMUTABLE'); END;`,
@@ -992,8 +1505,47 @@ BEGIN
 END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_audit_update" BEFORE UPDATE ON "nozzle_audit_log" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_AUDIT_APPEND_ONLY'); END;`,
   `CREATE TRIGGER IF NOT EXISTS "nozzle_control_audit_delete" BEFORE DELETE ON "nozzle_audit_log" BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_AUDIT_APPEND_ONLY'); END;`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (2, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`,
 ])
+
+function versionOneArtifactStatement(statement: string): readonly string[] {
+  if (
+    statement.startsWith('CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_attempt_insert_v2"')
+  ) {
+    return [SAGA_ATTEMPT_INSERT_V1_ARTIFACT]
+  }
+  if (
+    statement.startsWith('CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_outcome_insert_v2"')
+  ) {
+    return [SAGA_OUTCOME_INSERT_V1_ARTIFACT]
+  }
+  if (
+    statement.includes("nozzle_control_schema_versions") ||
+    statement.includes("nozzle_control_meta_update") ||
+    statement.includes("nozzle_control_meta_delete") ||
+    statement.includes("nozzle_saga_action_attempt_protocols") ||
+    statement.includes("nozzle_control_saga_protocol_") ||
+    statement === 'DROP TRIGGER IF EXISTS "nozzle_control_saga_attempt_insert";' ||
+    statement === 'DROP TRIGGER IF EXISTS "nozzle_control_saga_outcome_insert";'
+  ) {
+    return []
+  }
+  return [statement]
+}
+
+export const CONTROL_SCHEMA_VERSION_ONE_STATEMENTS = Object.freeze(
+  CONTROL_SCHEMA_STATEMENTS.flatMap(versionOneArtifactStatement),
+)
+
+export const CONTROL_SCHEMA_VERSION_ONE_ARTIFACT_SHA256 =
+  "6537f6ef35f24d62831e751779758fc6eb04c7938850b28abfa23f4c6335afaa" as const
 
 export function controlSchemaSql(): string {
   return `${CONTROL_SCHEMA_STATEMENTS.join("\n\n")}\n`
+}
+
+export function controlSchemaVersionOneSql(): string {
+  return `${CONTROL_SCHEMA_VERSION_ONE_STATEMENTS.join("\n\n")}\n`
 }

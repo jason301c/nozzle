@@ -1,10 +1,17 @@
+import { createHash } from "node:crypto"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 import { describe, expect, it } from "vitest"
 import {
   CONTROL_SCHEMA_STATEMENTS,
   CONTROL_SCHEMA_VERSION,
+  CONTROL_SCHEMA_VERSION_ONE_ARTIFACT_SHA256,
+  CONTROL_SCHEMA_VERSION_ONE_STATEMENTS,
   CONTROL_TABLE_NAMES,
   controlSchemaSql,
+  controlSchemaVersionOneSql,
 } from "../src/schema.js"
 
 function withDatabase(run: (database: DatabaseSync) => void): void {
@@ -53,11 +60,39 @@ function auditEvent(input: {
   })
 }
 
+const firstProductTableIndex = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+  statement.startsWith('CREATE TABLE IF NOT EXISTS "nozzle_fleets"'),
+)
+const schemaInstallBoundaries = CONTROL_SCHEMA_STATEMENTS.flatMap((statement, index) => {
+  const isBoundary =
+    index < firstProductTableIndex ||
+    statement.includes("nozzle_saga_action_attempt_protocols") ||
+    statement.includes("nozzle_control_saga_attempt_insert_v2") ||
+    statement.includes("nozzle_control_saga_outcome_insert_v2") ||
+    statement.includes("nozzle_control_saga_protocol_classify_v2") ||
+    statement.includes('DROP TRIGGER IF EXISTS "nozzle_control_saga_attempt_insert"') ||
+    statement.includes('DROP TRIGGER IF EXISTS "nozzle_control_saga_outcome_insert"') ||
+    index === CONTROL_SCHEMA_STATEMENTS.length - 1
+  return isBoundary ? ([[index, statement.split("\n", 1)[0]]] as const) : []
+})
+
 describe("control D1 schema", () => {
+  it("keeps the complete historical version-one install artifact checksum-locked", () => {
+    const sql = controlSchemaVersionOneSql()
+    expect(Object.isFrozen(CONTROL_SCHEMA_VERSION_ONE_STATEMENTS)).toBe(true)
+    expect(createHash("sha256").update(sql).digest("hex")).toBe(
+      CONTROL_SCHEMA_VERSION_ONE_ARTIFACT_SHA256,
+    )
+    expect(sql).toContain('CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_attempt_insert"')
+    expect(sql).toContain('CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_outcome_insert"')
+    expect(sql).not.toContain("nozzle_control_schema_versions")
+    expect(sql).not.toContain("nozzle_saga_action_attempt_protocols")
+  })
+
   it("emits one deterministic install artifact with every required ledger table", () => {
     const sql = controlSchemaSql()
     expect(sql).toBe(`${CONTROL_SCHEMA_STATEMENTS.join("\n\n")}\n`)
-    expect(CONTROL_SCHEMA_VERSION).toBe(1)
+    expect(CONTROL_SCHEMA_VERSION).toBe(2)
     expect(Object.isFrozen(CONTROL_SCHEMA_STATEMENTS)).toBe(true)
     expect(Object.isFrozen(CONTROL_TABLE_NAMES)).toBe(true)
     expect(sql).not.toContain("fictional-secret")
@@ -74,6 +109,7 @@ describe("control D1 schema", () => {
       expect(tables).toEqual(
         [
           "nozzle_control_meta",
+          "nozzle_control_schema_versions",
           "nozzle_control_sequence",
           "nozzle_migration_operations",
           "nozzle_movement_operations",
@@ -83,7 +119,332 @@ describe("control D1 schema", () => {
       expect(database.prepare('SELECT "schema_version" FROM "nozzle_control_meta"').get()).toEqual({
         schema_version: 1,
       })
+      expect(
+        database
+          .prepare(
+            `SELECT "schema_version" FROM "nozzle_control_schema_versions"
+             ORDER BY "schema_version"`,
+          )
+          .all(),
+      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }])
+      expect(() =>
+        database.prepare(`UPDATE "nozzle_control_meta" SET "installed_at_ms" = 0`).run(),
+      ).toThrow("NOZZLE_CONTROL_INSTALL_IDENTITY_IMMUTABLE")
+      expect(() => database.prepare(`DELETE FROM "nozzle_control_meta"`).run()).toThrow(
+        "NOZZLE_CONTROL_INSTALL_IDENTITY_IMMUTABLE",
+      )
+      expect(() =>
+        database
+          .prepare(
+            `UPDATE "nozzle_control_schema_versions" SET "published_at_ms" = 0
+             WHERE "schema_version" = 2`,
+          )
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_SCHEMA_VERSION_IMMUTABLE")
+      expect(() => database.prepare(`DELETE FROM "nozzle_control_schema_versions"`).run()).toThrow(
+        "NOZZLE_CONTROL_SCHEMA_VERSION_IMMUTABLE",
+      )
     })
+  })
+
+  it("upgrades and reruns the full version-one artifact without losing install identity", () => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      database.exec(controlSchemaVersionOneSql())
+      const beforeIdentity = database
+        .prepare('SELECT "schema_version", "installed_at_ms" FROM "nozzle_control_meta"')
+        .get()
+
+      database.exec(controlSchemaSql())
+      database.exec(controlSchemaSql())
+
+      expect(
+        database
+          .prepare('SELECT "schema_version", "installed_at_ms" FROM "nozzle_control_meta"')
+          .get(),
+      ).toEqual(beforeIdentity)
+      expect(
+        database
+          .prepare(
+            `SELECT "schema_version", "published_at_ms"
+             FROM "nozzle_control_schema_versions" ORDER BY "schema_version"`,
+          )
+          .all(),
+      ).toEqual([
+        {
+          published_at_ms: (beforeIdentity as { installed_at_ms: number }).installed_at_ms,
+          schema_version: 1,
+        },
+        expect.objectContaining({ schema_version: 2 }),
+      ])
+      expect(
+        database
+          .prepare(
+            `SELECT "name" FROM "sqlite_schema" WHERE "type" = 'trigger'
+             AND "name" LIKE 'nozzle_control_saga_%insert%'
+             ORDER BY "name"`,
+          )
+          .all(),
+      ).toEqual([
+        { name: "nozzle_control_saga_attempt_insert_v2" },
+        { name: "nozzle_control_saga_insert" },
+        { name: "nozzle_control_saga_outcome_insert_v2" },
+        { name: "nozzle_control_saga_protocol_action_insert_v2" },
+        { name: "nozzle_control_saga_protocol_binding_insert_v2" },
+        { name: "nozzle_control_saga_protocol_compensation_insert_v2" },
+        { name: "nozzle_control_saga_protocol_insert_v2" },
+        { name: "nozzle_control_saga_protocol_observation_insert_v2" },
+      ])
+    } finally {
+      database.close()
+    }
+  })
+
+  it.each(
+    schemaInstallBoundaries,
+  )("recovers an installation interrupted at %i: %s", (boundaryIndex) => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      for (const statement of CONTROL_SCHEMA_STATEMENTS.slice(0, boundaryIndex + 1)) {
+        database.exec(statement)
+      }
+
+      database.exec(controlSchemaSql())
+
+      expect(
+        database
+          .prepare(
+            `SELECT "schema_version" FROM "nozzle_control_schema_versions"
+             ORDER BY "schema_version"`,
+          )
+          .all(),
+      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }])
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_saga_action_attempts" AS "attempt"
+             LEFT JOIN "nozzle_saga_action_attempt_protocols" AS "protocol"
+               ON "protocol"."attempt_id" = "attempt"."attempt_id"
+             WHERE "protocol"."attempt_id" IS NULL`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("is idempotent when two installers alternate at every statement boundary", () => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      for (const statement of CONTROL_SCHEMA_STATEMENTS) {
+        database.exec(statement)
+        database.exec(statement)
+      }
+      expect(
+        database
+          .prepare(
+            `SELECT "schema_version" FROM "nozzle_control_schema_versions"
+             ORDER BY "schema_version"`,
+          )
+          .all(),
+      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }])
+    } finally {
+      database.close()
+    }
+  })
+
+  it("is non-destructive across two connections with skewed installer progress", () => {
+    const directory = mkdtempSync(join(tmpdir(), "nozzle-schema-install-"))
+    const path = join(directory, "control.sqlite")
+    const installers = [new DatabaseSync(path), new DatabaseSync(path)] as const
+    try {
+      for (const installer of installers) installer.exec("PRAGMA busy_timeout = 1000;")
+
+      const progress: [number, number] = [0, 0]
+      const schedule = [
+        [0, 7],
+        [1, 1],
+        [0, 13],
+        [1, 5],
+        [0, 2],
+        [1, 17],
+        [0, 11],
+        [1, 3],
+      ] as const
+      let turn = 0
+      while (progress.some((index) => index < CONTROL_SCHEMA_STATEMENTS.length)) {
+        const scheduled = schedule.at(turn % schedule.length)
+        if (scheduled === undefined) throw new Error("installer schedule must not be empty")
+        const [scheduledInstaller, burst] = scheduled
+        const otherInstaller = scheduledInstaller === 0 ? 1 : 0
+        const installerIndex: 0 | 1 =
+          progress[scheduledInstaller] < CONTROL_SCHEMA_STATEMENTS.length
+            ? scheduledInstaller
+            : otherInstaller
+        const end = Math.min(progress[installerIndex] + burst, CONTROL_SCHEMA_STATEMENTS.length)
+        while (progress[installerIndex] < end) {
+          const statement = CONTROL_SCHEMA_STATEMENTS.at(progress[installerIndex])
+          if (statement === undefined) throw new Error("installer progress exceeded schema")
+          installers[installerIndex].exec(statement)
+          progress[installerIndex] += 1
+        }
+        turn += 1
+      }
+
+      for (const installer of installers) {
+        expect(
+          installer
+            .prepare(
+              `SELECT "schema_version" FROM "nozzle_control_schema_versions"
+               ORDER BY "schema_version"`,
+            )
+            .all(),
+        ).toEqual([{ schema_version: 1 }, { schema_version: 2 }])
+        expect(
+          installer
+            .prepare(
+              `SELECT count(*) AS "count" FROM "nozzle_saga_action_attempts" AS "attempt"
+               LEFT JOIN "nozzle_saga_action_attempt_protocols" AS "protocol"
+                 ON "protocol"."attempt_id" = "attempt"."attempt_id"
+               WHERE "protocol"."attempt_id" IS NULL`,
+            )
+            .get(),
+        ).toEqual({ count: 0 })
+      }
+      expect(
+        installers[0]
+          .prepare(
+            `SELECT "schema_version", count(*) AS "count"
+             FROM "nozzle_control_meta" GROUP BY "schema_version"`,
+          )
+          .get(),
+      ).toEqual({ count: 1, schema_version: 1 })
+    } finally {
+      for (const installer of installers) installer.close()
+      rmSync(directory, { force: true, recursive: true })
+    }
+  })
+
+  it("rejects a future schema before changing saga protocol objects", () => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      database.exec(`CREATE TABLE "nozzle_control_meta" (
+        "schema_version" INTEGER PRIMARY KEY NOT NULL CHECK ("schema_version" = 1),
+        "installed_at_ms" INTEGER NOT NULL CHECK ("installed_at_ms" >= 0)
+      );
+      INSERT INTO "nozzle_control_meta" VALUES (1, 1234);
+      CREATE TABLE "nozzle_control_schema_versions" (
+        "schema_version" INTEGER PRIMARY KEY NOT NULL CHECK ("schema_version" >= 1),
+        "published_at_ms" INTEGER NOT NULL CHECK ("published_at_ms" >= 0)
+      );
+      INSERT INTO "nozzle_control_schema_versions" VALUES (1, 1234), (2, 2345), (3, 3456);
+      CREATE TABLE "nozzle_saga_action_attempts" ("attempt_id" TEXT);
+      CREATE TRIGGER "nozzle_control_saga_attempt_insert_v2"
+      BEFORE INSERT ON "nozzle_saga_action_attempts" BEGIN SELECT 3; END;`)
+      const before = database
+        .prepare(
+          `SELECT "sql" FROM "sqlite_schema"
+           WHERE "type" = 'trigger' AND "name" = 'nozzle_control_saga_attempt_insert_v2'`,
+        )
+        .get()
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+
+      expect(
+        database
+          .prepare(
+            `SELECT "sql" FROM "sqlite_schema"
+             WHERE "type" = 'trigger' AND "name" = 'nozzle_control_saga_attempt_insert_v2'`,
+          )
+          .get(),
+      ).toEqual(before)
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "sqlite_schema"
+             WHERE "type" = 'table' AND "name" = 'nozzle_saga_action_attempt_protocols'`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it.each([
+    ["nozzle_control_saga_attempt_insert_v2", "nozzle_saga_action_attempts"],
+    ["nozzle_control_saga_outcome_insert_v2", "nozzle_saga_action_attempt_outcomes"],
+    ["nozzle_control_saga_protocol_insert_v2", "nozzle_saga_action_attempt_protocols"],
+    ["nozzle_control_saga_protocol_binding_insert_v2", "nozzle_saga_action_attempt_protocols"],
+    ["nozzle_control_saga_protocol_action_insert_v2", "nozzle_saga_action_attempt_protocols"],
+    ["nozzle_control_saga_protocol_observation_insert_v2", "nozzle_saga_action_attempt_protocols"],
+    ["nozzle_control_saga_protocol_compensation_insert_v2", "nozzle_saga_action_attempt_protocols"],
+    ["nozzle_control_saga_protocol_update", "nozzle_saga_action_attempt_protocols"],
+    ["nozzle_control_saga_protocol_delete", "nozzle_saga_action_attempt_protocols"],
+    ["nozzle_control_saga_protocol_classify_v2", "nozzle_saga_action_attempts"],
+  ] as const)("refuses to publish with a corrupt %s trigger", (triggerName, tableName) => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      for (const statement of CONTROL_SCHEMA_STATEMENTS.slice(0, -1)) database.exec(statement)
+      database.exec(`DROP TRIGGER "${triggerName}";`)
+      database.exec(
+        `CREATE TRIGGER "${triggerName}" BEFORE INSERT ON "${tableName}"
+         BEGIN SELECT 2; END;`,
+      )
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+             WHERE "schema_version" = 2`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("installs and verifies replacement saga guards before publishing version two", () => {
+    for (const triggerName of ["saga_attempt_insert", "saga_outcome_insert"] as const) {
+      const createIndex = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+        statement.includes(`CREATE TRIGGER IF NOT EXISTS "nozzle_control_${triggerName}_v2"`),
+      )
+      const dropIndex = CONTROL_SCHEMA_STATEMENTS.indexOf(
+        `DROP TRIGGER IF EXISTS "nozzle_control_${triggerName}";`,
+      )
+      expect(createIndex).toBeGreaterThanOrEqual(0)
+      expect(dropIndex).toBeGreaterThan(createIndex)
+    }
+    const protocolGuardIndices = [
+      "insert",
+      "binding_insert",
+      "action_insert",
+      "observation_insert",
+      "compensation_insert",
+    ].map((suffix) =>
+      CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+        statement.includes(
+          `CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_protocol_${suffix}_v2"`,
+        ),
+      ),
+    )
+    const protocolMapperIndex = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+      statement.includes('CREATE TRIGGER IF NOT EXISTS "nozzle_control_saga_protocol_classify_v2"'),
+    )
+    const protocolBackfillIndex = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+      statement.includes('SELECT "attempt_id", 1, "accepted_at_ms"'),
+    )
+    expect(protocolGuardIndices.every((index) => index >= 0)).toBe(true)
+    expect(protocolMapperIndex).toBeGreaterThan(Math.max(...protocolGuardIndices))
+    expect(protocolBackfillIndex).toBeGreaterThan(protocolMapperIndex)
+    expect(CONTROL_SCHEMA_STATEMENTS.at(-1)).toBe(
+      `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (2, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`,
+    )
   })
 
   it("makes published configuration, topology, and route versions immutable", () => {
@@ -267,6 +628,18 @@ describe("control D1 schema", () => {
   it("requires fenced operation effects and append-only receipts for saga state", () => {
     withDatabase((database) => {
       const descriptorChecksum = "d".repeat(64)
+      const descriptorJson = JSON.stringify({
+        steps: [
+          {
+            forwardAction: {
+              actionId: "a.forward",
+              artifactChecksum: "artifact",
+              version: 1,
+            },
+            stepId: "a",
+          },
+        ],
+      })
       const record = (stateVersion: number, status: "planned" | "running" | "succeeded") =>
         JSON.stringify({
           deadlineAtMs: 10_000,
@@ -285,10 +658,19 @@ describe("control D1 schema", () => {
               compensation: { state: "pending" },
               forward:
                 status === "planned"
-                  ? { state: "pending" }
+                  ? { idempotencyKey: "action-key", state: "pending" }
                   : status === "running"
-                    ? { activeAttemptId: "attempt-a", state: "running" }
-                    : { resultChecksum: "action", state: "succeeded" },
+                    ? {
+                        activeAttemptId: "attempt-a",
+                        idempotencyKey: "action-key",
+                        state: "running",
+                      }
+                    : {
+                        idempotencyKey: "action-key",
+                        resultChecksum: "action",
+                        state: "succeeded",
+                      },
+              inputChecksum: "action-input",
             },
           },
           terminationCause: null,
@@ -313,8 +695,10 @@ describe("control D1 schema", () => {
            VALUES
              ('operation-saga', 'saga:init', 'init-key', 'saga:lease', '{}',
               '{"state":"pending"}', 'pending', NULL, 1),
-             ('operation-saga', 'saga:a:forward', 'action-key', 'saga:lease', '{}',
-              '{"activeAttemptId":"attempt-a","state":"running"}', 'running', 1, 1)`,
+             ('operation-saga', 'saga:forward:a', 'action-key', 'saga:lease',
+              '{"effectProtocol":"saga_receipt","idempotencyKey":"action-key","leaseKey":"saga:lease","stepId":"saga:forward:a"}',
+              '{"activeAttemptId":"attempt-a","fencingToken":1,"state":"running"}',
+              'running', 1, 1)`,
         )
         .run()
       database
@@ -356,11 +740,11 @@ describe("control D1 schema", () => {
             "deadline_at_ms", "status", "commitment", "termination_cause",
             "termination_requested_at_ms", "state_version", "last_evidence_checksum",
             "last_effect_id", "record_checksum", "record_json", "created_at_ms", "updated_at_ms")
-           VALUES ('saga-a', 'operation-saga', 'transfer', 1, ?, '{}', 'saga-key', 'saga-input',
+           VALUES ('saga-a', 'operation-saga', 'transfer', 1, ?, ?, 'saga-key', 'saga-input',
              10000, 'planned', 'none', NULL, NULL, 0, 'evidence-0', 'effect-saga-0', 'record-0',
              ?, 1, 1)`,
         )
-        .run(descriptorChecksum, record(0, "planned"))
+        .run(descriptorChecksum, descriptorJson, record(0, "planned"))
 
       expect(() =>
         database.prepare(`UPDATE "nozzle_sagas" SET "status" = 'running'`).run(),
@@ -373,7 +757,7 @@ describe("control D1 schema", () => {
               "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
               "acceptance_checksum", "lease_key", "holder_id", "acquisition_id", "fencing_token",
               "accepted_at_ms")
-             VALUES ('attempt-a', 'saga-a', 'operation-saga', 'saga:a:forward', 'a', 'forward',
+             VALUES ('attempt-a', 'saga-a', 'operation-saga', 'saga:forward:a', 'a', 'forward',
                'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'acceptance',
                'saga:lease', 'controller', 'acquisition', 1, 1)`,
           )
@@ -385,8 +769,8 @@ describe("control D1 schema", () => {
            ("transition_id", "operation_id", "step_id", "from_record_json", "to_record_json",
             "from_operation_status", "to_operation_status", "audit_event_hash", "fencing_token",
             "lease_key", "holder_id", "acquisition_id", "created_at_ms")
-           VALUES ('transition-action-accepted', 'operation-saga', 'saga:a:forward',
-             '{"activeAttemptId":"attempt-a","state":"running"}',
+           VALUES ('transition-action-accepted', 'operation-saga', 'saga:forward:a',
+             '{"activeAttemptId":"attempt-a","fencingToken":1,"state":"running"}',
              '{"activeAttemptId":"attempt-a","lastAttemptId":"attempt-a","state":"running"}',
              'running', 'running', 'audit-action-accepted', 1, 'saga:lease', 'controller',
              'acquisition', 2)`,
@@ -400,7 +784,7 @@ describe("control D1 schema", () => {
             "evidence_checksum", "record_checksum", "record_json", "lease_key", "holder_id",
             "acquisition_id", "fencing_token", "created_at_ms")
            VALUES ('effect-saga-running', 'transition-action-accepted', 'operation-saga',
-             'saga:a:forward', 'saga', 'saga-a', 'forward:accepted', 0, 1,
+             'saga:forward:a', 'saga', 'saga-a', 'forward:accepted', 0, 1,
              'accepted-evidence', 'record-running', ?, 'saga:lease', 'controller', 'acquisition',
              1, 2)`,
         )
@@ -415,18 +799,36 @@ describe("control D1 schema", () => {
            WHERE "saga_id" = 'saga-a'`,
         )
         .run(record(1, "running"))
-      database
-        .prepare(
-          `INSERT INTO "nozzle_saga_action_attempts"
-           ("attempt_id", "saga_id", "operation_id", "operation_step_id", "saga_step_id",
-            "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
-            "acceptance_checksum", "lease_key", "holder_id", "acquisition_id", "fencing_token",
-            "accepted_at_ms")
-           VALUES ('attempt-a', 'saga-a', 'operation-saga', 'saga:a:forward', 'a', 'forward',
-             'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'acceptance',
-             'saga:lease', 'controller', 'acquisition', 1, 2)`,
+      const acceptedAttempt = database.prepare(
+        `INSERT INTO "nozzle_saga_action_attempts"
+         ("attempt_id", "saga_id", "operation_id", "operation_step_id", "saga_step_id",
+          "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
+          "acceptance_checksum", "lease_key", "holder_id", "acquisition_id", "fencing_token",
+          "accepted_at_ms")
+         VALUES ('attempt-a', 'saga-a', 'operation-saga', 'saga:forward:a', 'a', 'forward',
+           'effect', ?, ?, ?, '{}', 'acceptance', 'saga:lease', 'controller', 'acquisition', 1, 2)`,
+      )
+      for (const weakBinding of [
+        ["different-action", "action-key", "action-input"],
+        ["a.forward@1:artifact", "different-key", "action-input"],
+        ["a.forward@1:artifact", "action-key", "different-input"],
+      ] as const) {
+        expect(() => acceptedAttempt.run(...weakBinding)).toThrow(
+          "NOZZLE_CONTROL_SAGA_ATTEMPT_FENCED",
         )
-        .run()
+      }
+      acceptedAttempt.run("a.forward@1:artifact", "action-key", "action-input")
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO "nozzle_saga_action_attempt_outcomes"
+             ("attempt_id", "state", "evidence_checksum", "evidence_json", "output_checksum",
+              "output_json", "error_checksum", "error_json", "outcome_checksum", "completed_at_ms")
+             VALUES ('attempt-a', 'indeterminate', 'evidence', '{}', NULL, NULL, 'error', '{}',
+               'outcome', 2)`,
+          )
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_FENCED")
       database
         .prepare(
           `INSERT INTO "nozzle_saga_action_attempt_outcomes"
@@ -442,8 +844,8 @@ describe("control D1 schema", () => {
            ("transition_id", "operation_id", "step_id", "from_record_json", "to_record_json",
             "from_operation_status", "to_operation_status", "audit_event_hash", "fencing_token",
             "lease_key", "holder_id", "acquisition_id", "created_at_ms")
-           VALUES ('transition-action', 'operation-saga', 'saga:a:forward',
-             '{"activeAttemptId":"attempt-a","state":"running"}',
+           VALUES ('transition-action', 'operation-saga', 'saga:forward:a',
+             '{"activeAttemptId":"attempt-a","fencingToken":1,"state":"running"}',
              '{"resultChecksum":"action","state":"succeeded"}', 'running', 'running',
              'audit-action', 1, 'saga:lease', 'controller', 'acquisition', 2)`,
         )
@@ -455,7 +857,7 @@ describe("control D1 schema", () => {
             "resource_id", "effect_kind", "from_state_version", "to_state_version",
             "evidence_checksum", "record_checksum", "record_json", "lease_key", "holder_id",
             "acquisition_id", "fencing_token", "created_at_ms")
-           VALUES ('effect-saga-1', 'transition-action', 'operation-saga', 'saga:a:forward', 'saga',
+           VALUES ('effect-saga-1', 'transition-action', 'operation-saga', 'saga:forward:a', 'saga',
              'saga-a', 'forward:succeeded', 1, 2, 'evidence-1', 'record-1', ?, 'saga:lease',
              'controller', 'acquisition', 1, 2)`,
         )
@@ -549,7 +951,7 @@ describe("control D1 schema", () => {
               "phase", "purpose", "action_key", "idempotency_key", "input_checksum", "input_json",
               "acceptance_checksum", "lease_key", "holder_id", "acquisition_id", "fencing_token",
               "accepted_at_ms")
-             VALUES ('fenced', 'saga-a', 'operation-saga', 'saga:a:forward', 'a', 'forward',
+             VALUES ('fenced', 'saga-a', 'operation-saga', 'saga:forward:a', 'a', 'forward',
                'effect', 'a.forward@1:artifact', 'action-key', 'action-input', '{}', 'acceptance',
                'saga:lease', 'controller', 'acquisition', 2, 1)`,
           )

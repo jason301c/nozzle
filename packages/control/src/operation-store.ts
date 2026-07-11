@@ -98,16 +98,6 @@ interface ProviderAttemptPresenceRow {
   readonly step_id: string
 }
 
-interface SagaAttemptPresenceRow {
-  readonly acceptance_checksum: string
-  readonly attempt_id: string
-  readonly operation_id: string
-  readonly operation_step_id: string
-  readonly outcome_checksum: string | null
-  readonly purpose: string
-  readonly state: string | null
-}
-
 export interface LoadedOperation {
   readonly capabilitySnapshotJson: string
   readonly environmentId: string
@@ -143,8 +133,6 @@ interface AttemptOutcomeRequirement {
   readonly checksum: string
   readonly providerPurpose: "effect" | "reconciliation"
   readonly providerState: "confirmed" | "rejected" | "unknown"
-  readonly sagaPurpose: "effect" | "observation"
-  readonly sagaState: "confirmed" | "failed" | "indeterminate" | "not_applied" | "unknown"
 }
 
 export interface BeginStoredOperationStepInput extends TransitionIdentity {
@@ -427,43 +415,6 @@ export class D1OperationStore {
         : typeof row.outcome_checksum !== "string" || row.outcome_checksum.trim() === "")
     ) {
       return intervention("Persisted provider-attempt recovery evidence is malformed.")
-    }
-    return Object.freeze(row)
-  }
-
-  async #sagaAttempt(attemptId: string): Promise<SagaAttemptPresenceRow | undefined> {
-    const row = await this.#database
-      .prepare(
-        `SELECT "attempt"."attempt_id", "attempt"."operation_id",
-                "attempt"."operation_step_id", "attempt"."acceptance_checksum",
-                "attempt"."purpose", "outcome"."state", "outcome"."outcome_checksum"
-         FROM "nozzle_saga_action_attempts" AS "attempt"
-         LEFT JOIN "nozzle_saga_action_attempt_outcomes" AS "outcome" USING ("attempt_id")
-         WHERE "attempt"."attempt_id" = ?1`,
-      )
-      .bind(attemptId)
-      .first<SagaAttemptPresenceRow>()
-    if (row === null) return undefined
-    if (
-      row.attempt_id !== attemptId ||
-      typeof row.operation_id !== "string" ||
-      row.operation_id.trim() === "" ||
-      typeof row.operation_step_id !== "string" ||
-      row.operation_step_id.trim() === "" ||
-      typeof row.acceptance_checksum !== "string" ||
-      row.acceptance_checksum.trim() === "" ||
-      (row.purpose !== "effect" && row.purpose !== "observation") ||
-      (row.state !== null &&
-        row.state !== "confirmed" &&
-        row.state !== "failed" &&
-        row.state !== "indeterminate" &&
-        row.state !== "not_applied" &&
-        row.state !== "unknown") ||
-      (row.state === null
-        ? row.outcome_checksum !== null
-        : typeof row.outcome_checksum !== "string" || row.outcome_checksum.trim() === "")
-    ) {
-      return intervention("Persisted saga-attempt recovery evidence is malformed.")
     }
     return Object.freeze(row)
   }
@@ -1176,7 +1127,6 @@ export class D1OperationStore {
         }
         return before.operation
       }
-      const unknown = markRunningStepUnknownAfterCrash(before.operation, input.stepId)
       const originalFencingToken = record.fencingToken as number
       const activeAttemptId = record.activeAttemptId as string
       const lastAttemptId = record.lastAttemptId as string
@@ -1187,13 +1137,14 @@ export class D1OperationStore {
       const planStep = before.operation.plan.steps.find(
         (candidate) => candidate.stepId === input.stepId,
       ) as OperationStepPlan
+      if (planStep.effectProtocol === "saga_receipt") {
+        return intervention(
+          "Saga-receipt crash recovery must be consumed through D1SagaCoordinatorStore.",
+        )
+      }
       const providerAttempt =
         planStep.effectProtocol === "provider_receipt"
           ? await this.#providerAttempt(activeAttemptId)
-          : undefined
-      const sagaAttempt =
-        planStep.effectProtocol === "saga_receipt"
-          ? await this.#sagaAttempt(activeAttemptId)
           : undefined
       if (
         providerAttempt !== undefined &&
@@ -1202,18 +1153,14 @@ export class D1OperationStore {
       ) {
         return intervention("Provider-attempt recovery evidence belongs to a different step.")
       }
-      if (
-        sagaAttempt !== undefined &&
-        (sagaAttempt.operation_id !== input.operationId ||
-          sagaAttempt.operation_step_id !== input.stepId ||
-          sagaAttempt.purpose !== "effect")
-      ) {
-        return intervention("Saga-attempt recovery evidence belongs to a different step.")
-      }
       const notDispatched =
-        (planStep.effectProtocol === "provider_receipt" && providerAttempt === undefined) ||
-        (planStep.effectProtocol === "saga_receipt" && sagaAttempt === undefined)
-      let next = unknown
+        planStep.effectProtocol === "provider_receipt" && providerAttempt === undefined
+      const recoveryErrorChecksum = providerAttempt?.acceptance_checksum
+      let next = markRunningStepUnknownAfterCrash(
+        before.operation,
+        input.stepId,
+        recoveryErrorChecksum,
+      )
       if (notDispatched) {
         const absenceEvidenceChecksum = await this.#digest(
           new TextEncoder().encode(
@@ -1237,8 +1184,7 @@ export class D1OperationStore {
         actorChecksum: input.actorChecksum,
         after,
         auditEventType: notDispatched ? "step.crash.not_dispatched" : "step.crash.outcome_unknown",
-        auditPayloadChecksum:
-          providerAttempt?.acceptance_checksum ?? sagaAttempt?.acceptance_checksum ?? lastAttemptId,
+        auditPayloadChecksum: providerAttempt?.acceptance_checksum ?? lastAttemptId,
         before,
         proof: input.proof,
         stepId: input.stepId,
@@ -1269,8 +1215,6 @@ export class D1OperationStore {
         checksum: input.resultChecksum,
         providerPurpose: "effect",
         providerState: "confirmed",
-        sagaPurpose: "effect",
-        sagaState: "confirmed",
       },
     )
   }
@@ -1295,13 +1239,6 @@ export class D1OperationStore {
         checksum: input.errorChecksum,
         providerPurpose: "effect",
         providerState: input.outcome === "unknown" ? "unknown" : "rejected",
-        sagaPurpose: "effect",
-        sagaState:
-          input.outcome === "unknown"
-            ? "unknown"
-            : input.outcome === "definitely_not_applied"
-              ? "not_applied"
-              : "failed",
       },
     )
   }
@@ -1336,13 +1273,6 @@ export class D1OperationStore {
             checksum: input.evidenceChecksum,
             providerPurpose: "reconciliation",
             providerState: "confirmed",
-            sagaPurpose: "observation",
-            sagaState:
-              input.outcome === "applied"
-                ? "confirmed"
-                : input.outcome === "not_applied"
-                  ? "not_applied"
-                  : "indeterminate",
           },
     )
   }
@@ -1364,6 +1294,11 @@ export class D1OperationStore {
       const planStep = before.operation.plan.steps.find(
         (candidate) => candidate.stepId === input.stepId,
       ) as OperationStepPlan | undefined
+      if (planStep?.effectProtocol === "saga_receipt") {
+        return intervention(
+          "Saga-receipt step outcomes must be consumed through D1SagaCoordinatorStore.",
+        )
+      }
       if (planStep?.effectProtocol === "provider_receipt") {
         if (attemptOutcome === undefined) {
           return intervention("A provider-receipt step outcome lacks receipt requirements.")
@@ -1380,24 +1315,6 @@ export class D1OperationStore {
           receipt.outcome_checksum !== attemptOutcome.checksum
         ) {
           return intervention("The provider outcome receipt contradicts the operation transition.")
-        }
-      }
-      if (planStep?.effectProtocol === "saga_receipt") {
-        if (attemptOutcome === undefined) {
-          return intervention("A saga-receipt step outcome lacks receipt requirements.")
-        }
-        const receipt = await this.#sagaAttempt(attemptOutcome.attemptId)
-        if (receipt === undefined || receipt.state === null) {
-          return resume("The saga attempt has no terminal outcome receipt.")
-        }
-        if (
-          receipt.operation_id !== input.operationId ||
-          receipt.operation_step_id !== input.stepId ||
-          receipt.purpose !== attemptOutcome.sagaPurpose ||
-          receipt.state !== attemptOutcome.sagaState ||
-          receipt.outcome_checksum !== attemptOutcome.checksum
-        ) {
-          return intervention("The saga outcome receipt contradicts the operation transition.")
         }
       }
       const next = transition(before.operation)

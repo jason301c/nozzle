@@ -25,6 +25,7 @@ import {
   type OperationRecord,
   type OperationStepPlanInput,
   operationStatus,
+  recordSagaStepTerminalClassification,
   recordStepFailure,
   recordStepReconciliation,
   recordStepSuccess,
@@ -868,10 +869,89 @@ describe("operation crash, resume, and idempotency guards", () => {
     })
   })
 
+  it("distinguishes retryable saga absence from terminal classification success", async () => {
+    const lease = acquire()
+    const started = begin(
+      createOperationRecord(
+        await plan([
+          step("one", {
+            effectProtocol: "saga_receipt",
+            retryClassification: "reconcile_first",
+          }),
+        ]),
+      ),
+      lease,
+    ).operation
+    const unknown = recordStepFailure(started, {
+      attemptId: "attempt-1",
+      errorChecksum: "unknown-effect",
+      outcome: "unknown",
+      stepId: "one",
+    })
+
+    const applied = recordStepReconciliation(unknown, {
+      evidenceChecksum: "applied-observation",
+      observedPostconditionChecksum: "post-one",
+      outcome: "applied",
+      resultChecksum: "business-result",
+      stepId: "one",
+    })
+    expect(applied.steps.one).toMatchObject({
+      reconciliationEvidenceChecksum: "applied-observation",
+      resultChecksum: "business-result",
+      state: "succeeded",
+    })
+
+    const retryable = recordStepReconciliation(unknown, {
+      evidenceChecksum: "not-applied-observation",
+      outcome: "not_applied",
+      stepId: "one",
+    })
+    expect(retryable.steps.one).toMatchObject({
+      reconciliationEvidenceChecksum: "not-applied-observation",
+      state: "retryable_failed",
+    })
+
+    const terminal = recordSagaStepTerminalClassification(unknown, {
+      counters: { cost: { observations: 1 }, progress: { classifications: 1 } },
+      outcome: "not_applied",
+      receiptOutcomeChecksum: "terminal-receipt-outcome",
+      stepId: "one",
+    })
+    expect(terminal.steps.one).toMatchObject({
+      costCounters: { observations: 1 },
+      errorChecksum: "unknown-effect",
+      progressCounters: { classifications: 1 },
+      reconciliationEvidenceChecksum: "terminal-receipt-outcome",
+      resultChecksum: "terminal-receipt-outcome",
+      state: "succeeded",
+    })
+    expect(operationStatus(terminal)).toBe("succeeded")
+
+    const indeterminate = recordStepReconciliation(unknown, {
+      evidenceChecksum: "indeterminate-observation",
+      outcome: "indeterminate",
+      stepId: "one",
+    })
+    expect(indeterminate.steps.one).toMatchObject({
+      reconciliationEvidenceChecksum: "indeterminate-observation",
+      state: "intervention_required",
+    })
+  })
+
   it("marks every in-flight attempt unknown on crash before resuming", async () => {
     const lease = acquire()
     const operation = createOperationRecord(await plan([step("a"), step("b"), step("c")]))
     const runningA = begin(operation, lease, { stepId: "a" }).operation
+    expect(
+      markRunningStepUnknownAfterCrash(runningA, "a", "accepted-receipt").steps.a,
+    ).toMatchObject({
+      errorChecksum: "accepted-receipt",
+      state: "unknown",
+    })
+    expect(() => markRunningStepUnknownAfterCrash(runningA, "a", "")).toThrow(
+      "Crash-recovery error checksum",
+    )
     const notDispatched = markRunningStepNotDispatchedAfterCrash(
       runningA,
       "a",
@@ -1077,6 +1157,59 @@ describe("operation crash, resume, and idempotency guards", () => {
         stepId: "one",
       }),
     ).toThrow("reconciliation outcome is invalid")
+
+    expect(() =>
+      recordSagaStepTerminalClassification(unknown, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "terminal-receipt",
+        stepId: "one",
+      }),
+    ).toThrow("requires a saga-receipt step")
+
+    const sagaOperation = createOperationRecord(
+      await plan([step("one", { effectProtocol: "saga_receipt" })]),
+    )
+    expect(() =>
+      recordSagaStepTerminalClassification(sagaOperation, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "terminal-receipt",
+        stepId: "one",
+      }),
+    ).toThrow("Only an unknown saga step")
+    const sagaUnknown = recordStepFailure(begin(sagaOperation, lease).operation, {
+      attemptId: "attempt-1",
+      errorChecksum: "unknown",
+      outcome: "unknown",
+      stepId: "one",
+    })
+    expect(() =>
+      recordSagaStepTerminalClassification(sagaUnknown, {
+        outcome: "invalid" as "not_applied",
+        receiptOutcomeChecksum: "terminal-receipt",
+        stepId: "one",
+      }),
+    ).toThrow("classification outcome is invalid")
+    expect(() =>
+      recordSagaStepTerminalClassification(sagaUnknown, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "",
+        stepId: "one",
+      }),
+    ).toThrow("receipt-outcome checksum")
+    for (const missing of ["fencingToken", "lastAttemptId"] as const) {
+      const malformedStep = { ...sagaUnknown.steps.one }
+      delete malformedStep[missing]
+      expect(() =>
+        recordSagaStepTerminalClassification(
+          { ...sagaUnknown, steps: { one: malformedStep } } as OperationRecord,
+          {
+            outcome: "not_applied",
+            receiptOutcomeChecksum: "terminal-receipt",
+            stepId: "one",
+          },
+        ),
+      ).toThrow("incomplete classification metadata")
+    }
   })
 
   it("requires full evidence to reconcile applied outcomes and preserves never-retry", async () => {

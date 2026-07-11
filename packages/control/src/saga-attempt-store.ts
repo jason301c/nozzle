@@ -1,15 +1,16 @@
 import {
   type DigestFunction,
   type LeaseProof,
-  loadSagaRecord,
   NozzleError,
+  type OperationStepRecord,
   type SagaActionPhase,
   type SagaActionReference,
   type SagaRecord,
   sagaActionKey,
 } from "@nozzle/core"
-import type { ControlDatabase, ControlRunResult } from "./database.js"
-import { sagaActionOperationStepId } from "./saga-store.js"
+import type { ControlRunResult, TransactionalControlDatabase } from "./database.js"
+import { D1OperationStore } from "./operation-store.js"
+import { D1SagaStore, sagaActionOperationStepId } from "./saga-store.js"
 
 const MAX_IDENTITY_BYTES = 512
 const MAX_TEXT_BYTES = 2048
@@ -46,6 +47,7 @@ export interface SagaAttemptIdentity {
   readonly operationId: string
   readonly operationStepId: string
   readonly phase: SagaActionPhase
+  readonly protocolVersion: 1 | 2
   readonly purpose: SagaAttemptPurpose
   readonly sagaId: string
   readonly sagaStepId: string
@@ -98,9 +100,14 @@ export type CompleteSagaAttemptInput =
       readonly state: Exclude<SagaAttemptOutcomeState, "confirmed">
     })
 
+export interface ValidateSagaProjectionReceiptInput {
+  readonly attemptId: string
+  readonly proof: LeaseProof
+  readonly requireState: "accepted" | "terminal"
+}
+
 interface SagaProjectionRow {
   readonly operation_id: string
-  readonly record_json: string
 }
 
 interface SagaAttemptRow {
@@ -127,6 +134,8 @@ interface SagaAttemptRow {
   readonly output_checksum: string | null
   readonly output_json: string | null
   readonly phase: string
+  readonly protocol_classified_at_ms: number | null
+  readonly protocol_version: number | null
   readonly purpose: string
   readonly saga_id: string
   readonly saga_step_id: string
@@ -252,7 +261,7 @@ export function sagaObservationIdempotencyKey(actionIdempotencyKey: string): str
 }
 
 function acceptanceParts(
-  identity: Omit<SagaAttemptIdentity, "acceptanceChecksum" | "acceptedAtMs">,
+  identity: Omit<SagaAttemptIdentity, "acceptanceChecksum" | "acceptedAtMs" | "protocolVersion">,
 ) {
   return [
     identity.attemptId,
@@ -277,7 +286,7 @@ function acceptanceParts(
 
 async function acceptanceChecksum(
   digest: DigestFunction,
-  identity: Omit<SagaAttemptIdentity, "acceptanceChecksum" | "acceptedAtMs">,
+  identity: Omit<SagaAttemptIdentity, "acceptanceChecksum" | "acceptedAtMs" | "protocolVersion">,
 ): Promise<string> {
   return checkedDigest(digest, ACCEPTANCE_DOMAIN, acceptanceParts(identity))
 }
@@ -301,13 +310,13 @@ async function outcomeChecksum(
   ])
 }
 
-function changed(result: ControlRunResult): boolean {
+function changed(result: ControlRunResult, maximumChanges = 1): boolean {
   const changes = result.meta.changes
   if (
     result.success !== true ||
     !Number.isSafeInteger(changes) ||
     (changes as number) < 0 ||
-    (changes as number) > 1
+    (changes as number) > maximumChanges
   ) {
     return intervention("Control D1 returned malformed saga-receipt mutation metadata.")
   }
@@ -351,20 +360,25 @@ function actionRecord(saga: SagaRecord, stepId: string, actionPhase: SagaActionP
 }
 
 export class D1SagaAttemptStore {
-  readonly #database: ControlDatabase
+  readonly #database: TransactionalControlDatabase
   readonly #digest: DigestFunction
+  readonly #operations: D1OperationStore
+  readonly #sagas: D1SagaStore
 
-  constructor(database: ControlDatabase, digest: DigestFunction) {
+  constructor(database: TransactionalControlDatabase, digest: DigestFunction) {
     if (
       typeof database !== "object" ||
       database === null ||
-      typeof database.prepare !== "function"
+      typeof database.prepare !== "function" ||
+      typeof database.batch !== "function"
     ) {
       configuration("A control D1 database binding is required.")
     }
     if (typeof digest !== "function") configuration("A saga-attempt digest is required.")
     this.#database = database
     this.#digest = digest
+    this.#operations = new D1OperationStore(database, digest)
+    this.#sagas = new D1SagaStore(database, digest)
   }
 
   async #binding(
@@ -373,17 +387,22 @@ export class D1SagaAttemptStore {
     actionPhase: SagaActionPhase,
     attemptPurpose: SagaAttemptPurpose,
     attemptId: string,
+    proof: LeaseProof,
   ): Promise<ActionBinding> {
     const row = await this.#database
-      .prepare(`SELECT "operation_id", "record_json" FROM "nozzle_sagas" WHERE "saga_id" = ?1`)
+      .prepare(`SELECT "operation_id" FROM "nozzle_sagas" WHERE "saga_id" = ?1`)
       .bind(sagaId)
       .first<SagaProjectionRow>()
     if (row === null) return resume("The saga does not exist.")
-    if (typeof row.operation_id !== "string" || typeof row.record_json !== "string") {
+    if (typeof row.operation_id !== "string") {
       return intervention("Persisted saga action binding is malformed.")
     }
-    const canonical = inputJson(row.record_json, "Persisted saga action binding JSON", true)
-    const saga = await loadSagaRecord(JSON.parse(canonical), this.#digest)
+    const saga = await this.#sagas.get(sagaId)
+    if (saga === undefined) return intervention("The persisted saga projection disappeared.")
+    const operation = await this.#operations.get(row.operation_id)
+    if (operation === undefined) {
+      return intervention("The saga operation projection is missing.")
+    }
     const current = actionRecord(saga, sagaStepId, actionPhase)
     if (
       attemptPurpose === "effect"
@@ -393,12 +412,79 @@ export class D1SagaAttemptStore {
       return resume("The saga action is not eligible for this durable attempt.")
     }
     const actionKey = sagaActionKey(reference(saga, sagaStepId, actionPhase, attemptPurpose))
+    const operationStepId = sagaActionOperationStepId(sagaStepId, actionPhase)
+    const operationAction = operation.operation.steps[operationStepId] as
+      | OperationStepRecord
+      | undefined
+    const planStep = operation.operation.plan.steps.find((step) => step.stepId === operationStepId)
+    if (
+      operationAction === undefined ||
+      planStep === undefined ||
+      planStep.effectProtocol !== "saga_receipt" ||
+      planStep.leaseKey !== proof.leaseKey
+    ) {
+      return intervention("The saga action lacks its exact generic operation binding.")
+    }
     let causalAttemptId: string | null = null
     if (attemptPurpose === "observation") {
       causalAttemptId = current.lastAttemptId as string
+      if (
+        operationAction.state !== "unknown" ||
+        operationAction.lastAttemptId !== causalAttemptId ||
+        operationAction.fencingToken === undefined ||
+        proof.fencingToken <= operationAction.fencingToken
+      ) {
+        return intervention("The operation ledger is not eligible for saga observation.")
+      }
+      const cause = await this.get(causalAttemptId)
+      if (
+        cause === undefined ||
+        cause.sagaId !== sagaId ||
+        cause.operationId !== row.operation_id ||
+        cause.operationStepId !== operationStepId ||
+        cause.sagaStepId !== sagaStepId ||
+        cause.phase !== actionPhase ||
+        cause.purpose !== "effect" ||
+        (cause.state !== "accepted" && cause.state !== "unknown")
+      ) {
+        return intervention("The saga observation lacks its checksum-verified causal receipt.")
+      }
+      const sagaErrorChecksum = current.errorChecksum
+      const operationErrorChecksum = operationAction.errorChecksum
+      if (
+        cause.state === "unknown"
+          ? sagaErrorChecksum !== cause.errorChecksum ||
+            operationErrorChecksum !== cause.outcomeChecksum
+          : sagaErrorChecksum !== cause.acceptanceChecksum ||
+            operationErrorChecksum !== cause.acceptanceChecksum
+      ) {
+        return intervention("The operation and saga ledgers disagree about the observation cause.")
+      }
     } else if (actionPhase === "compensation") {
       const forward = actionRecord(saga, sagaStepId, "forward")
       causalAttemptId = forward.lastAttemptId as string
+      const cause = await this.get(causalAttemptId)
+      if (
+        cause === undefined ||
+        cause.state !== "confirmed" ||
+        cause.sagaId !== sagaId ||
+        cause.operationId !== row.operation_id ||
+        cause.operationStepId !== sagaActionOperationStepId(sagaStepId, "forward") ||
+        cause.sagaStepId !== sagaStepId ||
+        cause.phase !== "forward" ||
+        cause.purpose !== "effect" ||
+        cause.outputChecksum !== forward.resultChecksum
+      ) {
+        return intervention("Saga compensation lacks its exact confirmed forward receipt.")
+      }
+    }
+    if (
+      attemptPurpose === "effect" &&
+      (operationAction.state !== "running" ||
+        operationAction.activeAttemptId !== attemptId ||
+        operationAction.fencingToken !== proof.fencingToken)
+    ) {
+      return intervention("The operation and saga ledgers disagree about the active attempt.")
     }
     return Object.freeze({
       actionKey,
@@ -408,21 +494,75 @@ export class D1SagaAttemptStore {
           ? current.idempotencyKey
           : sagaObservationIdempotencyKey(current.idempotencyKey),
       operationId: row.operation_id,
-      operationStepId: sagaActionOperationStepId(sagaStepId, actionPhase),
+      operationStepId,
       saga,
     })
+  }
+
+  async #validateProjectionBinding(receipt: SagaAttemptRecord, proof: LeaseProof): Promise<void> {
+    const binding = await this.#binding(
+      receipt.sagaId,
+      receipt.sagaStepId,
+      receipt.phase,
+      receipt.purpose,
+      receipt.attemptId,
+      proof,
+    )
+    const sagaStep = binding.saga.steps[receipt.sagaStepId] as NonNullable<
+      SagaRecord["steps"][string]
+    >
+    const expectedInputChecksum = {
+      "effect:compensation": receipt.inputChecksum,
+      "effect:forward": sagaStep.inputChecksum,
+      "observation:compensation": receipt.inputChecksum,
+      "observation:forward": receipt.inputChecksum,
+    }[`${receipt.purpose}:${receipt.phase}`] as string
+    const actual = JSON.stringify([
+      receipt.sagaId,
+      receipt.causalAttemptId,
+      receipt.operationId,
+      receipt.operationStepId,
+      receipt.actionKey,
+      receipt.idempotencyKey,
+      receipt.inputChecksum,
+      receipt.leaseKey,
+      receipt.holderId,
+      receipt.acquisitionId,
+      receipt.fencingToken,
+    ])
+    const expected = JSON.stringify([
+      binding.saga.sagaId,
+      binding.causalAttemptId,
+      binding.operationId,
+      binding.operationStepId,
+      binding.actionKey,
+      binding.idempotencyKey,
+      expectedInputChecksum,
+      proof.leaseKey,
+      proof.holderId,
+      proof.acquisitionId,
+      proof.fencingToken,
+    ])
+    if (actual !== expected) {
+      return intervention(
+        "A protocol-one saga receipt no longer has its exact safe projection binding.",
+      )
+    }
   }
 
   async get(attemptIdInput: string): Promise<SagaAttemptRecord | undefined> {
     const attemptId = boundedText(attemptIdInput, "Saga attempt ID", MAX_IDENTITY_BYTES)
     const row = await this.#database
       .prepare(
-        `SELECT "attempt".*, "outcome"."state", "outcome"."evidence_checksum",
+        `SELECT "attempt".*, "protocol"."protocol_version",
+                "protocol"."classified_at_ms" AS "protocol_classified_at_ms",
+                "outcome"."state", "outcome"."evidence_checksum",
                 "outcome"."evidence_json", "outcome"."output_checksum",
                 "outcome"."output_json", "outcome"."error_checksum",
                 "outcome"."error_json", "outcome"."outcome_checksum",
                 "outcome"."completed_at_ms"
          FROM "nozzle_saga_action_attempts" AS "attempt"
+         LEFT JOIN "nozzle_saga_action_attempt_protocols" AS "protocol" USING ("attempt_id")
          LEFT JOIN "nozzle_saga_action_attempt_outcomes" AS "outcome" USING ("attempt_id")
          WHERE "attempt"."attempt_id" = ?1`,
       )
@@ -438,6 +578,8 @@ export class D1SagaAttemptStore {
       typeof row.operation_step_id !== "string" ||
       typeof row.saga_step_id !== "string" ||
       (row.phase !== "forward" && row.phase !== "compensation") ||
+      (row.protocol_version !== 1 && row.protocol_version !== 2) ||
+      row.protocol_classified_at_ms !== row.accepted_at_ms ||
       (row.purpose !== "effect" && row.purpose !== "observation") ||
       typeof row.action_key !== "string" ||
       typeof row.idempotency_key !== "string" ||
@@ -475,6 +617,7 @@ export class D1SagaAttemptStore {
       operationId: row.operation_id,
       operationStepId: row.operation_step_id,
       phase: row.phase,
+      protocolVersion: row.protocol_version,
       purpose: row.purpose,
       sagaId: row.saga_id,
       sagaStepId: row.saga_step_id,
@@ -586,6 +729,63 @@ export class D1SagaAttemptStore {
     )
   }
 
+  async validateProjectionReceipt(
+    input: ValidateSagaProjectionReceiptInput,
+  ): Promise<SagaAttemptRecord> {
+    const attemptId = boundedText(input.attemptId, "Saga attempt ID", MAX_IDENTITY_BYTES)
+    validProof(input.proof)
+    if (input.requireState !== "accepted" && input.requireState !== "terminal") {
+      return configuration("Saga projection receipt state requirement is invalid.")
+    }
+    const receipt = await this.get(attemptId)
+    if (receipt === undefined) return resume("The saga projection receipt was never accepted.")
+    const receiptProof: LeaseProof = Object.freeze({
+      acquisitionId: receipt.acquisitionId,
+      fencingToken: receipt.fencingToken,
+      holderId: receipt.holderId,
+      leaseKey: receipt.leaseKey,
+    })
+    let bindingProof: LeaseProof
+    if (input.requireState === "accepted") {
+      if (receipt.state !== "accepted" || receipt.purpose !== "effect") {
+        return intervention("Saga crash recovery requires an accepted effect receipt.")
+      }
+      if (
+        input.proof.leaseKey !== receipt.leaseKey ||
+        input.proof.fencingToken <= receipt.fencingToken
+      ) {
+        return resume("Saga crash recovery requires a strictly newer fence on the same lease.")
+      }
+      bindingProof = receiptProof
+    } else {
+      if (receipt.state === "accepted") {
+        return resume("The saga settlement receipt is not terminal.")
+      }
+      const compatibleStates: Readonly<
+        Record<SagaAttemptPurpose, readonly SagaAttemptOutcomeState[]>
+      > = {
+        effect: ["confirmed", "failed", "not_applied", "unknown"],
+        observation: ["confirmed", "indeterminate", "not_applied"],
+      }
+      if (!compatibleStates[receipt.purpose].includes(receipt.state)) {
+        return intervention("The persisted saga settlement receipt has an incompatible outcome.")
+      }
+      const exactReceiptOwner =
+        input.proof.holderId === receipt.holderId &&
+        input.proof.acquisitionId === receipt.acquisitionId
+      const fenceIsUsable =
+        input.proof.fencingToken > receipt.fencingToken ||
+        (input.proof.fencingToken === receipt.fencingToken && exactReceiptOwner)
+      if (input.proof.leaseKey !== receipt.leaseKey || !fenceIsUsable) {
+        return resume("Saga settlement requires the receipt lease or a strictly newer fence.")
+      }
+      bindingProof = receiptProof
+    }
+    if (receipt.protocolVersion === 2) return receipt
+    await this.#validateProjectionBinding(receipt, bindingProof)
+    return receipt
+  }
+
   async accept(input: AcceptSagaAttemptInput): Promise<SagaAttemptRecord> {
     const attemptId = boundedText(input.attemptId, "Saga attempt ID", MAX_IDENTITY_BYTES)
     const sagaId = boundedText(input.sagaId, "Saga ID", MAX_IDENTITY_BYTES)
@@ -595,7 +795,14 @@ export class D1SagaAttemptStore {
     validProof(input.proof)
     const canonicalInput = inputJson(input.inputJson, "Saga action input", false)
     const inputChecksum = await payloadChecksum(this.#digest, INPUT_DOMAIN, canonicalInput)
-    const binding = await this.#binding(sagaId, sagaStepId, input.phase, input.purpose, attemptId)
+    const binding = await this.#binding(
+      sagaId,
+      sagaStepId,
+      input.phase,
+      input.purpose,
+      attemptId,
+      input.proof,
+    )
     if (
       input.purpose === "effect" &&
       input.phase === "forward" &&
@@ -658,12 +865,13 @@ export class D1SagaAttemptStore {
         input.proof.fencingToken,
       )
       .run()
-    changed(result)
+    changed(result, 2)
     const accepted = await this.get(attemptId)
     if (accepted === undefined) {
       return resume("The saga attempt was not accepted under the active exact fence.")
     }
     if (
+      accepted.protocolVersion !== 2 ||
       accepted.sagaId !== sagaId ||
       accepted.causalAttemptId !== binding.causalAttemptId ||
       accepted.operationId !== binding.operationId ||
@@ -707,8 +915,16 @@ export class D1SagaAttemptStore {
     const existing = await this.get(attemptId)
     if (existing === undefined) return resume("The saga attempt was never durably accepted.")
     if (
+      existing.state === "accepted" &&
+      existing.protocolVersion === 1 &&
+      existing.purpose === "observation"
+    ) {
+      await this.#validateProjectionBinding(existing, input.proof)
+    }
+    if (
       (existing.purpose === "effect" && input.state === "indeterminate") ||
-      (existing.purpose === "observation" && input.state === "unknown")
+      (existing.purpose === "observation" &&
+        (input.state === "failed" || input.state === "unknown"))
     ) {
       return configuration("Saga attempt outcome is incompatible with its purpose.")
     }

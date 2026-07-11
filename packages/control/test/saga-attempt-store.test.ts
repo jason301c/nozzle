@@ -20,6 +20,7 @@ import {
   sagaActionInputChecksum,
   sagaObservationIdempotencyKey,
 } from "../src/saga-attempt-store.js"
+import { D1SagaCoordinatorStore } from "../src/saga-coordinator-store.js"
 import {
   D1SagaStore,
   SAGA_INIT_OPERATION_STEP_ID,
@@ -132,10 +133,43 @@ class FixedStatement implements ControlStatement {
   }
 }
 
+class TransformStatement implements ControlStatement {
+  readonly #inner: ControlStatement
+  readonly #transform: (row: unknown) => unknown
+
+  constructor(inner: ControlStatement, transform: (row: unknown) => unknown) {
+    this.#inner = inner
+    this.#transform = transform
+  }
+
+  bind(...values: readonly ControlBindingValue[]): ControlStatement {
+    this.#inner.bind(...values)
+    return this
+  }
+
+  async all<T>(): Promise<ControlQueryResult<T>> {
+    const result = await this.#inner.all<unknown>()
+    return { ...result, results: result.results.map(this.#transform) as T[] }
+  }
+
+  async first<T>(): Promise<T | null> {
+    const row = await this.#inner.first<unknown>()
+    return (row === null ? null : this.#transform(row)) as T | null
+  }
+
+  async run(): Promise<ControlRunResult> {
+    return this.#inner.run()
+  }
+}
+
 interface AttemptFaults {
   readonly attemptRow?: unknown | (() => unknown)
+  readonly operationProjectionMissing?: boolean
+  readonly operationStepChanges?: null | Readonly<Record<string, unknown>>
   readonly runResult?: ControlRunResult
-  readonly sagaRow?: unknown
+  readonly sagaBindingRow?: unknown
+  readonly sagaProjectionMissing?: boolean
+  readonly sagaProjectionChanges?: Readonly<Record<string, unknown>>
 }
 
 class FaultDatabase implements TransactionalControlDatabase {
@@ -164,10 +198,39 @@ class FaultDatabase implements TransactionalControlDatabase {
       })
     }
     if (
-      sql.includes('SELECT "operation_id", "record_json" FROM "nozzle_sagas"') &&
-      this.#faults.sagaRow !== undefined
+      sql.includes('SELECT "operation_id" FROM "nozzle_sagas"') &&
+      this.#faults.sagaBindingRow !== undefined
     ) {
-      return new FixedStatement({ row: this.#faults.sagaRow })
+      return new FixedStatement({ row: this.#faults.sagaBindingRow })
+    }
+    if (this.#faults.sagaProjectionMissing && sql.includes('SELECT "saga".*')) {
+      return new FixedStatement({ row: null })
+    }
+    if (
+      this.#faults.operationProjectionMissing &&
+      sql.includes('FROM "nozzle_operations" WHERE "operation_id"')
+    ) {
+      return new FixedStatement({ row: null })
+    }
+    if (
+      sql.includes('FROM "nozzle_operation_steps" WHERE "operation_id"') &&
+      this.#faults.operationStepChanges !== undefined
+    ) {
+      const changes = this.#faults.operationStepChanges
+      return new TransformStatement(this.#base.prepare(sql), (row) => {
+        const record = row as Record<string, unknown>
+        if (record.step_id !== "saga:forward:a") return row
+        return changes === null
+          ? { ...record, step_id: "missing-from-plan" }
+          : { ...record, ...changes }
+      })
+    }
+    if (sql.includes('SELECT "saga".*') && this.#faults.sagaProjectionChanges !== undefined) {
+      const changes = this.#faults.sagaProjectionChanges
+      return new TransformStatement(this.#base.prepare(sql), (row) => ({
+        ...(row as Record<string, unknown>),
+        ...changes,
+      }))
     }
     if (sql.includes('INSERT INTO "nozzle_saga_action_') && this.#faults.runResult !== undefined) {
       return new FixedStatement({ runResult: this.#faults.runResult })
@@ -179,12 +242,15 @@ class FaultDatabase implements TransactionalControlDatabase {
 function rawAttempt(database: DatabaseSync, attemptId: string): Record<string, unknown> {
   return database
     .prepare(
-      `SELECT "attempt".*, "outcome"."state", "outcome"."evidence_checksum",
+      `SELECT "attempt".*, "protocol"."protocol_version",
+              "protocol"."classified_at_ms" AS "protocol_classified_at_ms",
+              "outcome"."state", "outcome"."evidence_checksum",
               "outcome"."evidence_json", "outcome"."output_checksum",
               "outcome"."output_json", "outcome"."error_checksum",
               "outcome"."error_json", "outcome"."outcome_checksum",
               "outcome"."completed_at_ms"
        FROM "nozzle_saga_action_attempts" AS "attempt"
+       LEFT JOIN "nozzle_saga_action_attempt_protocols" AS "protocol" USING ("attempt_id")
        LEFT JOIN "nozzle_saga_action_attempt_outcomes" AS "outcome" USING ("attempt_id")
        WHERE "attempt"."attempt_id" = ?`,
     )
@@ -228,12 +294,25 @@ async function acceptanceForRow(row: Record<string, unknown>): Promise<string> {
   ])
 }
 
+async function outcomeForRow(row: Record<string, unknown>): Promise<string> {
+  const confirmed = row.state === "confirmed"
+  return framedChecksum("nozzle.saga-action-outcome.v1", [
+    row.acceptance_checksum as string,
+    row.state as string,
+    row.evidence_checksum as string,
+    row.evidence_json as string,
+    (confirmed ? row.output_checksum : row.error_checksum) as string,
+    (confirmed ? row.output_json : row.error_json) as string,
+  ])
+}
+
 describe("D1SagaAttemptStore", () => {
   let database: DatabaseAdapter
   let leases: D1LeaseStore
   let operations: D1OperationStore
   let sagaStore: D1SagaStore
   let attempts: D1SagaAttemptStore
+  let coordinator: D1SagaCoordinatorStore
 
   beforeEach(() => {
     database = new DatabaseAdapter()
@@ -241,10 +320,15 @@ describe("D1SagaAttemptStore", () => {
     operations = new D1OperationStore(database, digest)
     sagaStore = new D1SagaStore(database, digest)
     attempts = new D1SagaAttemptStore(database, digest)
+    coordinator = new D1SagaCoordinatorStore(database, digest)
     return () => database.close()
   })
 
-  async function fixture(suffix: string, actionInputJson = '{"b":2,"a":1}') {
+  async function fixture(
+    suffix: string,
+    actionInputJson = '{"b":2,"a":1}',
+    actionEffectProtocol: "opaque" | "saga_receipt" = "saga_receipt",
+  ) {
     const operationId = `attempt-operation-${suffix}`
     const sagaId = `attempt-saga-${suffix}`
     const leaseKey = `saga:${sagaId}`
@@ -270,9 +354,11 @@ describe("D1SagaAttemptStore", () => {
           checkpoint: stepId === finalStepId ? ("irreversible" as const) : ("reversible" as const),
           dependsOn: [],
           effectProtocol:
-            stepId === actionStepId || stepId === compensationStepId || stepId === finalStepId
-              ? ("saga_receipt" as const)
-              : ("opaque" as const),
+            stepId === actionStepId
+              ? actionEffectProtocol
+              : stepId === compensationStepId || stepId === finalStepId
+                ? ("saga_receipt" as const)
+                : ("opaque" as const),
           idempotencyKey: `${operationId}:${stepId}:key`,
           inputChecksum: `${operationId}:${stepId}:input`,
           leaseKey,
@@ -435,29 +521,14 @@ describe("D1SagaAttemptStore", () => {
       })
     ).saga
 
-    const makeUnknown = async (acceptedOutcomeChecksum: string) => {
-      await operations.failStep({
+    const makeUnknown = async () => {
+      saga = await coordinator.settleActionFromReceipt({
         actorChecksum: "saga-attempt-actor",
         attemptId: actionAttemptId,
-        errorChecksum: acceptedOutcomeChecksum,
         operationId,
-        outcome: "unknown",
-        proof,
-        stepId: actionStepId,
-      })
-      saga = await sagaStore.recordActionFailure({
-        attemptId: actionAttemptId,
-        effect: context(
-          `${actionAttemptId}:unknown`,
-          actionStepId,
-          operationTransitionIdentity("failed", [operationId, actionStepId, actionAttemptId]),
-        ),
-        errorChecksum: acceptedOutcomeChecksum,
-        evidenceChecksum: acceptedOutcomeChecksum,
-        outcome: "unknown",
         phase: "forward",
+        proof,
         sagaId,
-        serverTimeMs: 1_002,
         stepId: "a",
       })
       await leases.release({ proof })
@@ -471,15 +542,52 @@ describe("D1SagaAttemptStore", () => {
       proof = leaseProof(reacquired.record)
     }
 
+    const recoverAcceptedUnknown = async (acceptanceChecksum: string) => {
+      await leases.release({ proof })
+      const recovery = await leases.acquire({
+        acquisitionId: `${sagaId}:recovery-acquisition`,
+        holderId: `${sagaId}:recovery-controller`,
+        leaseKey,
+        ttlMs: 60_000,
+      })
+      if (!recovery.acquired) throw new Error("Saga recovery lease failed.")
+      proof = leaseProof(recovery.record)
+      const recoveryId = `${actionAttemptId}:accepted-recovery`
+      saga = await coordinator.recoverActionAfterCrash({
+        actorChecksum: "saga-attempt-actor",
+        attemptId: actionAttemptId,
+        operationId,
+        phase: "forward",
+        proof,
+        recoveryId,
+        sagaId,
+        stepId: "a",
+      })
+      if (saga.steps.a?.forward.errorChecksum !== acceptanceChecksum) {
+        throw new Error("Accepted recovery did not preserve its acceptance evidence.")
+      }
+      await leases.release({ proof })
+      const observer = await leases.acquire({
+        acquisitionId: `${sagaId}:recovered-observation-acquisition`,
+        holderId: `${sagaId}:recovered-observation-controller`,
+        leaseKey,
+        ttlMs: 60_000,
+      })
+      if (!observer.acquired) throw new Error("Recovered saga observation lease failed.")
+      proof = leaseProof(observer.record)
+    }
+
     return {
       actionAttemptId,
       actionInputJson,
       actionStepId,
       compensationStepId,
+      coordinator,
       context,
       makeUnknown,
       operationId,
       proof: () => proof,
+      recoverAcceptedUnknown,
       saga: () => saga,
       sagaId,
     }
@@ -502,6 +610,7 @@ describe("D1SagaAttemptStore", () => {
       inputJson: '{"a":1,"b":2}',
       operationId: run.operationId,
       operationStepId: run.actionStepId,
+      protocolVersion: 2,
       state: "accepted",
     })
     expect(await attempts.get(run.actionAttemptId)).toEqual(accepted)
@@ -534,6 +643,13 @@ describe("D1SagaAttemptStore", () => {
     await expect(attempts.complete({ ...input, outputJson: '{"result":false}' })).rejects.toThrow(
       /contradicts durable evidence/u,
     )
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: run.proof(),
+        requireState: "accepted",
+      }),
+    ).rejects.toThrow(/requires an accepted effect receipt/u)
     expect(() =>
       database.database
         .prepare(`UPDATE "nozzle_saga_action_attempts" SET "input_checksum" = 'rewritten'`)
@@ -542,6 +658,59 @@ describe("D1SagaAttemptStore", () => {
     expect(() =>
       database.database.prepare(`DELETE FROM "nozzle_saga_action_attempts"`).run(),
     ).toThrow(/SAGA_ATTEMPT_PERSISTENT/u)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: { ...run.proof(), acquisitionId: "different-acquisition" },
+        requireState: "terminal",
+      }),
+    ).rejects.toThrow(/receipt lease or a strictly newer fence/u)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: run.proof(),
+        requireState: "terminal",
+      }),
+    ).resolves.toEqual(completed)
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_protocol_update";')
+    database.database
+      .prepare(
+        `UPDATE "nozzle_saga_action_attempt_protocols"
+         SET "protocol_version" = 1 WHERE "attempt_id" = ?`,
+      )
+      .run(run.actionAttemptId)
+    const legacyForward = await attempts.get(run.actionAttemptId)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: run.proof(),
+        requireState: "terminal",
+      }),
+    ).resolves.toEqual(legacyForward)
+    const receiptProof = run.proof()
+    await leases.release({ proof: receiptProof })
+    const acquired = await leases.acquire({
+      acquisitionId: `${run.sagaId}:terminal-recovery-acquisition`,
+      holderId: `${run.sagaId}:terminal-recovery-controller`,
+      leaseKey: receiptProof.leaseKey,
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Terminal receipt recovery lease failed.")
+    const recoveryProof = leaseProof(acquired.record)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: recoveryProof,
+        requireState: "terminal",
+      }),
+    ).resolves.toEqual(legacyForward)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: { ...recoveryProof, leaseKey: "different-lease" },
+        requireState: "terminal",
+      }),
+    ).rejects.toThrow(/receipt lease or a strictly newer fence/u)
   })
 
   it("records every effect failure classification and rejects indeterminate effects", async () => {
@@ -607,7 +776,7 @@ describe("D1SagaAttemptStore", () => {
       state: "unknown",
     })
     if (unknown.state === "accepted") throw new Error("Expected terminal unknown receipt.")
-    await run.makeUnknown(unknown.outcomeChecksum)
+    await run.makeUnknown()
 
     const observationAttemptId = `${run.sagaId}:a:observe:1`
     const observation = await attempts.accept({
@@ -654,7 +823,7 @@ describe("D1SagaAttemptStore", () => {
       state: "unknown",
     })
     if (wrongUnknown.state === "accepted") throw new Error("Expected terminal unknown receipt.")
-    await wrong.makeUnknown(wrongUnknown.outcomeChecksum)
+    await wrong.makeUnknown()
     const wrongObservationId = `${wrong.sagaId}:a:observe:1`
     await attempts.accept({
       attemptId: wrongObservationId,
@@ -665,15 +834,444 @@ describe("D1SagaAttemptStore", () => {
       sagaId: wrong.sagaId,
       sagaStepId: "a",
     })
+    for (const state of ["failed", "unknown"] as const) {
+      await expect(
+        attempts.complete({
+          attemptId: wrongObservationId,
+          errorJson: "{}",
+          evidenceJson: "{}",
+          proof: wrong.proof(),
+          state,
+        }),
+      ).rejects.toThrow(/incompatible/u)
+    }
+  })
+
+  it("rejects observation dispatch when the operation ledger disagrees about its cause", async () => {
+    const run = await fixture("observation-operation-binding")
+    await attempts.accept({
+      attemptId: run.actionAttemptId,
+      inputJson: run.actionInputJson,
+      phase: "forward",
+      proof: run.proof(),
+      purpose: "effect",
+      sagaId: run.sagaId,
+      sagaStepId: "a",
+    })
+    const unknown = await attempts.complete({
+      attemptId: run.actionAttemptId,
+      errorJson: '{"dispatch":"unknown"}',
+      evidenceJson: '{"transport":"lost"}',
+      proof: run.proof(),
+      state: "unknown",
+    })
+    if (unknown.state === "accepted") throw new Error("Expected terminal unknown receipt.")
+    await run.makeUnknown()
+
+    const operationRow = database.database
+      .prepare(
+        `SELECT * FROM "nozzle_operation_steps"
+         WHERE "operation_id" = ? AND "step_id" = ?`,
+      )
+      .get(run.operationId, run.actionStepId) as Record<string, unknown>
+    const record = JSON.parse(operationRow.record_json as string) as Record<string, unknown>
+    const input = {
+      attemptId: `${run.sagaId}:a:observe:operation-binding`,
+      inputJson: JSON.stringify({ originalAttemptId: run.actionAttemptId }),
+      phase: "forward" as const,
+      proof: run.proof(),
+      purpose: "observation" as const,
+      sagaId: run.sagaId,
+      sagaStepId: "a",
+    }
+    for (const operationStepChanges of [
+      null,
+      { state: "running" },
+      { record_json: null },
+      { fencing_token: null },
+    ]) {
+      const faulted = new D1SagaAttemptStore(
+        new FaultDatabase(database, { operationStepChanges }),
+        digest,
+      )
+      await expect(faulted.accept(input)).rejects.toThrow(/persisted operation step/iu)
+    }
+    for (const operationStepChanges of [
+      { record_json: JSON.stringify({ ...record, lastAttemptId: "other-attempt" }) },
+      { record_json: JSON.stringify({ ...record, errorChecksum: "other-error" }) },
+      {
+        fencing_token: (operationRow.fencing_token as number) + 1,
+        record_json: JSON.stringify({
+          ...record,
+          fencingToken: (operationRow.fencing_token as number) + 1,
+        }),
+      },
+    ]) {
+      const faulted = new D1SagaAttemptStore(
+        new FaultDatabase(database, { operationStepChanges }),
+        digest,
+      )
+      await expect(faulted.accept(input)).rejects.toThrow(/operation ledger|ledgers disagree/u)
+    }
+
+    const causeRow = rawAttempt(database.database, run.actionAttemptId)
+    const corruptedCause: Record<string, unknown> = {
+      ...causeRow,
+      operation_id: "another-operation",
+    }
+    corruptedCause.acceptance_checksum = await acceptanceForRow(corruptedCause)
+    corruptedCause.outcome_checksum = await outcomeForRow(corruptedCause)
+    await expect(
+      new D1SagaAttemptStore(
+        new FaultDatabase(database, { attemptRow: corruptedCause }),
+        digest,
+      ).accept(input),
+    ).rejects.toThrow(/checksum-verified causal receipt/u)
+
+    const acceptedCause = {
+      ...causeRow,
+      completed_at_ms: null,
+      error_checksum: null,
+      error_json: null,
+      evidence_checksum: null,
+      evidence_json: null,
+      outcome_checksum: null,
+      state: null,
+    }
+    await expect(
+      new D1SagaAttemptStore(
+        new FaultDatabase(database, { attemptRow: acceptedCause }),
+        digest,
+      ).accept(input),
+    ).rejects.toThrow(/ledgers disagree/u)
+  })
+
+  it("binds an accepted-without-outcome recovery to the same receipt evidence in both ledgers", async () => {
+    const run = await fixture("observation-accepted-recovery")
+    const effect = await attempts.accept({
+      attemptId: run.actionAttemptId,
+      inputJson: run.actionInputJson,
+      phase: "forward",
+      proof: run.proof(),
+      purpose: "effect",
+      sagaId: run.sagaId,
+      sagaStepId: "a",
+    })
+    await run.recoverAcceptedUnknown(effect.acceptanceChecksum)
+
+    await expect(
+      attempts.accept({
+        attemptId: `${run.actionAttemptId}:observation`,
+        inputJson: JSON.stringify({ originalAttemptId: run.actionAttemptId }),
+        phase: "forward",
+        proof: run.proof(),
+        purpose: "observation",
+        sagaId: run.sagaId,
+        sagaStepId: "a",
+      }),
+    ).resolves.toMatchObject({
+      causalAttemptId: run.actionAttemptId,
+      purpose: "observation",
+      state: "accepted",
+    })
+  })
+
+  it("revalidates legacy accepted observations before allowing a terminal outcome", async () => {
+    const unknownRun = async (suffix: string) => {
+      const run = await fixture(suffix)
+      await attempts.accept({
+        attemptId: run.actionAttemptId,
+        inputJson: run.actionInputJson,
+        phase: "forward",
+        proof: run.proof(),
+        purpose: "effect",
+        sagaId: run.sagaId,
+        sagaStepId: "a",
+      })
+      const unknown = await attempts.complete({
+        attemptId: run.actionAttemptId,
+        errorJson: '{"dispatch":"unknown"}',
+        evidenceJson: '{"transport":"lost"}',
+        proof: run.proof(),
+        state: "unknown",
+      })
+      if (unknown.state !== "unknown") throw new Error("Expected an unknown effect receipt.")
+      await run.makeUnknown()
+      return run
+    }
+    const acceptObservation = async (run: Awaited<ReturnType<typeof unknownRun>>, suffix: string) =>
+      attempts.accept({
+        attemptId: `${run.actionAttemptId}:observation:${suffix}`,
+        inputJson: JSON.stringify({ originalAttemptId: run.actionAttemptId }),
+        phase: "forward",
+        proof: run.proof(),
+        purpose: "observation",
+        sagaId: run.sagaId,
+        sagaStepId: "a",
+      })
+    const markLegacy = (attemptId: string) => {
+      database.database
+        .prepare(
+          `UPDATE "nozzle_saga_action_attempt_protocols"
+           SET "protocol_version" = 1 WHERE "attempt_id" = ?`,
+        )
+        .run(attemptId)
+    }
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_protocol_update";')
+
+    const valid = await unknownRun("legacy-observation-valid")
+    const validObservation = await acceptObservation(valid, "valid")
+    markLegacy(validObservation.attemptId)
     await expect(
       attempts.complete({
-        attemptId: wrongObservationId,
-        errorJson: "{}",
-        evidenceJson: "{}",
-        proof: wrong.proof(),
-        state: "unknown",
+        attemptId: validObservation.attemptId,
+        evidenceJson: '{"lookup":"complete"}',
+        outputJson: '{"applied":true}',
+        proof: valid.proof(),
+        state: "confirmed",
       }),
-    ).rejects.toThrow(/incompatible/u)
+    ).resolves.toMatchObject({ protocolVersion: 1, state: "confirmed" })
+
+    const contradictory = await acceptObservation(valid, "contradictory")
+    markLegacy(contradictory.attemptId)
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_attempt_update";')
+    const contradictoryRow: Record<string, unknown> = {
+      ...rawAttempt(database.database, contradictory.attemptId),
+      action_key: "different-observation-action",
+    }
+    const contradictoryAcceptance = await acceptanceForRow(contradictoryRow)
+    database.database
+      .prepare(
+        `UPDATE "nozzle_saga_action_attempts"
+         SET "action_key" = ?, "acceptance_checksum" = ? WHERE "attempt_id" = ?`,
+      )
+      .run("different-observation-action", contradictoryAcceptance, contradictory.attemptId)
+    await expect(
+      attempts.complete({
+        attemptId: contradictory.attemptId,
+        evidenceJson: '{"lookup":"contradictory"}',
+        outputJson: '{"applied":true}',
+        proof: valid.proof(),
+        state: "confirmed",
+      }),
+    ).rejects.toThrow(/protocol-one saga receipt/u)
+
+    const stale = await unknownRun("legacy-observation-stale")
+    const winner = await acceptObservation(stale, "winner")
+    const staleObservation = await acceptObservation(stale, "stale")
+    markLegacy(staleObservation.attemptId)
+    await attempts.complete({
+      attemptId: winner.attemptId,
+      evidenceJson: '{"lookup":"complete"}',
+      outputJson: '{"applied":true}',
+      proof: stale.proof(),
+      state: "confirmed",
+    })
+    await stale.coordinator.settleObservationFromReceipt({
+      actorChecksum: "saga-attempt-actor",
+      attemptId: winner.attemptId,
+      operationId: stale.operationId,
+      phase: "forward",
+      proof: stale.proof(),
+      sagaId: stale.sagaId,
+      stepId: "a",
+    })
+    await expect(
+      attempts.complete({
+        attemptId: staleObservation.attemptId,
+        evidenceJson: '{"lookup":"late"}',
+        outputJson: '{"applied":true}',
+        proof: stale.proof(),
+        state: "confirmed",
+      }),
+    ).rejects.toThrow(/not eligible/u)
+  })
+
+  it("revalidates terminal protocol-one observations before first settlement", async () => {
+    const unknownRun = async (suffix: string) => {
+      const run = await fixture(suffix)
+      await attempts.accept({
+        attemptId: run.actionAttemptId,
+        inputJson: run.actionInputJson,
+        phase: "forward",
+        proof: run.proof(),
+        purpose: "effect",
+        sagaId: run.sagaId,
+        sagaStepId: "a",
+      })
+      const unknown = await attempts.complete({
+        attemptId: run.actionAttemptId,
+        errorJson: '{"dispatch":"unknown"}',
+        evidenceJson: '{"transport":"lost"}',
+        proof: run.proof(),
+        state: "unknown",
+      })
+      if (unknown.state !== "unknown") throw new Error("Expected an unknown effect receipt.")
+      await run.makeUnknown()
+      return run
+    }
+    const terminalObservation = async (
+      run: Awaited<ReturnType<typeof unknownRun>>,
+      suffix: string,
+    ) => {
+      const attemptId = `${run.actionAttemptId}:observation:${suffix}`
+      await attempts.accept({
+        attemptId,
+        inputJson: JSON.stringify({ originalAttemptId: run.actionAttemptId }),
+        phase: "forward",
+        proof: run.proof(),
+        purpose: "observation",
+        sagaId: run.sagaId,
+        sagaStepId: "a",
+      })
+      return attempts.complete({
+        attemptId,
+        evidenceJson: '{"lookup":"complete"}',
+        outputJson: '{"applied":true}',
+        proof: run.proof(),
+        state: "confirmed",
+      })
+    }
+    const markLegacy = (attemptId: string) => {
+      database.database
+        .prepare(
+          `UPDATE "nozzle_saga_action_attempt_protocols"
+           SET "protocol_version" = 1 WHERE "attempt_id" = ?`,
+        )
+        .run(attemptId)
+    }
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_protocol_update";')
+
+    const valid = await unknownRun("terminal-legacy-observation-valid")
+    const validReceipt = await terminalObservation(valid, "valid")
+    markLegacy(validReceipt.attemptId)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: validReceipt.attemptId,
+        proof: valid.proof(),
+        requireState: "terminal",
+      }),
+    ).resolves.toMatchObject({ protocolVersion: 1, state: "confirmed" })
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: validReceipt.attemptId,
+        proof: { ...valid.proof(), fencingToken: validReceipt.fencingToken - 1 },
+        requireState: "terminal",
+      }),
+    ).rejects.toThrow(/receipt lease or a strictly newer fence/u)
+
+    const weak = await unknownRun("terminal-legacy-observation-weak")
+    const weakReceipt = await terminalObservation(weak, "weak")
+    markLegacy(weakReceipt.attemptId)
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_attempt_update";')
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_outcome_update";')
+    const weakRow: Record<string, unknown> = {
+      ...rawAttempt(database.database, weakReceipt.attemptId),
+      action_key: "different-observation-action",
+    }
+    weakRow.acceptance_checksum = await acceptanceForRow(weakRow)
+    weakRow.outcome_checksum = await outcomeForRow(weakRow)
+    database.database
+      .prepare(
+        `UPDATE "nozzle_saga_action_attempts"
+         SET "action_key" = ?, "acceptance_checksum" = ? WHERE "attempt_id" = ?`,
+      )
+      .run(
+        weakRow.action_key as string,
+        weakRow.acceptance_checksum as string,
+        weakReceipt.attemptId,
+      )
+    database.database
+      .prepare(
+        `UPDATE "nozzle_saga_action_attempt_outcomes"
+         SET "outcome_checksum" = ? WHERE "attempt_id" = ?`,
+      )
+      .run(weakRow.outcome_checksum as string, weakReceipt.attemptId)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: weakReceipt.attemptId,
+        proof: weak.proof(),
+        requireState: "terminal",
+      }),
+    ).rejects.toThrow(/protocol-one saga receipt/u)
+
+    const stale = await unknownRun("terminal-legacy-observation-stale")
+    const winner = await terminalObservation(stale, "winner")
+    const staleReceipt = await terminalObservation(stale, "stale")
+    markLegacy(staleReceipt.attemptId)
+    await stale.coordinator.settleObservationFromReceipt({
+      actorChecksum: "saga-attempt-actor",
+      attemptId: winner.attemptId,
+      operationId: stale.operationId,
+      phase: "forward",
+      proof: stale.proof(),
+      sagaId: stale.sagaId,
+      stepId: "a",
+    })
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: staleReceipt.attemptId,
+        proof: stale.proof(),
+        requireState: "terminal",
+      }),
+    ).rejects.toThrow(/not eligible/u)
+
+    const invalid = await unknownRun("terminal-legacy-observation-invalid")
+    const invalidAttemptId = `${invalid.actionAttemptId}:observation:invalid`
+    await attempts.accept({
+      attemptId: invalidAttemptId,
+      inputJson: JSON.stringify({ originalAttemptId: invalid.actionAttemptId }),
+      phase: "forward",
+      proof: invalid.proof(),
+      purpose: "observation",
+      sagaId: invalid.sagaId,
+      sagaStepId: "a",
+    })
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: invalidAttemptId,
+        proof: invalid.proof(),
+        requireState: "accepted",
+      }),
+    ).rejects.toThrow(/requires an accepted effect receipt/u)
+    markLegacy(invalidAttemptId)
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_outcome_insert_v2";')
+    const invalidRow = rawAttempt(database.database, invalidAttemptId)
+    const evidenceJson = "{}"
+    const errorJson = '{"legacy":"failed"}'
+    const evidenceChecksum = await framedChecksum("nozzle.saga-action-evidence.v1", [evidenceJson])
+    const errorChecksum = await framedChecksum("nozzle.saga-action-error.v1", [errorJson])
+    const outcomeChecksum = await framedChecksum("nozzle.saga-action-outcome.v1", [
+      invalidRow.acceptance_checksum as string,
+      "failed",
+      evidenceChecksum,
+      evidenceJson,
+      errorChecksum,
+      errorJson,
+    ])
+    database.database
+      .prepare(
+        `INSERT INTO "nozzle_saga_action_attempt_outcomes"
+         ("attempt_id", "state", "evidence_checksum", "evidence_json", "output_checksum",
+          "output_json", "error_checksum", "error_json", "outcome_checksum", "completed_at_ms")
+         VALUES (?, 'failed', ?, ?, NULL, NULL, ?, ?, ?, ?)`,
+      )
+      .run(
+        invalidAttemptId,
+        evidenceChecksum,
+        evidenceJson,
+        errorChecksum,
+        errorJson,
+        outcomeChecksum,
+        invalidRow.accepted_at_ms as number,
+      )
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: invalidAttemptId,
+        proof: invalid.proof(),
+        requireState: "terminal",
+      }),
+    ).rejects.toThrow(/incompatible outcome/u)
   })
 
   it("binds compensation acceptance to the exact confirmed forward attempt", async () => {
@@ -695,31 +1293,13 @@ describe("D1SagaAttemptStore", () => {
       state: "confirmed",
     })
     if (forwardOutcome.state !== "confirmed") throw new Error("Expected confirmed forward.")
-    await operations.completeStep({
+    let saga = await run.coordinator.settleActionFromReceipt({
       actorChecksum: "saga-attempt-actor",
       attemptId: run.actionAttemptId,
-      observedPostconditionChecksum: `${run.operationId}:${run.actionStepId}:postcondition`,
       operationId: run.operationId,
-      proof: run.proof(),
-      resultChecksum: forwardOutcome.outcomeChecksum,
-      stepId: run.actionStepId,
-    })
-    let saga = await sagaStore.recordActionSuccess({
-      attemptId: run.actionAttemptId,
-      effect: run.context(
-        `${run.actionAttemptId}:success`,
-        run.actionStepId,
-        operationTransitionIdentity("succeeded", [
-          run.operationId,
-          run.actionStepId,
-          run.actionAttemptId,
-        ]),
-      ),
-      evidenceChecksum: forwardOutcome.outcomeChecksum,
       phase: "forward",
-      resultChecksum: forwardOutcome.outputChecksum,
+      proof: run.proof(),
       sagaId: run.sagaId,
-      serverTimeMs: 1_002,
       stepId: "a",
     })
 
@@ -788,7 +1368,7 @@ describe("D1SagaAttemptStore", () => {
         stepId: "a",
       })
     ).saga
-    const compensation = await attempts.accept({
+    const compensationInput = {
       attemptId: compensationAttemptId,
       inputJson: JSON.stringify({
         causalAttemptId: forward.attemptId,
@@ -799,16 +1379,187 @@ describe("D1SagaAttemptStore", () => {
       purpose: "effect",
       sagaId: run.sagaId,
       sagaStepId: "a",
-    })
+    } as const
+    await expect(
+      new D1SagaAttemptStore(new FaultDatabase(database, { attemptRow: null }), digest).accept(
+        compensationInput,
+      ),
+    ).rejects.toThrow(/exact confirmed forward receipt/u)
+    const compensation = await attempts.accept(compensationInput)
     expect(compensation).toMatchObject({
       causalAttemptId: forward.attemptId,
       phase: "compensation",
       state: "accepted",
     })
+    const terminalCompensation = await attempts.complete({
+      attemptId: compensationAttemptId,
+      evidenceJson: '{"dispatch":"confirmed"}',
+      outputJson: '{"compensated":true}',
+      proof: run.proof(),
+      state: "confirmed",
+    })
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_protocol_update";')
+    database.database
+      .prepare(
+        `UPDATE "nozzle_saga_action_attempt_protocols"
+         SET "protocol_version" = 1 WHERE "attempt_id" = ?`,
+      )
+      .run(compensationAttemptId)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: compensationAttemptId,
+        proof: run.proof(),
+        requireState: "terminal",
+      }),
+    ).resolves.toMatchObject({ protocolVersion: 1, state: terminalCompensation.state })
+
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_outcome_update";')
+    const changedOutputJson = '{"created":false}'
+    const changedOutputChecksum = await framedChecksum("nozzle.saga-action-output.v1", [
+      changedOutputJson,
+    ])
+    const changedForwardRow: Record<string, unknown> = {
+      ...rawAttempt(database.database, forward.attemptId),
+      output_checksum: changedOutputChecksum,
+      output_json: changedOutputJson,
+    }
+    changedForwardRow.outcome_checksum = await outcomeForRow(changedForwardRow)
+    database.database
+      .prepare(
+        `UPDATE "nozzle_saga_action_attempt_outcomes"
+         SET "output_checksum" = ?, "output_json" = ?, "outcome_checksum" = ?
+         WHERE "attempt_id" = ?`,
+      )
+      .run(
+        changedOutputChecksum,
+        changedOutputJson,
+        changedForwardRow.outcome_checksum as string,
+        forward.attemptId,
+      )
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: compensationAttemptId,
+        proof: run.proof(),
+        requireState: "terminal",
+      }),
+    ).rejects.toThrow(/exact confirmed forward receipt/u)
+  })
+
+  it("validates accepted effects for crash recovery separately from terminal settlement", async () => {
+    const run = await fixture("settlement-terminal")
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: "missing-attempt",
+        proof: run.proof(),
+        requireState: "terminal",
+      }),
+    ).rejects.toThrow(/never accepted/u)
+    await attempts.accept({
+      attemptId: run.actionAttemptId,
+      inputJson: run.actionInputJson,
+      phase: "forward",
+      proof: run.proof(),
+      purpose: "effect",
+      sagaId: run.sagaId,
+      sagaStepId: "a",
+    })
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: run.proof(),
+        requireState: "accepted",
+      }),
+    ).rejects.toThrow(/strictly newer fence/u)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: run.proof(),
+        requireState: "terminal",
+      }),
+    ).rejects.toThrow(/not terminal/u)
+    const originalProof = run.proof()
+    await leases.release({ proof: originalProof })
+    const acquired = await leases.acquire({
+      acquisitionId: `${run.sagaId}:recovery-validation-acquisition`,
+      holderId: `${run.sagaId}:recovery-validation-controller`,
+      leaseKey: originalProof.leaseKey,
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("Saga recovery validation lease failed.")
+    const recoveryProof = leaseProof(acquired.record)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: recoveryProof,
+        requireState: "accepted",
+      }),
+    ).resolves.toMatchObject({ protocolVersion: 2, state: "accepted" })
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: { ...recoveryProof, leaseKey: "different-lease" },
+        requireState: "accepted",
+      }),
+    ).rejects.toThrow(/same lease/u)
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_protocol_update";')
+    database.database
+      .prepare(
+        `UPDATE "nozzle_saga_action_attempt_protocols"
+         SET "protocol_version" = 1 WHERE "attempt_id" = ?`,
+      )
+      .run(run.actionAttemptId)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: recoveryProof,
+        requireState: "accepted",
+      }),
+    ).resolves.toMatchObject({ protocolVersion: 1, state: "accepted" })
+
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_attempt_update";')
+    const changedInputJson = '{"different":true}'
+    const changedInputChecksum = await framedChecksum("nozzle.saga-action-input.v1", [
+      changedInputJson,
+    ])
+    const changedAttemptRow: Record<string, unknown> = {
+      ...rawAttempt(database.database, run.actionAttemptId),
+      input_checksum: changedInputChecksum,
+      input_json: changedInputJson,
+    }
+    changedAttemptRow.acceptance_checksum = await acceptanceForRow(changedAttemptRow)
+    database.database
+      .prepare(
+        `UPDATE "nozzle_saga_action_attempts"
+         SET "input_checksum" = ?, "input_json" = ?, "acceptance_checksum" = ?
+         WHERE "attempt_id" = ?`,
+      )
+      .run(
+        changedInputChecksum,
+        changedInputJson,
+        changedAttemptRow.acceptance_checksum as string,
+        run.actionAttemptId,
+      )
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: recoveryProof,
+        requireState: "accepted",
+      }),
+    ).rejects.toThrow(/protocol-one saga receipt/u)
+    await expect(
+      attempts.validateProjectionReceipt({
+        attemptId: run.actionAttemptId,
+        proof: recoveryProof,
+        requireState: "invalid" as never,
+      }),
+    ).rejects.toThrow(/state requirement is invalid/u)
   })
 
   it("validates receipt inputs and fails closed before an ineligible dispatch", async () => {
     expect(() => new D1SagaAttemptStore(null as never, digest)).toThrow(/binding is required/u)
+    expect(
+      () => new D1SagaAttemptStore({ prepare: database.prepare.bind(database) } as never, digest),
+    ).toThrow(/binding is required/u)
     expect(() => new D1SagaAttemptStore(database, null as never)).toThrow(/digest/u)
     await expect(sagaActionInputChecksum("{}", null as never)).rejects.toThrow(/digest/u)
     await expect(sagaActionInputChecksum("{}", async () => "")).rejects.toThrow(/non-empty/u)
@@ -852,21 +1603,68 @@ describe("D1SagaAttemptStore", () => {
 
     const missing = { ...base, attemptId: "missing", sagaId: "missing-saga" }
     await expect(attempts.accept(missing)).rejects.toThrow(/saga does not exist/u)
-    for (const [sagaRow, message] of [
-      [{ operation_id: null, record_json: "{}" }, /binding is malformed/u],
-      [{ operation_id: run.operationId, record_json: null }, /binding is malformed/u],
-      [{ operation_id: run.operationId, record_json: "{" }, /not valid JSON/u],
-      [
-        {
-          operation_id: run.operationId,
-          record_json: ` ${JSON.stringify(run.saga())}`,
-        },
-        /not canonical/u,
-      ],
+    await expect(
+      new D1SagaAttemptStore(
+        new FaultDatabase(database, { sagaProjectionMissing: true }),
+        digest,
+      ).accept(base),
+    ).rejects.toThrow(/projection disappeared/u)
+    await expect(
+      new D1SagaAttemptStore(
+        new FaultDatabase(database, { operationProjectionMissing: true }),
+        digest,
+      ).accept(base),
+    ).rejects.toThrow(/operation projection is missing/u)
+    await expect(
+      new D1SagaAttemptStore(
+        new FaultDatabase(database, { sagaBindingRow: { operation_id: null } }),
+        digest,
+      ).accept(base),
+    ).rejects.toThrow(/binding is malformed/u)
+    for (const [sagaProjectionChanges, message] of [
+      [{ record_checksum: "wrong" }, /canonical record/u],
+      [{ effect_record_checksum: "wrong" }, /operation-effect receipt/u],
     ] as const) {
-      const faulted = new D1SagaAttemptStore(new FaultDatabase(database, { sagaRow }), digest)
+      const faulted = new D1SagaAttemptStore(
+        new FaultDatabase(database, { sagaProjectionChanges }),
+        digest,
+      )
       await expect(faulted.accept(base)).rejects.toThrow(message)
     }
+
+    const wrongProtocol = await fixture("validation-wrong-protocol", undefined, "opaque")
+    await expect(
+      attempts.accept({
+        attemptId: wrongProtocol.actionAttemptId,
+        inputJson: wrongProtocol.actionInputJson,
+        phase: "forward",
+        proof: wrongProtocol.proof(),
+        purpose: "effect",
+        sagaId: wrongProtocol.sagaId,
+        sagaStepId: "a",
+      }),
+    ).rejects.toThrow(/exact generic operation binding/u)
+
+    const operationRow = database.database
+      .prepare(
+        `SELECT "record_json" FROM "nozzle_operation_steps"
+         WHERE "operation_id" = ? AND "step_id" = ?`,
+      )
+      .get(run.operationId, run.actionStepId) as { record_json: string }
+    const operationRecord = JSON.parse(operationRow.record_json) as Record<string, unknown>
+    const activeMismatch = new D1SagaAttemptStore(
+      new FaultDatabase(database, {
+        operationStepChanges: {
+          record_json: JSON.stringify({
+            ...operationRecord,
+            activeAttemptId: "another-active-attempt",
+            lastAttemptId: "another-active-attempt",
+          }),
+        },
+      }),
+      digest,
+    )
+    await expect(activeMismatch.accept(base)).rejects.toThrow(/active attempt/u)
 
     await expect(
       attempts.complete({
@@ -905,6 +1703,11 @@ describe("D1SagaAttemptStore", () => {
       [{ causal_attempt_id: run.actionAttemptId }, /causal identity is malformed/u],
       [{ causal_attempt_id: "unexpected" }, /causal identity is malformed/u],
       [{ phase: "other" }, /identity is malformed/u],
+      [{ protocol_version: 3 }, /identity is malformed/u],
+      [
+        { protocol_classified_at_ms: (acceptedRow.accepted_at_ms as number) + 1 },
+        /identity is malformed/u,
+      ],
       [{ input_json: null }, /action input is malformed/u],
       [{ input_json: "{" }, /action input is not valid JSON/u],
       [{ input_json: ` ${acceptedRow.input_json as string}` }, /action input is not canonical/u],
@@ -960,7 +1763,7 @@ describe("D1SagaAttemptStore", () => {
     }
     const malformed = new D1SagaAttemptStore(
       new FaultDatabase(database, {
-        runResult: { meta: { changes: 2 }, success: true },
+        runResult: { meta: { changes: 3 }, success: true },
       }),
       digest,
     )
@@ -990,6 +1793,14 @@ describe("D1SagaAttemptStore", () => {
     await expect(contradictoryAccept.accept(acceptInput)).rejects.toThrow(
       /contradictory immutable input/u,
     )
+    const legacyAccept = new D1SagaAttemptStore(
+      new FaultDatabase(database, {
+        attemptRow: { ...acceptedRow, protocol_version: 1 },
+        runResult: { meta: { changes: 0 }, success: true },
+      }),
+      digest,
+    )
+    await expect(legacyAccept.accept(acceptInput)).rejects.toThrow(/contradictory immutable input/u)
 
     await expect(
       attempts.complete({

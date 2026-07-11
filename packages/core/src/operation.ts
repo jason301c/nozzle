@@ -1361,6 +1361,7 @@ function recoverRunningStepAfterCrash(
   operation: OperationRecord,
   stepId: string,
   state: "retryable_failed" | "unknown",
+  errorChecksum?: string,
 ): OperationRecord {
   const record = getStepRecord(operation, stepId)
   if (record.state !== "running") {
@@ -1374,6 +1375,7 @@ function recoverRunningStepAfterCrash(
       ? { authorizationChecksum: record.authorizationChecksum }
       : {}),
     costCounters: record.costCounters,
+    ...(errorChecksum === undefined ? {} : { errorChecksum }),
     fencingToken: record.fencingToken,
     lastAttemptId: record.lastAttemptId,
     progressCounters: record.progressCounters,
@@ -1401,8 +1403,12 @@ export function markRunningStepNotDispatchedAfterCrash(
 export function markRunningStepUnknownAfterCrash(
   operation: OperationRecord,
   stepId: string,
+  errorChecksum?: string,
 ): OperationRecord {
-  return recoverRunningStepAfterCrash(operation, stepId, "unknown")
+  if (errorChecksum !== undefined) {
+    assertWellFormedString(errorChecksum, "Crash-recovery error checksum")
+  }
+  return recoverRunningStepAfterCrash(operation, stepId, "unknown", errorChecksum)
 }
 
 export function markRunningStepsUnknownAfterCrash(operation: OperationRecord): OperationRecord {
@@ -1411,6 +1417,30 @@ export function markRunningStepsUnknownAfterCrash(operation: OperationRecord): O
     if (record.state === "running") next = markRunningStepUnknownAfterCrash(next, stepId)
   }
   return next
+}
+
+function reconciledStepRecord(
+  record: OperationStepRecord,
+  fencingToken: number,
+  lastAttemptId: string,
+  counters: CounterDeltas | undefined,
+  evidenceChecksum: string,
+  state: OperationStepState,
+  resultChecksum?: string,
+): OperationStepRecord {
+  return Object.freeze({
+    ...(record.authorizationChecksum
+      ? { authorizationChecksum: record.authorizationChecksum }
+      : {}),
+    ...withCounterDeltas(record, counters),
+    ...(record.errorChecksum ? { errorChecksum: record.errorChecksum } : {}),
+    fencingToken,
+    lastAttemptId,
+    reconciliationEvidenceChecksum: evidenceChecksum,
+    ...(resultChecksum ? { resultChecksum } : {}),
+    startedAttempts: record.startedAttempts,
+    state,
+  })
 }
 
 export function recordStepReconciliation(
@@ -1455,20 +1485,60 @@ export function recordStepReconciliation(
     state = "retryable_failed"
   }
 
-  const next: OperationStepRecord = Object.freeze({
-    ...(record.authorizationChecksum
-      ? { authorizationChecksum: record.authorizationChecksum }
-      : {}),
-    ...withCounterDeltas(record, input.counters),
-    ...(record.errorChecksum ? { errorChecksum: record.errorChecksum } : {}),
-    fencingToken: record.fencingToken,
-    lastAttemptId: record.lastAttemptId,
-    reconciliationEvidenceChecksum: input.evidenceChecksum,
-    ...(resultChecksum ? { resultChecksum } : {}),
-    startedAttempts: record.startedAttempts,
+  const next = reconciledStepRecord(
+    record,
+    record.fencingToken,
+    record.lastAttemptId,
+    input.counters,
+    input.evidenceChecksum,
     state,
-  })
+    resultChecksum,
+  )
   return updateStep(operation, input.stepId, next)
+}
+
+/**
+ * Records terminal non-application for a saga-receipt step. Generic success means the receipt was
+ * classified; the coupled saga projection remains the authority for the business outcome.
+ */
+export function recordSagaStepTerminalClassification(
+  operation: OperationRecord,
+  input: {
+    readonly counters?: CounterDeltas
+    readonly outcome: "not_applied"
+    readonly receiptOutcomeChecksum: string
+    readonly stepId: string
+  },
+): OperationRecord {
+  const planStep = getPlanStep(operation, input.stepId)
+  if (planStep.effectProtocol !== "saga_receipt") {
+    configurationError("Terminal saga classification requires a saga-receipt step.")
+  }
+  const record = getStepRecord(operation, input.stepId)
+  if (record.state !== "unknown") {
+    resumeError("Only an unknown saga step can receive terminal classification.")
+  }
+  if (!record.fencingToken || !record.lastAttemptId) {
+    interventionError("The unknown saga step has incomplete classification metadata.")
+  }
+  if (input.outcome !== "not_applied") {
+    configurationError("Terminal saga classification outcome is invalid.")
+  }
+  assertWellFormedString(input.receiptOutcomeChecksum, "Terminal saga receipt-outcome checksum")
+
+  return updateStep(
+    operation,
+    input.stepId,
+    reconciledStepRecord(
+      record,
+      record.fencingToken,
+      record.lastAttemptId,
+      input.counters,
+      input.receiptOutcomeChecksum,
+      "succeeded",
+      input.receiptOutcomeChecksum,
+    ),
+  )
 }
 
 function auditChecksumValues(event: Omit<AuditEvent, "eventHash">): readonly string[] {
