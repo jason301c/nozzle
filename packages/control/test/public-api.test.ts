@@ -10,11 +10,14 @@ describe("@nozzle/control public API", () => {
     expect(exports).not.toHaveProperty("SAGA_ATTEMPT_ROW_SELECT")
     for (const internal of [
       "acceptedSagaAttemptRecord",
+      "D1SagaHistoryReader",
       "loadSagaAttemptIdentityRow",
       "loadSagaAttemptOutcomeRow",
       "SAGA_ATTEMPT_IDENTITY_ROW_SELECT",
       "SAGA_ATTEMPT_OUTCOME_ROW_SELECT",
       "SAGA_ATTEMPT_PAYLOAD_ROW_SELECT",
+      "SAGA_HISTORY_PAGE_MAX_BYTES",
+      "SAGA_HISTORY_PAGE_ROW_LIMIT",
       "SAGA_OUTCOME_ERROR_REFERENCE_JSON",
       "SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON",
       "SAGA_OUTCOME_OUTPUT_REFERENCE_JSON",
