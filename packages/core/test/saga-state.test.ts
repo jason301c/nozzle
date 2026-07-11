@@ -10,6 +10,7 @@ import {
   beginSagaAction,
   createSagaRecord,
   loadSagaRecord,
+  mapSagaSettlementOutcome,
   markRunningSagaActionUnknown,
   markSagaActionNotDispatched,
   nextSagaCommand,
@@ -130,6 +131,7 @@ async function expectAsyncCode(promise: Promise<unknown>, code: string): Promise
 }
 
 type MutableRecord = Record<string, unknown>
+type SagaCreationInput = Parameters<typeof createSagaRecord>[0]
 
 function mutableRecord(value: unknown): MutableRecord {
   return value as MutableRecord
@@ -146,6 +148,184 @@ function mutableAction(
 ): MutableRecord {
   return mutableRecord(mutableStep(candidate, stepId)[phase])
 }
+
+async function terminalSagaRecords(): Promise<readonly SagaRecord[]> {
+  let succeeded = await saga([descriptorStep("a")])
+  succeeded = execute(succeeded, "a", "forward", "a-1", 1_000)
+  succeeded = succeed(succeeded, "a", "forward", "a-1", 1_001)
+
+  const cancelled = requestSagaTermination(await saga([descriptorStep("a")]), {
+    cause: "cancellation",
+    serverTimeMs: 1_001,
+  })
+  const timedOut = requestSagaTermination(await saga([descriptorStep("a")]), {
+    cause: "timeout",
+    serverTimeMs: 10_000,
+  })
+
+  let failed = await saga([descriptorStep("a", { maxAttempts: 1 })])
+  failed = execute(failed, "a", "forward", "failed-a-1", 1_000)
+  failed = recordSagaActionFailure(failed, {
+    attemptId: "failed-a-1",
+    errorChecksum: "terminal-failure",
+    outcome: "definitely_not_applied_terminal",
+    phase: "forward",
+    serverTimeMs: 1_001,
+    stepId: "a",
+  })
+
+  let interventionRequired = await saga([irreversibleStep("commit")])
+  interventionRequired = execute(interventionRequired, "commit", "forward", "commit-1", 1_000)
+  interventionRequired = requestSagaTermination(interventionRequired, {
+    cause: "cancellation",
+    serverTimeMs: 1_001,
+  })
+  interventionRequired = succeed(interventionRequired, "commit", "forward", "commit-1", 1_002)
+
+  return Object.freeze([succeeded, failed, cancelled, timedOut, interventionRequired])
+}
+
+describe("terminal saga settlement outcomes", () => {
+  it("maps and round trips every terminal domain outcome without changing its meaning", async () => {
+    const records = await terminalSagaRecords()
+    const expectedOutcomes = [
+      "succeeded",
+      "failed",
+      "failed",
+      "failed",
+      "intervention_required",
+    ] as const
+
+    for (const [index, record] of records.entries()) {
+      const before = structuredClone(record)
+      expect(mapSagaSettlementOutcome(record)).toBe(expectedOutcomes[index])
+      expect(record).toEqual(before)
+      expect(nextSagaCommand(record, 0)).toEqual({
+        kind: "terminal",
+        status: record.status,
+      })
+
+      const serialized = structuredClone(record)
+      expect(mapSagaSettlementOutcome(serialized)).toBe(expectedOutcomes[index])
+      const loaded = await loadSagaRecord(serialized, digest)
+      expect(loaded).toEqual(record)
+      expect(Object.isFrozen(loaded)).toBe(true)
+      expect(Object.isFrozen(loaded.steps)).toBe(true)
+      expect(mapSagaSettlementOutcome(loaded)).toBe(expectedOutcomes[index])
+      expect(mapSagaSettlementOutcome(serialized)).toBe(expectedOutcomes[index])
+    }
+  })
+
+  it("rejects every nonterminal, contradictory, and malformed projection", async () => {
+    const planned = await saga([descriptorStep("a"), descriptorStep("b")])
+    const running = execute(planned, "a", "forward", "a-1", 1_000)
+    let compensating = succeed(running, "a", "forward", "a-1", 1_001)
+    compensating = requestSagaTermination(compensating, {
+      cause: "cancellation",
+      serverTimeMs: 1_002,
+    })
+    expect(planned.status).toBe("planned")
+    expect(running.status).toBe("running")
+    expect(compensating.status).toBe("compensating")
+
+    for (const record of [planned, running, compensating]) {
+      expectCode(() => mapSagaSettlementOutcome(record), "OperationResumeRequiredError")
+    }
+
+    const succeeded = (await terminalSagaRecords())[0] as SagaRecord
+    const structuralClone = Object.freeze({ ...succeeded })
+    expect(mapSagaSettlementOutcome(structuralClone)).toBe("succeeded")
+    expectCode(
+      () => mapSagaSettlementOutcome({ ...succeeded, status: "failed" }),
+      "OperationInterventionRequiredError",
+    )
+    expect(() =>
+      mapSagaSettlementOutcome({ ...succeeded, steps: null } as unknown as SagaRecord),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "OperationInterventionRequiredError",
+        message: "Saga settlement projection is malformed.",
+      }),
+    )
+    for (const record of [
+      {
+        ...succeeded,
+        status: "failed",
+        terminationCause: "unsupported",
+        terminationRequestedAtMs: 1,
+      },
+      { ...succeeded, terminationCause: "cancellation", terminationRequestedAtMs: null },
+      { ...succeeded, terminationCause: null, terminationRequestedAtMs: 1 },
+      { ...succeeded, terminationCause: "timeout", terminationRequestedAtMs: -1 },
+      { ...succeeded, terminationCause: "timeout", terminationRequestedAtMs: "invalid" },
+    ]) {
+      expectCode(
+        () => mapSagaSettlementOutcome(record as unknown as SagaRecord),
+        "OperationInterventionRequiredError",
+      )
+    }
+
+    let causeReads = 0
+    const switchingCause = { ...succeeded }
+    Object.defineProperty(switchingCause, "terminationCause", {
+      enumerable: true,
+      get() {
+        causeReads += 1
+        return causeReads === 1 ? null : "unsupported"
+      },
+    })
+    expect(mapSagaSettlementOutcome(switchingCause)).toBe("succeeded")
+    expect(causeReads).toBe(1)
+    expectCode(
+      () => mapSagaSettlementOutcome(new Proxy(succeeded, {})),
+      "OperationInterventionRequiredError",
+    )
+  })
+
+  it("keeps outcome mapping independent from persistence and history authority", async () => {
+    const planned = await saga([descriptorStep("a")])
+    const serialized = structuredClone(planned)
+    const structuralTerminal = requestSagaTermination(serialized, {
+      cause: "cancellation",
+      serverTimeMs: 1_001,
+    })
+    expect(structuralTerminal.status).toBe("cancelled")
+    expect(mapSagaSettlementOutcome(structuralTerminal)).toBe("failed")
+
+    const loaded = await loadSagaRecord(serialized, digest)
+    const loadedTerminal = requestSagaTermination(loaded, {
+      cause: "cancellation",
+      serverTimeMs: 1_001,
+    })
+    expect(mapSagaSettlementOutcome(loadedTerminal)).toBe("failed")
+    expectCode(() => mapSagaSettlementOutcome(serialized), "OperationResumeRequiredError")
+  })
+
+  it("is independent of arbitrary persisted terminal versions", async () => {
+    const records = await terminalSagaRecords()
+    await fc.assert(
+      fc.asyncProperty(
+        fc.constantFrom(...records),
+        fc.integer({ min: 1, max: Number.MAX_SAFE_INTEGER - 1 }),
+        async (record, stateVersion) => {
+          const versioned = Object.freeze({ ...record, stateVersion })
+          expect(mapSagaSettlementOutcome(versioned)).toBe(mapSagaSettlementOutcome(record))
+          expect(versioned.stateVersion).toBe(stateVersion)
+          expect(versioned.steps).toBe(record.steps)
+          expect(versioned.descriptor).toBe(record.descriptor)
+          expect(sagaCommitment(versioned)).toBe(sagaCommitment(record))
+          expect(Object.isFrozen(versioned)).toBe(true)
+
+          const loaded = await loadSagaRecord(structuredClone(versioned), digest)
+          expect(loaded).toEqual(versioned)
+          expect(mapSagaSettlementOutcome(loaded)).toBe(mapSagaSettlementOutcome(record))
+          expect(mapSagaSettlementOutcome(versioned)).toBe(mapSagaSettlementOutcome(record))
+        },
+      ),
+      { numRuns: 100 },
+    )
+  })
+})
 
 describe("serial saga state machine", () => {
   it("executes forwards in sealed order and reports commitment honestly", async () => {
@@ -448,6 +628,95 @@ describe("serial saga state machine", () => {
     ).toMatchObject({ disposition: "replay_failure", errorChecksum: "retry" })
   })
 
+  it("round trips an epoch retry with a sealed zero delay", async () => {
+    const step = descriptorStep("a", {
+      baseRetryDelayMs: 0,
+      maxAttempts: 2,
+      maxRetryDelayMs: 0,
+    })
+    const descriptor = await sealSagaDescriptor(
+      { descriptorId: "epoch-retry", steps: [step], version: 1 },
+      digest,
+    )
+    let record = createSagaRecord({
+      deadlineAtMs: 100,
+      descriptor,
+      idempotencyKey: "epoch-retry-request",
+      inputChecksum: "epoch-retry-input",
+      sagaId: "epoch-retry-saga",
+      serverTimeMs: 0,
+      stepInputChecksums: { a: "epoch-retry-step-input" },
+    })
+    record = execute(record, "a", "forward", "epoch-attempt", 0)
+    record = recordSagaActionFailure(record, {
+      attemptId: "epoch-attempt",
+      errorChecksum: "not-applied",
+      outcome: "definitely_not_applied_retryable",
+      phase: "forward",
+      serverTimeMs: 0,
+      stepId: "a",
+    })
+
+    expect(record.steps.a?.forward.nextAttemptAtMs).toBe(0)
+    expect(nextSagaCommand(record, 0)).toMatchObject({ kind: "execute", stepId: "a" })
+
+    const loaded = await loadSagaRecord(structuredClone(record), digest)
+    expect(loaded).toEqual(record)
+    expect(loaded.steps.a?.forward.nextAttemptAtMs).toBe(0)
+    expect(nextSagaCommand(loaded, 0)).toMatchObject({ kind: "execute", stepId: "a" })
+  })
+
+  it("rejects version overflow while preserving every safe boundary increment", async () => {
+    const initial = await saga([descriptorStep("a")])
+    const command = nextSagaCommand(initial, 1_000)
+    if (command.kind !== "execute") throw new Error("expected execute")
+
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({
+          min: Number.MAX_SAFE_INTEGER - 100,
+          max: Number.MAX_SAFE_INTEGER - 1,
+        }),
+        async (stateVersion) => {
+          const projection = mutableRecord(structuredClone(initial))
+          projection.stateVersion = stateVersion
+          projection.status = "running"
+          const loaded = await loadSagaRecord(projection, digest)
+          const begin = () =>
+            beginSagaAction(loaded, {
+              attemptId: "boundary-attempt",
+              idempotencyKey: command.idempotencyKey,
+              phase: "forward",
+              serverTimeMs: 1_000,
+              stepId: "a",
+            })
+
+          const decision = begin()
+          expect(decision.disposition).toBe("execute")
+          expect(decision.saga.stateVersion).toBe(stateVersion + 1)
+          expect(Number.isSafeInteger(decision.saga.stateVersion)).toBe(true)
+        },
+      ),
+      { numRuns: 100 },
+    )
+
+    const exhaustedProjection = mutableRecord(structuredClone(initial))
+    exhaustedProjection.stateVersion = Number.MAX_SAFE_INTEGER
+    exhaustedProjection.status = "running"
+    const exhausted = await loadSagaRecord(exhaustedProjection, digest)
+    expectCode(
+      () =>
+        beginSagaAction(exhausted, {
+          attemptId: "overflow-attempt",
+          idempotencyKey: command.idempotencyKey,
+          phase: "forward",
+          serverTimeMs: 1_000,
+          stepId: "a",
+        }),
+      "OperationInterventionRequiredError",
+    )
+  })
+
   it("distinguishes accepted unknown actions from proven non-dispatch", async () => {
     let record = await saga([descriptorStep("a", { maxAttempts: 2 })])
     record = execute(record, "a", "forward", "a-1", 1_000)
@@ -482,6 +751,163 @@ describe("serial saga state machine", () => {
       stepId: "a",
     })
     expect(terminal.status).toBe("failed")
+  })
+
+  it("captures changing creation accessors once and preserves the trusted descriptor", async () => {
+    const steps = [descriptorStep("a"), descriptorStep("b")]
+    const descriptor = await sealSagaDescriptor(
+      { descriptorId: "captured-creation", steps, version: 1 },
+      digest,
+    )
+    const stable: SagaCreationInput = {
+      deadlineAtMs: 10_000,
+      descriptor,
+      idempotencyKey: "captured-request",
+      inputChecksum: "captured-input",
+      sagaId: "captured-saga",
+      serverTimeMs: 1_000,
+      stepInputChecksums: { a: "captured-a", b: "captured-b" },
+    }
+    const changed: { readonly [Key in keyof SagaCreationInput]: unknown } = {
+      deadlineAtMs: -1,
+      descriptor: structuredClone(descriptor),
+      idempotencyKey: "",
+      inputChecksum: "",
+      sagaId: "",
+      serverTimeMs: -1,
+      stepInputChecksums: [],
+    }
+    const reads: Record<string, number> = {}
+    const changingInput: MutableRecord = {}
+    for (const key of Object.keys(stable) as readonly (keyof SagaCreationInput)[]) {
+      Object.defineProperty(changingInput, key, {
+        enumerable: true,
+        get() {
+          const count = (reads[key] ?? 0) + 1
+          reads[key] = count
+          return count === 1 ? stable[key] : changed[key]
+        },
+      })
+    }
+
+    const created = createSagaRecord(changingInput as unknown as SagaCreationInput)
+    expect(reads).toEqual({
+      deadlineAtMs: 1,
+      descriptor: 1,
+      idempotencyKey: 1,
+      inputChecksum: 1,
+      sagaId: 1,
+      serverTimeMs: 1,
+      stepInputChecksums: 1,
+    })
+    expect(created).toMatchObject({
+      deadlineAtMs: 10_000,
+      idempotencyKey: "captured-request",
+      inputChecksum: "captured-input",
+      sagaId: "captured-saga",
+      steps: {
+        a: { inputChecksum: "captured-a" },
+        b: { inputChecksum: "captured-b" },
+      },
+    })
+    expect(created.descriptor).toBe(descriptor)
+
+    const loaded = await loadSagaRecord(structuredClone(created), digest)
+    expect(loaded).toEqual(created)
+    expect(loaded.descriptor).not.toBe(created.descriptor)
+  })
+
+  it("owns a mutating step-checksum map before validating creation", async () => {
+    const steps = [descriptorStep("a"), descriptorStep("b")]
+    const descriptor = await sealSagaDescriptor(
+      { descriptorId: "owned-creation", steps, version: 1 },
+      digest,
+    )
+    const values: Record<string, string> = { a: "owned-a", b: "owned-b" }
+    const reads: Record<string, number> = { a: 0, b: 0 }
+    const changingChecksums: MutableRecord = {}
+    for (const stepId of ["a", "b"] as const) {
+      Object.defineProperty(changingChecksums, stepId, {
+        enumerable: true,
+        get() {
+          reads[stepId] = (reads[stepId] ?? 0) + 1
+          const current = values[stepId] as string
+          values[stepId] = `mutated-${stepId}`
+          return current
+        },
+      })
+    }
+
+    const created = createSagaRecord({
+      deadlineAtMs: 10_000,
+      descriptor,
+      idempotencyKey: "owned-request",
+      inputChecksum: "owned-input",
+      sagaId: "owned-saga",
+      serverTimeMs: 1_000,
+      stepInputChecksums: changingChecksums as Readonly<Record<string, string>>,
+    })
+    expect(reads).toEqual({ a: 1, b: 1 })
+    expect(values).toEqual({ a: "mutated-a", b: "mutated-b" })
+    expect(created.steps.a?.inputChecksum).toBe("owned-a")
+    expect(created.steps.b?.inputChecksum).toBe("owned-b")
+
+    values.a = "changed-after-creation"
+    values.b = "changed-after-creation"
+    expect(created.steps.a?.inputChecksum).toBe("owned-a")
+    expect(created.steps.b?.inputChecksum).toBe("owned-b")
+    expect(await loadSagaRecord(structuredClone(created), digest)).toEqual(created)
+  })
+
+  it("normalizes creation getter, proxy, and clone failures", async () => {
+    const descriptor = await sealSagaDescriptor(
+      { descriptorId: "capture-failures", steps: [descriptorStep("a")], version: 1 },
+      digest,
+    )
+    const valid: SagaCreationInput = {
+      deadlineAtMs: 10_000,
+      descriptor,
+      idempotencyKey: "capture-failure-request",
+      inputChecksum: "capture-failure-input",
+      sagaId: "capture-failure-saga",
+      serverTimeMs: 1_000,
+      stepInputChecksums: { a: "capture-failure-a" },
+    }
+    const throwingGetter = { ...valid }
+    Object.defineProperty(throwingGetter, "sagaId", {
+      enumerable: true,
+      get() {
+        throw new Error("getter-specific detail")
+      },
+    })
+    const throwingProxy = new Proxy(valid, {
+      get(target, property, receiver) {
+        if (property === "inputChecksum") throw new Error("proxy-specific detail")
+        return Reflect.get(target, property, receiver)
+      },
+    })
+    const proxiedChecksums = {
+      ...valid,
+      stepInputChecksums: new Proxy({ a: "capture-failure-a" }, {}),
+    }
+    const uncloneableChecksums = {
+      ...valid,
+      stepInputChecksums: { a: () => "capture-failure-a" },
+    }
+
+    for (const candidate of [
+      throwingGetter,
+      throwingProxy,
+      proxiedChecksums,
+      uncloneableChecksums,
+    ]) {
+      expect(() => createSagaRecord(candidate as SagaCreationInput)).toThrowError(
+        expect.objectContaining({
+          code: "ConfigurationError",
+          message: "Saga creation input could not be captured safely.",
+        }),
+      )
+    }
   })
 
   it("rejects malformed creation, nonserial commands, and contradictory outcomes", async () => {
@@ -1146,18 +1572,9 @@ describe("serial saga state machine", () => {
       "OperationInterventionRequiredError",
     )
 
-    let duplicateAttempt = succeed(running, "a", "forward", "a-1", 1_001)
-    duplicateAttempt = execute(duplicateAttempt, "b", "forward", "b-1", 1_002)
-    const duplicateAttemptProjection = mutableRecord(structuredClone(duplicateAttempt))
-    const duplicateAction = mutableAction(duplicateAttemptProjection, "b", "forward")
-    duplicateAction.activeAttemptId = "a-1"
-    duplicateAction.lastAttemptId = "a-1"
-    await expectAsyncCode(
-      loadSagaRecord(duplicateAttemptProjection, digest),
-      "OperationInterventionRequiredError",
-    )
-
-    let reverseOrder = requestSagaTermination(duplicateAttempt, {
+    let progressed = succeed(running, "a", "forward", "a-1", 1_001)
+    progressed = execute(progressed, "b", "forward", "b-1", 1_002)
+    let reverseOrder = requestSagaTermination(progressed, {
       cause: "cancellation",
       serverTimeMs: 1_003,
     })
@@ -1212,6 +1629,59 @@ describe("serial saga state machine", () => {
       loadSagaRecord(throwingProjection, digest),
       "OperationInterventionRequiredError",
     )
+  })
+
+  it("validates an owned stable snapshot before reconstructing a persisted saga", async () => {
+    const initial = await saga([descriptorStep("a")])
+    const changingGetter = mutableRecord(structuredClone(initial))
+    let statusReads = 0
+    Object.defineProperty(changingGetter, "status", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        statusReads += 1
+        return statusReads === 1 ? "planned" : "succeeded"
+      },
+    })
+
+    const loadedGetter = await loadSagaRecord(changingGetter, digest)
+    expect(statusReads).toBe(1)
+    expect(loadedGetter.status).toBe("planned")
+    expect(Object.getOwnPropertyDescriptor(loadedGetter, "status")).toMatchObject({
+      value: "planned",
+    })
+    expectCode(() => mapSagaSettlementOutcome(loadedGetter), "OperationResumeRequiredError")
+
+    let proxyStatusReads = 0
+    const changingProxy = new Proxy(mutableRecord(structuredClone(initial)), {
+      get(target, property, receiver) {
+        if (property === "status") {
+          proxyStatusReads += 1
+          return proxyStatusReads === 1 ? "planned" : "succeeded"
+        }
+        return Reflect.get(target, property, receiver)
+      },
+    })
+    await expectAsyncCode(
+      loadSagaRecord(changingProxy, digest),
+      "OperationInterventionRequiredError",
+    )
+    expect(proxyStatusReads).toBe(0)
+
+    const asynchronouslyChanged = mutableRecord(structuredClone(initial))
+    let changed = false
+    const mutatingDigest: DigestFunction = async (input) => {
+      asynchronouslyChanged.status = "succeeded"
+      mutableAction(asynchronouslyChanged, "a", "forward").state = "succeeded"
+      changed = true
+      return digest(input)
+    }
+    const loadedOwned = await loadSagaRecord(asynchronouslyChanged, mutatingDigest)
+    expect(changed).toBe(true)
+    expect(asynchronouslyChanged.status).toBe("succeeded")
+    expect(loadedOwned.status).toBe("planned")
+    expect(loadedOwned.steps.a?.forward.state).toBe("pending")
+    expect(Object.isFrozen(loadedOwned)).toBe(true)
   })
 
   it("model-checks generated forward and compensation outcomes for bounded step counts", async () => {

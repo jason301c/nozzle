@@ -12,9 +12,11 @@ import {
   decideLeaseAcquisition,
   decideLeaseRelease,
   decideLeaseRenewal,
+  encodeAuditEventChecksumInput,
   encodeOperationPlanChecksumInput,
   type FencedLeaseRecord,
   leaseProof,
+  loadAuditEvent,
   loadIrreversibleAuthorization,
   loadOperationPlan,
   markOperationStepNotRequired,
@@ -165,6 +167,21 @@ describe("immutable operation plans", () => {
       ...encodeOperationPlanChecksumInput(right),
     ])
     expect(sealedLeft.steps.map((entry) => entry.stepId)).toEqual(["a", "b"])
+    expect(Object.keys(sealedLeft.steps[0] ?? {})).toEqual([
+      "activation",
+      "checkpoint",
+      "completionRole",
+      "dependsOn",
+      "effectProtocol",
+      "idempotencyKey",
+      "inputChecksum",
+      "leaseKey",
+      "postconditionChecksum",
+      "preconditionChecksum",
+      "recoveryInstructions",
+      "retryClassification",
+      "stepId",
+    ])
     expect(Object.isFrozen(sealedLeft)).toBe(true)
     expect(Object.isFrozen(sealedLeft.steps)).toBe(true)
     expect(Object.isFrozen(sealedLeft.steps[0]?.dependsOn)).toBe(true)
@@ -211,6 +228,7 @@ describe("immutable operation plans", () => {
 
   it.each([
     planInput([]),
+    { ...planInput(), steps: "not-an-array" as never },
     { ...planInput(), operationId: "" },
     { ...planInput(), operationType: "\ud800" },
     { ...planInput(), operationType: "\udc00" },
@@ -223,6 +241,7 @@ describe("immutable operation plans", () => {
     planInput([step("a", { dependsOn: ["a"] })]),
     planInput([step("a", { dependsOn: ["b"] }), step("b", { dependsOn: ["a"] })]),
     planInput([step("a", { dependsOn: ["b", "b"] }), step("b")]),
+    planInput([step("a", { dependsOn: "not-an-array" as never })]),
     planInput([step("a", { checkpoint: "bad" as "reversible" })]),
     planInput([step("a", { retryClassification: "bad" as "never" })]),
     planInput([step("a", { effectProtocol: "bad" as "opaque" })]),
@@ -251,6 +270,88 @@ describe("immutable operation plans", () => {
     )
   })
 
+  it("rejects operation step fields outside the canonical checksum contract", async () => {
+    const stepWithExtraField = { ...step("one"), outsideChecksum: "unchecked" }
+
+    await expect(sealOperationPlan(planInput([stepWithExtraField]), digest)).rejects.toThrow(
+      /unknown fields/u,
+    )
+    await expect(
+      sealOperationPlan(
+        { ...planInput(), outsideChecksum: "unchecked" } as OperationPlanInput,
+        digest,
+      ),
+    ).rejects.toThrow(/input fields/u)
+  })
+
+  it("rejects sparse or decorated checksum-bearing plan arrays", async () => {
+    const decoratedSteps = [step("one")] as OperationStepPlanInput[] & {
+      outsideChecksum?: string
+    }
+    decoratedSteps.outsideChecksum = "unchecked"
+    const sparseSteps = new Array<OperationStepPlanInput>(2)
+    sparseSteps[1] = step("one")
+    const balancedSparseSteps = new Array<OperationStepPlanInput>(1) as OperationStepPlanInput[] & {
+      outsideChecksum?: string
+    }
+    balancedSparseSteps.outsideChecksum = "unchecked"
+
+    for (const steps of [decoratedSteps, sparseSteps, balancedSparseSteps]) {
+      await expect(sealOperationPlan(planInput(steps), digest)).rejects.toMatchObject({
+        code: "ConfigurationError",
+        message: "Operation plan steps must be an array.",
+      })
+    }
+
+    const decoratedDependencies = [] as string[] & { outsideChecksum?: string }
+    decoratedDependencies.outsideChecksum = "unchecked"
+    await expect(
+      sealOperationPlan(planInput([step("one", { dependsOn: decoratedDependencies })]), digest),
+    ).rejects.toMatchObject({
+      code: "ConfigurationError",
+      message: "Step dependencies must be an array.",
+    })
+
+    const sealed = await plan()
+    const decoratedPersistedSteps = sealed.steps.map((entry) => ({ ...entry })) as Array<
+      OperationPlan["steps"][number]
+    > & { outsideChecksum?: string }
+    decoratedPersistedSteps.outsideChecksum = "unchecked"
+    await expect(
+      loadOperationPlan({ ...sealed, steps: decoratedPersistedSteps }, digest),
+    ).rejects.toMatchObject({
+      code: "ConfigurationError",
+      message: "Operation plan steps must be an array.",
+    })
+  })
+
+  it("captures every plan input once before hashing and normalizes unsafe capture", async () => {
+    const switchingStep = { ...step("one") }
+    let retryClassificationReads = 0
+    Object.defineProperty(switchingStep, "retryClassification", {
+      enumerable: true,
+      get() {
+        retryClassificationReads += 1
+        return retryClassificationReads === 1 ? "idempotent" : "invalid"
+      },
+    })
+    const sealed = await sealOperationPlan(planInput([switchingStep]), digest)
+    expect(retryClassificationReads).toBe(1)
+    expect(sealed.steps[0]?.retryClassification).toBe("idempotent")
+
+    const hostile = new Proxy(planInput(), {})
+    await expect(sealOperationPlan(hostile, digest)).rejects.toMatchObject({
+      code: "ConfigurationError",
+      message: "Operation plan input could not be captured safely.",
+    })
+    expect(() => encodeOperationPlanChecksumInput(hostile)).toThrowError(
+      expect.objectContaining({
+        code: "ConfigurationError",
+        message: "Operation plan input could not be captured safely.",
+      }),
+    )
+  })
+
   it("requires persisted plans to be integrity-verified before execution", async () => {
     const sealed = await plan()
     const persisted = { ...sealed, steps: sealed.steps.map((entry) => ({ ...entry })) }
@@ -267,6 +368,37 @@ describe("immutable operation plans", () => {
     await expect(
       loadOperationPlan({ ...persisted, schemaVersion: 2 } as unknown as OperationPlan, digest),
     ).rejects.toThrow("version is unsupported")
+    await expect(
+      loadOperationPlan(
+        {
+          ...persisted,
+          steps: persisted.steps.map((entry) => ({ ...entry, outsideChecksum: "unchecked" })),
+        },
+        digest,
+      ),
+    ).rejects.toThrow(/unknown fields/u)
+
+    let checksumReads = 0
+    const switchingChecksum = { ...persisted }
+    Object.defineProperty(switchingChecksum, "planChecksum", {
+      enumerable: true,
+      get() {
+        checksumReads += 1
+        return checksumReads === 1 ? sealed.planChecksum : "attacker-selected-checksum"
+      },
+    })
+    const captured = await loadOperationPlan(switchingChecksum, digest)
+    expect(checksumReads).toBe(1)
+    expect(captured.planChecksum).toBe(sealed.planChecksum)
+    expect(captured).toEqual(sealed)
+
+    await expect(loadOperationPlan(new Proxy(persisted, {}), digest)).rejects.toMatchObject({
+      code: "OperationInterventionRequiredError",
+      message: "The persisted operation plan could not be captured safely.",
+    })
+    await expect(
+      loadOperationPlan({ ...persisted, outsideChecksum: "unchecked" } as OperationPlan, digest),
+    ).rejects.toThrow(/plan fields/u)
   })
 })
 
@@ -620,6 +752,93 @@ describe("sealed irreversible authorization", () => {
     ).rejects.toThrow("version is unsupported")
     const reversibleOperation = createOperationRecord(await plan())
     expect(() => begin(reversibleOperation, lease, { authorization })).toThrow("reversible step")
+  })
+
+  it("captures authorization inputs once and brands only exact persisted fields", async () => {
+    const sealedPlan = await plan([step("delete", { checkpoint: "irreversible" })])
+    const lease = acquire()
+    const base = {
+      actorChecksum: "actor",
+      authorizationId: "authorization-captured",
+      decisionChecksum: "decision",
+      lease,
+      leaseProof: leaseProof(lease),
+      sealedAtServerTimeMs: 105,
+      stepId: "delete",
+    }
+    let actorReads = 0
+    const switching = { ...base }
+    Object.defineProperty(switching, "actorChecksum", {
+      enumerable: true,
+      get() {
+        actorReads += 1
+        return actorReads === 1 ? "actor" : "changed-actor"
+      },
+    })
+
+    const authorization = await sealIrreversibleAuthorization(sealedPlan, switching, digest)
+    expect(actorReads).toBe(1)
+    expect(authorization.actorChecksum).toBe("actor")
+
+    await expect(
+      sealIrreversibleAuthorization(sealedPlan, new Proxy(base, {}), digest),
+    ).rejects.toMatchObject({
+      code: "ConfigurationError",
+      message: "Irreversible authorization input could not be captured safely.",
+    })
+    await expect(
+      sealIrreversibleAuthorization(
+        sealedPlan,
+        { ...base, outsideChecksum: "unchecked" } as typeof base,
+        digest,
+      ),
+    ).rejects.toThrow(/input fields/u)
+    const { leaseKey: _leaseKey, ...leaseWithoutKey } = lease
+    for (const candidate of [
+      { ...base, lease: { ...lease, outsideChecksum: "unchecked" } },
+      { ...base, leaseProof: { ...base.leaseProof, outsideChecksum: "unchecked" } },
+      {
+        ...base,
+        lease: { ...leaseWithoutKey, outsideChecksum: "unchecked" } as unknown as FencedLeaseRecord,
+      },
+      {
+        ...base,
+        lease: Object.assign(new Map(), lease) as unknown as FencedLeaseRecord,
+      },
+    ]) {
+      await expect(sealIrreversibleAuthorization(sealedPlan, candidate, digest)).rejects.toThrow(
+        /lease fields/u,
+      )
+    }
+    await expect(
+      sealIrreversibleAuthorization(structuredClone(sealedPlan), base, digest),
+    ).rejects.toThrow(/sealed or integrity-verified plan/u)
+
+    let checksumReads = 0
+    const switchingChecksum = { ...authorization }
+    Object.defineProperty(switchingChecksum, "authorizationChecksum", {
+      enumerable: true,
+      get() {
+        checksumReads += 1
+        return checksumReads === 1 ? authorization.authorizationChecksum : "changed-checksum"
+      },
+    })
+    const loaded = await loadIrreversibleAuthorization(switchingChecksum, digest)
+    expect(checksumReads).toBe(1)
+    expect(loaded).toEqual(authorization)
+    expect(Object.keys(loaded)).toEqual(Object.keys(authorization))
+    await expect(
+      loadIrreversibleAuthorization(
+        { ...authorization, outsideChecksum: "unchecked" } as typeof authorization,
+        digest,
+      ),
+    ).rejects.toThrow(/authorization fields/u)
+    await expect(
+      loadIrreversibleAuthorization(new Proxy({ ...authorization }, {}), digest),
+    ).rejects.toMatchObject({
+      code: "OperationInterventionRequiredError",
+      message: "The persisted irreversible authorization could not be captured safely.",
+    })
   })
 
   it("rejects authorization for reversible, absent, and mismatched steps", async () => {
@@ -1262,6 +1481,43 @@ describe("operation crash, resume, and idempotency guards", () => {
       state: "succeeded",
     })
     expect(operationStatus(terminal)).toBe("succeeded")
+    expect(
+      recordSagaStepTerminalClassification(terminal, {
+        counters: { cost: { observations: 1 }, progress: { classifications: 1 } },
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "terminal-receipt-outcome",
+        stepId: "one",
+      }),
+    ).toBe(terminal)
+    expect(() =>
+      recordSagaStepTerminalClassification(terminal, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "contradictory-terminal-receipt",
+        stepId: "one",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+
+    const terminalAfterRetryable = recordSagaStepTerminalClassification(retryable, {
+      counters: { cost: { observations: 2 }, progress: { classifications: 3 } },
+      outcome: "not_applied",
+      receiptOutcomeChecksum: "not-applied-observation",
+      stepId: "one",
+    })
+    expect(terminalAfterRetryable.steps.one).toEqual({
+      costCounters: { observations: 2 },
+      errorChecksum: "unknown-effect",
+      fencingToken: lease.fencingToken,
+      lastAttemptId: "attempt-1",
+      progressCounters: { classifications: 3 },
+      reconciliationEvidenceChecksum: "not-applied-observation",
+      resultChecksum: "not-applied-observation",
+      startedAttempts: 1,
+      state: "succeeded",
+    })
+    expect(retryable.steps.one).toMatchObject({
+      reconciliationEvidenceChecksum: "not-applied-observation",
+      state: "retryable_failed",
+    })
 
     const indeterminate = recordStepReconciliation(unknown, {
       evidenceChecksum: "indeterminate-observation",
@@ -1272,6 +1528,93 @@ describe("operation crash, resume, and idempotency guards", () => {
       reconciliationEvidenceChecksum: "indeterminate-observation",
       state: "intervention_required",
     })
+  })
+
+  it("preserves arbitrary retryable and unknown saga attempt evidence during terminal classification", async () => {
+    const sealedPlan = await plan([
+      step("one", { effectProtocol: "saga_receipt", retryClassification: "reconcile_first" }),
+    ])
+    fc.assert(
+      fc.property(
+        fc.constantFrom("retryable_failed" as const, "unknown" as const),
+        fc.integer({ min: 1, max: 1_000_000 }),
+        fc.nat({ max: 1_000_000 }),
+        fc.nat({ max: 1_000_000 }),
+        fc.nat({ max: 1_000_000 }),
+        fc.nat({ max: 1_000_000 }),
+        fc.nat({ max: 1_000_000 }),
+        (
+          sourceState,
+          fencingToken,
+          initialCost,
+          initialProgress,
+          classificationCost,
+          classificationProgress,
+          receiptNumber,
+        ) => {
+          const activeLease: FencedLeaseRecord = Object.freeze({
+            acquisitionId: `acquisition-${fencingToken}`,
+            expiresAtServerTimeMs: 1_000,
+            fencingToken,
+            holderId: `holder-${fencingToken}`,
+            leaseKey: "fleet:example",
+          })
+          const running = begin(createOperationRecord(sealedPlan), activeLease, {
+            attemptId: `attempt-${fencingToken}`,
+          }).operation
+          const source = recordStepFailure(running, {
+            attemptId: `attempt-${fencingToken}`,
+            counters: {
+              cost: { calls: initialCost },
+              progress: { receipts: initialProgress },
+            },
+            errorChecksum: `source-error-${receiptNumber}`,
+            outcome: sourceState === "unknown" ? "unknown" : "definitely_not_applied",
+            stepId: "one",
+          })
+          expect(source.steps.one?.state).toBe(sourceState)
+          const before = source.steps.one
+          const receiptOutcomeChecksum =
+            sourceState === "retryable_failed"
+              ? `source-error-${receiptNumber}`
+              : `receipt-${receiptNumber}`
+          const input = {
+            counters: {
+              cost: { calls: classificationCost },
+              progress: { receipts: classificationProgress },
+            },
+            outcome: "not_applied" as const,
+            receiptOutcomeChecksum,
+            stepId: "one",
+          }
+
+          const terminal = recordSagaStepTerminalClassification(source, input)
+
+          expect(source.steps.one).toBe(before)
+          expect(terminal.steps.one).toEqual({
+            costCounters: { calls: initialCost + classificationCost },
+            errorChecksum: `source-error-${receiptNumber}`,
+            fencingToken,
+            lastAttemptId: `attempt-${fencingToken}`,
+            progressCounters: { receipts: initialProgress + classificationProgress },
+            reconciliationEvidenceChecksum: receiptOutcomeChecksum,
+            resultChecksum: receiptOutcomeChecksum,
+            startedAttempts: 1,
+            state: "succeeded",
+          })
+          expect(Object.isFrozen(terminal)).toBe(true)
+          expect(Object.isFrozen(terminal.steps.one)).toBe(true)
+          expect(recordSagaStepTerminalClassification(terminal, input)).toBe(terminal)
+          expect(() =>
+            recordSagaStepTerminalClassification(terminal, {
+              ...input,
+              receiptOutcomeChecksum: `${receiptOutcomeChecksum}:different`,
+            }),
+          ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+        },
+      ),
+      { numRuns: 200 },
+    )
   })
 
   it("marks every in-flight attempt unknown on crash before resuming", async () => {
@@ -1318,6 +1661,57 @@ describe("operation crash, resume, and idempotency guards", () => {
     expect(intervention.steps.b?.state).toBe("intervention_required")
     expect(operationStatus(intervention)).toBe("intervention_required")
     expect(begin(intervention, lease, { stepId: "b" }).disposition).toBe("blocked")
+  })
+
+  it("terminally fails a never-retry step proven not dispatched after a crash", async () => {
+    const lease = acquire()
+    const running = begin(
+      createOperationRecord(
+        await plan([
+          step("one", { effectProtocol: "provider_receipt", retryClassification: "never" }),
+        ]),
+      ),
+      lease,
+      { attemptId: "provider-attempt-1" },
+    ).operation
+
+    const recovered = markRunningStepNotDispatchedAfterCrash(
+      running,
+      "one",
+      "provider-dispatch-absence",
+    )
+
+    expect(recovered.steps.one).toEqual({
+      costCounters: {},
+      fencingToken: lease.fencingToken,
+      lastAttemptId: "provider-attempt-1",
+      progressCounters: {},
+      reconciliationEvidenceChecksum: "provider-dispatch-absence",
+      startedAttempts: 1,
+      state: "failed",
+    })
+    expect(operationStatus(recovered)).toBe("failed")
+    expect(Object.isFrozen(recovered.steps.one)).toBe(true)
+  })
+
+  it("blocks every second dispatch after never-retry crash absence is terminal", async () => {
+    const lease = acquire()
+    const running = begin(
+      createOperationRecord(await plan([step("one", { retryClassification: "never" })])),
+      lease,
+      { attemptId: "first-attempt" },
+    ).operation
+    const recovered = markRunningStepNotDispatchedAfterCrash(
+      running,
+      "one",
+      "first-attempt-was-not-dispatched",
+    )
+
+    for (const attemptId of ["first-attempt", "second-attempt"]) {
+      const decision = begin(recovered, lease, { attemptId })
+      expect(decision).toEqual({ disposition: "blocked", operation: recovered })
+      expect(decision.operation.steps.one?.startedAttempts).toBe(1)
+    }
   })
 
   it("classifies known failures according to the sealed retry policy", async () => {
@@ -1493,13 +1887,22 @@ describe("operation crash, resume, and idempotency guards", () => {
       }),
     ).toThrow("reconciliation outcome is invalid")
 
-    expect(() =>
-      recordSagaStepTerminalClassification(unknown, {
-        outcome: "not_applied",
-        receiptOutcomeChecksum: "terminal-receipt",
+    for (const effectProtocol of ["opaque", "provider_receipt"] as const) {
+      const protocolOperation = createOperationRecord(await plan([step("one", { effectProtocol })]))
+      const protocolUnknown = recordStepFailure(begin(protocolOperation, lease).operation, {
+        attemptId: "attempt-1",
+        errorChecksum: "unknown",
+        outcome: "unknown",
         stepId: "one",
-      }),
-    ).toThrow("requires a saga-receipt step")
+      })
+      expect(() =>
+        recordSagaStepTerminalClassification(protocolUnknown, {
+          outcome: "not_applied",
+          receiptOutcomeChecksum: "terminal-receipt",
+          stepId: "one",
+        }),
+      ).toThrow("requires a saga-receipt step")
+    }
 
     const sagaOperation = createOperationRecord(
       await plan([step("one", { effectProtocol: "saga_receipt" })]),
@@ -1510,8 +1913,16 @@ describe("operation crash, resume, and idempotency guards", () => {
         receiptOutcomeChecksum: "terminal-receipt",
         stepId: "one",
       }),
-    ).toThrow("Only an unknown saga step")
-    const sagaUnknown = recordStepFailure(begin(sagaOperation, lease).operation, {
+    ).toThrow("Only an unknown or retryable saga step")
+    const sagaRunning = begin(sagaOperation, lease).operation
+    expect(() =>
+      recordSagaStepTerminalClassification(sagaRunning, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "terminal-receipt",
+        stepId: "one",
+      }),
+    ).toThrow("Only an unknown or retryable saga step")
+    const sagaUnknown = recordStepFailure(sagaRunning, {
       attemptId: "attempt-1",
       errorChecksum: "unknown",
       outcome: "unknown",
@@ -1531,26 +1942,118 @@ describe("operation crash, resume, and idempotency guards", () => {
         stepId: "one",
       }),
     ).toThrow("receipt-outcome checksum")
-    for (const missing of ["fencingToken", "lastAttemptId"] as const) {
-      const malformedStep = { ...sagaUnknown.steps.one }
-      delete malformedStep[missing]
+    const sagaRetryable = recordStepFailure(sagaRunning, {
+      attemptId: "attempt-1",
+      errorChecksum: "proven-absence",
+      outcome: "definitely_not_applied",
+      stepId: "one",
+    })
+    expect(() =>
+      recordSagaStepTerminalClassification(sagaRetryable, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "different-absence-evidence",
+        stepId: "one",
+      }),
+    ).toThrow(/contradicts durable non-application evidence/u)
+    for (const source of [sagaUnknown, sagaRetryable]) {
+      for (const missing of ["fencingToken", "lastAttemptId"] as const) {
+        const malformedStep = { ...source.steps.one }
+        delete malformedStep[missing]
+        expect(() =>
+          recordSagaStepTerminalClassification(
+            { ...source, steps: { one: malformedStep } } as OperationRecord,
+            {
+              outcome: "not_applied",
+              receiptOutcomeChecksum: "terminal-receipt",
+              stepId: "one",
+            },
+          ),
+        ).toThrow("incomplete classification metadata")
+      }
+    }
+    for (const malformedStep of [
+      { ...sagaRetryable.steps.one, activeAttemptId: "attempt-1" },
+      { ...sagaRetryable.steps.one, startedAttempts: 0 },
+      { ...sagaRetryable.steps.one, costCounters: { calls: -1 } },
+      { ...sagaRetryable.steps.one, unexpected: "field" },
+      {
+        ...sagaRetryable.steps.one,
+        errorChecksum: undefined,
+        reconciliationEvidenceChecksum: undefined,
+      },
+    ]) {
       expect(() =>
         recordSagaStepTerminalClassification(
-          { ...sagaUnknown, steps: { one: malformedStep } } as OperationRecord,
+          { ...sagaRetryable, steps: { one: malformedStep } } as OperationRecord,
           {
             outcome: "not_applied",
             receiptOutcomeChecksum: "terminal-receipt",
             stepId: "one",
           },
         ),
-      ).toThrow("incomplete classification metadata")
+      ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
     }
+
+    const sagaFailed = recordStepFailure(sagaRunning, {
+      attemptId: "attempt-1",
+      errorChecksum: "permanent",
+      outcome: "permanent",
+      stepId: "one",
+    })
+    const sagaIntervention = recordStepReconciliation(sagaUnknown, {
+      evidenceChecksum: "indeterminate",
+      outcome: "indeterminate",
+      stepId: "one",
+    })
+    for (const source of [sagaFailed, sagaIntervention]) {
+      expect(() =>
+        recordSagaStepTerminalClassification(source, {
+          outcome: "not_applied",
+          receiptOutcomeChecksum: "terminal-receipt",
+          stepId: "one",
+        }),
+      ).toThrow("Only an unknown or retryable saga step")
+    }
+
+    const ordinarySuccess = recordStepSuccess(sagaRunning, {
+      attemptId: "attempt-1",
+      observedPostconditionChecksum: "post-one",
+      resultChecksum: "business-result",
+      stepId: "one",
+    })
+    expect(() =>
+      recordSagaStepTerminalClassification(ordinarySuccess, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "business-result",
+        stepId: "one",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+
+    const conditional = createOperationRecord(
+      await plan([
+        step("one"),
+        step("optional", { activation: "conditional", effectProtocol: "saga_receipt" }),
+      ]),
+    )
+    const notRequired = markOperationStepNotRequired(conditional, {
+      evidenceChecksum: "branch-evidence",
+      stepId: "optional",
+    })
+    expect(() =>
+      recordSagaStepTerminalClassification(notRequired, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "terminal-receipt",
+        stepId: "optional",
+      }),
+    ).toThrow("Only an unknown or retryable saga step")
   })
 
   it("requires full evidence to reconcile applied outcomes and preserves never-retry", async () => {
     const lease = acquire()
     const started = begin(
-      createOperationRecord(await plan([step("one", { retryClassification: "never" })])),
+      createOperationRecord(
+        await plan([step("one", { effectProtocol: "saga_receipt", retryClassification: "never" })]),
+      ),
       lease,
     ).operation
     const unknown = recordStepFailure(started, {
@@ -1581,6 +2084,20 @@ describe("operation crash, resume, and idempotency guards", () => {
       stepId: "one",
     })
     expect(absent.steps.one?.state).toBe("failed")
+
+    const failedStep = absent.steps.one
+    if (failedStep === undefined) throw new Error("Fixture step is missing.")
+    const forgedRetryable: OperationRecord = {
+      ...absent,
+      steps: { ...absent.steps, one: { ...failedStep, state: "retryable_failed" } },
+    }
+    expect(() =>
+      recordSagaStepTerminalClassification(forgedRetryable, {
+        outcome: "not_applied",
+        receiptOutcomeChecksum: "absent",
+        stepId: "one",
+      }),
+    ).toThrow(/never-retry/u)
   })
 })
 
@@ -1626,7 +2143,127 @@ describe("append-only hash-chain audit primitives", () => {
       [first, { ...second, serverTimeMs: 99 }],
     ]
     for (const events of cases) expect(await verifyAuditChain(events, digest)).toBe(false)
+
+    const otherFirst = await appendAuditEvent(
+      undefined,
+      auditInput(100, "other.operation.started"),
+      digest,
+    )
+    const otherSecond = await appendAuditEvent(
+      otherFirst,
+      auditInput(101, "other.step.started"),
+      digest,
+    )
+    expect(await verifyAuditChain([first, otherSecond], digest)).toBe(false)
+
+    const backwardsUnsigned = {
+      ...auditInput(99, "step.backwards"),
+      previousHash: first.eventHash,
+      schemaVersion: 1 as const,
+      sequence: 2,
+    }
+    const backwards: AuditEvent = {
+      ...backwardsUnsigned,
+      eventHash: await digest(encodeAuditEventChecksumInput(backwardsUnsigned)),
+    }
+    expect(await verifyAuditChain([first, backwards], digest)).toBe(false)
     await expect(appendAuditEvent(first, auditInput(99), digest)).rejects.toThrow("cannot decrease")
+  })
+
+  it("captures complete audit inputs and chains before hashing", async () => {
+    const switchingInput = auditInput(100)
+    let actorReads = 0
+    Object.defineProperty(switchingInput, "actorChecksum", {
+      enumerable: true,
+      get() {
+        actorReads += 1
+        return actorReads === 1 ? "actor-hash" : "changed-actor"
+      },
+    })
+    const first = await appendAuditEvent(undefined, switchingInput, digest)
+    expect(actorReads).toBe(1)
+    expect(first.actorChecksum).toBe("actor-hash")
+
+    const switchingPrevious = { ...first }
+    let hashReads = 0
+    Object.defineProperty(switchingPrevious, "eventHash", {
+      enumerable: true,
+      get() {
+        hashReads += 1
+        return hashReads === 1 ? first.eventHash : "changed-previous-hash"
+      },
+    })
+    const second = await appendAuditEvent(switchingPrevious, auditInput(101), digest)
+    expect(hashReads).toBe(1)
+    expect(second.previousHash).toBe(first.eventHash)
+
+    await expect(
+      appendAuditEvent(
+        undefined,
+        { ...auditInput(100), outsideChecksum: "unchecked" } as ReturnType<typeof auditInput>,
+        digest,
+      ),
+    ).rejects.toThrow(/input fields/u)
+    await expect(
+      appendAuditEvent(undefined, new Proxy(auditInput(100), {}), digest),
+    ).rejects.toMatchObject({
+      code: "ConfigurationError",
+      message: "Audit append input could not be captured safely.",
+    })
+    await expect(
+      appendAuditEvent(
+        { ...first, outsideChecksum: "unchecked" } as AuditEvent,
+        auditInput(101),
+        digest,
+      ),
+    ).rejects.toThrow(/audit event fields/u)
+    await expect(
+      appendAuditEvent({ ...first, payloadChecksum: "tampered" }, auditInput(101), digest),
+    ).rejects.toThrow(/checksum does not match/u)
+
+    let persistedHashReads = 0
+    const switchingPersisted = { ...first }
+    Object.defineProperty(switchingPersisted, "eventHash", {
+      enumerable: true,
+      get() {
+        persistedHashReads += 1
+        return persistedHashReads === 1 ? first.eventHash : "changed-event-hash"
+      },
+    })
+    await expect(loadAuditEvent(switchingPersisted, digest)).resolves.toEqual(first)
+    expect(persistedHashReads).toBe(1)
+    await expect(loadAuditEvent(new Proxy({ ...first }, {}), digest)).rejects.toMatchObject({
+      code: "OperationInterventionRequiredError",
+      message: "The persisted audit event could not be captured safely.",
+    })
+
+    const chain = [first, second]
+    let mutated = false
+    const mutatingDigest: DigestFunction = async (input) => {
+      if (!mutated) {
+        mutated = true
+        chain[1] = { ...second, previousHash: "post-capture-mutation" }
+      }
+      return digest(input)
+    }
+    expect(await verifyAuditChain(chain, mutatingDigest)).toBe(true)
+    expect(chain[1]?.previousHash).toBe("post-capture-mutation")
+    expect(await verifyAuditChain(new Proxy([first], {}), digest)).toBe(false)
+
+    expect(
+      await verifyAuditChain([{ ...first, outsideChecksum: "unchecked" } as AuditEvent], digest),
+    ).toBe(false)
+    const decoratedChain = [first] as AuditEvent[] & { outsideChecksum?: string }
+    decoratedChain.outsideChecksum = "unchecked"
+    const sparseChain = new Array<AuditEvent>(2)
+    sparseChain[1] = first
+    const balancedSparseChain = new Array<AuditEvent>(1) as AuditEvent[] & {
+      outsideChecksum?: string
+    }
+    balancedSparseChain.outsideChecksum = "unchecked"
+    for (const malformedChain of [decoratedChain, sparseChain, balancedSparseChain]) {
+      expect(await verifyAuditChain(malformedChain, digest)).toBe(false)
+    }
   })
 
   it("preserves a valid chain for arbitrary public-safe event sequences", async () => {

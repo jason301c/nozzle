@@ -31,6 +31,7 @@ export type SagaStatus =
   | "timed_out"
   | "compensating"
 export type SagaCommitment = "complete" | "confirmed_partial" | "none" | "possible"
+export type SagaSettlementOutcome = "failed" | "intervention_required" | "succeeded"
 
 export interface SagaActionRecord {
   readonly activeAttemptId?: string
@@ -215,13 +216,60 @@ function settledStatus(record: SagaRecord): SagaStatus {
 }
 
 function withRecord(record: SagaRecord, changes: SagaChanges): SagaRecord {
+  const stateVersion = record.stateVersion + 1
+  if (!Number.isSafeInteger(stateVersion)) {
+    intervention("Saga state version overflowed.")
+  }
   const candidate: SagaRecord = Object.freeze({
     ...record,
     ...changes,
-    stateVersion: record.stateVersion + 1,
+    stateVersion,
     status: record.status,
   })
   return Object.freeze({ ...candidate, status: settledStatus(candidate) })
+}
+
+/**
+ * Purely maps an already verified terminal saga projection to its operation outcome.
+ * This checks terminal-status consistency but does not establish persistence or history authority.
+ */
+export function mapSagaSettlementOutcome(record: SagaRecord): SagaSettlementOutcome {
+  let status: unknown
+  let expectedStatus: SagaStatus
+  try {
+    const snapshot: SagaRecord = structuredClone(record)
+    const cause = snapshot.terminationCause
+    const requestedAt = snapshot.terminationRequestedAtMs
+    if (
+      (cause !== null && cause !== "cancellation" && cause !== "failure" && cause !== "timeout") ||
+      (requestedAt !== null &&
+        (typeof requestedAt !== "number" ||
+          !Number.isSafeInteger(requestedAt) ||
+          requestedAt < 0)) ||
+      (cause === null) !== (requestedAt === null)
+    ) {
+      throw new Error()
+    }
+    status = snapshot.status
+    expectedStatus = settledStatus(snapshot)
+  } catch {
+    return intervention("Saga settlement projection is malformed.")
+  }
+  if (
+    status !== "cancelled" &&
+    status !== "failed" &&
+    status !== "intervention_required" &&
+    status !== "succeeded" &&
+    status !== "timed_out"
+  ) {
+    return resume("Saga settlement requires a terminal saga.")
+  }
+  if (status !== expectedStatus) {
+    return intervention("Saga terminal status contradicts its action states.")
+  }
+  if (status === "succeeded") return "succeeded"
+  if (status === "intervention_required") return "intervention_required"
+  return "failed"
 }
 
 function lastAttemptId(action: SagaActionRecord): string {
@@ -247,23 +295,43 @@ export function createSagaRecord(input: {
   readonly serverTimeMs: number
   readonly stepInputChecksums: Readonly<Record<string, string>>
 }): SagaRecord {
-  assertTrustedSagaDescriptor(input.descriptor)
-  nonEmpty(input.sagaId, "Saga ID")
-  nonEmpty(input.idempotencyKey, "Saga idempotency key")
-  nonEmpty(input.inputChecksum, "Saga input checksum")
-  serverTime(input.serverTimeMs)
-  serverTime(input.deadlineAtMs)
-  if (input.deadlineAtMs <= input.serverTimeMs)
+  const captured = (() => {
+    try {
+      const deadlineAtMs = input.deadlineAtMs
+      const descriptor = input.descriptor
+      const idempotencyKey = input.idempotencyKey
+      const inputChecksum = input.inputChecksum
+      const sagaId = input.sagaId
+      const serverTimeMs = input.serverTimeMs
+      const sourceStepInputChecksums = input.stepInputChecksums
+      const stepInputChecksums: unknown = structuredClone(sourceStepInputChecksums)
+      return {
+        deadlineAtMs,
+        descriptor,
+        idempotencyKey,
+        inputChecksum,
+        sagaId,
+        serverTimeMs,
+        stepInputChecksums,
+      }
+    } catch {
+      return configuration("Saga creation input could not be captured safely.")
+    }
+  })()
+  assertTrustedSagaDescriptor(captured.descriptor)
+  nonEmpty(captured.sagaId, "Saga ID")
+  nonEmpty(captured.idempotencyKey, "Saga idempotency key")
+  nonEmpty(captured.inputChecksum, "Saga input checksum")
+  serverTime(captured.serverTimeMs)
+  serverTime(captured.deadlineAtMs)
+  if (captured.deadlineAtMs <= captured.serverTimeMs)
     configuration("Saga deadline must be in the future.")
-  if (
-    typeof input.stepInputChecksums !== "object" ||
-    input.stepInputChecksums === null ||
-    Array.isArray(input.stepInputChecksums)
-  ) {
+  if (!plainRecord(captured.stepInputChecksums)) {
     configuration("Saga step input checksums are malformed.")
   }
-  const expected = input.descriptor.steps.map((step) => step.stepId)
-  const actual = Object.keys(input.stepInputChecksums).sort()
+  const stepInputChecksums = Object.freeze(captured.stepInputChecksums)
+  const expected = captured.descriptor.steps.map((step) => step.stepId)
+  const actual = Object.keys(stepInputChecksums).sort()
   const canonical = [...expected].sort()
   if (
     actual.length !== canonical.length ||
@@ -272,27 +340,27 @@ export function createSagaRecord(input: {
     configuration("Saga step input checksums do not match the descriptor.")
   }
   const steps: Record<string, SagaStepRecord> = {}
-  for (const step of input.descriptor.steps) {
-    const inputChecksum = input.stepInputChecksums[step.stepId]
+  for (const step of captured.descriptor.steps) {
+    const inputChecksum = stepInputChecksums[step.stepId]
     nonEmpty(inputChecksum, "Saga step input checksum")
     steps[step.stepId] = Object.freeze({
       compensation: initialAction(
-        sagaActionIdempotencyKey(input.sagaId, step.stepId, "compensation"),
+        sagaActionIdempotencyKey(captured.sagaId, step.stepId, "compensation"),
         step.irreversible ? "not_required" : "pending",
       ),
       forward: initialAction(
-        sagaActionIdempotencyKey(input.sagaId, step.stepId, "forward"),
+        sagaActionIdempotencyKey(captured.sagaId, step.stepId, "forward"),
         "pending",
       ),
       inputChecksum,
     })
   }
   return Object.freeze({
-    deadlineAtMs: input.deadlineAtMs,
-    descriptor: input.descriptor,
-    idempotencyKey: input.idempotencyKey,
-    inputChecksum: input.inputChecksum,
-    sagaId: input.sagaId,
+    deadlineAtMs: captured.deadlineAtMs,
+    descriptor: captured.descriptor,
+    idempotencyKey: captured.idempotencyKey,
+    inputChecksum: captured.inputChecksum,
+    sagaId: captured.sagaId,
     stateVersion: 0,
     status: "planned",
     steps: Object.freeze(steps),
@@ -891,9 +959,7 @@ function persistedAction(
     "Persisted saga error evidence contradicts its state.",
   )
   persisted(
-    state === "retryable_failed"
-      ? (value.nextAttemptAtMs as number) > 0
-      : value.nextAttemptAtMs === 0,
+    state === "retryable_failed" || value.nextAttemptAtMs === 0,
     "Persisted saga retry time contradicts its state.",
   )
   persisted(
@@ -1010,7 +1076,6 @@ async function loadSagaRecordUnchecked(
     "Persisted saga step membership contradicts its descriptor.",
   )
   const steps: Record<string, SagaStepRecord> = {}
-  const attemptIds = new Set<string>()
   let uncertainActions = 0
   for (const step of descriptor.steps) {
     const value = candidate.steps[step.stepId]
@@ -1050,13 +1115,6 @@ async function loadSagaRecordUnchecked(
         action.activeAttemptId === undefined || action.activeAttemptId === action.lastAttemptId,
         "Persisted saga active and last attempt identities are contradictory.",
       )
-      if (action.lastAttemptId !== undefined) {
-        persisted(
-          !attemptIds.has(action.lastAttemptId),
-          "Persisted saga reuses an attempt identity across actions.",
-        )
-        attemptIds.add(action.lastAttemptId)
-      }
     }
     persisted(
       step.irreversible
@@ -1150,7 +1208,8 @@ export async function loadSagaRecord(
   digest: DigestFunction,
 ): Promise<SagaRecord> {
   try {
-    return await loadSagaRecordUnchecked(candidate, digest)
+    const snapshot: unknown = structuredClone(candidate)
+    return await loadSagaRecordUnchecked(snapshot, digest)
   } catch (error) {
     if (error instanceof NozzleError && error.code === "OperationInterventionRequiredError") {
       throw error

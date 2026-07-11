@@ -5,6 +5,78 @@ const IRREVERSIBLE_AUTHORIZATION_DOMAIN = "nozzle.irreversible-authorization.v1"
 const AUDIT_EVENT_DOMAIN = "nozzle.audit-event.v1"
 const TRUSTED_OPERATION_PLANS = new WeakSet<OperationPlan>()
 const TRUSTED_IRREVERSIBLE_AUTHORIZATIONS = new WeakSet<IrreversibleAuthorization>()
+const OPERATION_PLAN_INPUT_KEYS = new Set([
+  "capabilitySnapshotChecksum",
+  "idempotencyKey",
+  "inputChecksum",
+  "operationId",
+  "operationType",
+  "steps",
+])
+const PERSISTED_OPERATION_PLAN_KEYS = new Set([
+  ...OPERATION_PLAN_INPUT_KEYS,
+  "planChecksum",
+  "schemaVersion",
+])
+const OPERATION_STEP_PLAN_INPUT_KEYS = new Set([
+  "activation",
+  "checkpoint",
+  "completionRole",
+  "dependsOn",
+  "effectProtocol",
+  "idempotencyKey",
+  "inputChecksum",
+  "leaseKey",
+  "postconditionChecksum",
+  "preconditionChecksum",
+  "recoveryInstructions",
+  "retryClassification",
+  "stepId",
+])
+const IRREVERSIBLE_AUTHORIZATION_KEYS = new Set([
+  "actorChecksum",
+  "authorizationChecksum",
+  "authorizationId",
+  "decisionChecksum",
+  "fencingToken",
+  "holderId",
+  "leaseAcquisitionId",
+  "leaseKey",
+  "operationId",
+  "planChecksum",
+  "sealedAtServerTimeMs",
+  "schemaVersion",
+  "stepId",
+  "stepInputChecksum",
+])
+const IRREVERSIBLE_AUTHORIZATION_INPUT_KEYS = new Set([
+  "actorChecksum",
+  "authorizationId",
+  "decisionChecksum",
+  "lease",
+  "leaseProof",
+  "sealedAtServerTimeMs",
+  "stepId",
+])
+const AUDIT_EVENT_INPUT_KEYS = new Set([
+  "actorChecksum",
+  "environmentId",
+  "eventType",
+  "fencingToken",
+  "idempotencyKey",
+  "operationId",
+  "payloadChecksum",
+  "serverTimeMs",
+  "stepId",
+])
+const FENCED_LEASE_RECORD_KEYS = new Set([
+  "acquisitionId",
+  "expiresAtServerTimeMs",
+  "fencingToken",
+  "holderId",
+  "leaseKey",
+])
+const LEASE_PROOF_KEYS = new Set(["acquisitionId", "fencingToken", "holderId", "leaseKey"])
 
 export const OPERATION_STEP_STATES = [
   "pending",
@@ -250,6 +322,22 @@ function interventionError(message: string): never {
   throw new NozzleError("OperationInterventionRequiredError", message)
 }
 
+function captureConfiguration<T>(value: T, message: string): T {
+  try {
+    return structuredClone(value)
+  } catch {
+    return configurationError(message)
+  }
+}
+
+function capturePersisted<T>(value: T, message: string): T {
+  try {
+    return structuredClone(value)
+  } catch {
+    return interventionError(message)
+  }
+}
+
 function isWellFormedUtf16(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index)
@@ -292,6 +380,12 @@ function checkedAdd(left: number, right: number, label: string): number {
 }
 
 function normalizeStep(step: OperationStepPlanInput): OperationStepPlan {
+  if (
+    !plainRecord(step) ||
+    !Object.keys(step).every((key) => OPERATION_STEP_PLAN_INPUT_KEYS.has(key))
+  ) {
+    configurationError("Operation step contains unknown fields.")
+  }
   assertWellFormedString(step.stepId, "Step ID")
   assertWellFormedString(step.idempotencyKey, "Step idempotency key")
   assertWellFormedString(step.inputChecksum, "Step input checksum")
@@ -317,26 +411,46 @@ function normalizeStep(step: OperationStepPlanInput): OperationStepPlan {
   if (!(["opaque", "provider_receipt", "saga_receipt"] as const).includes(effectProtocol)) {
     configurationError("Step effect protocol is invalid.")
   }
-  const dependsOn = [...new Set(step.dependsOn ?? [])].sort()
-  if (dependsOn.length !== (step.dependsOn ?? []).length || dependsOn.includes("")) {
+  const sourceDependencies = step.dependsOn ?? []
+  if (!exactDenseArray(sourceDependencies)) {
+    configurationError("Step dependencies must be an array.")
+  }
+  const dependsOn = [...new Set(sourceDependencies)].sort()
+  if (dependsOn.length !== sourceDependencies.length || dependsOn.includes("")) {
     configurationError("Step dependencies must be unique and non-empty.")
   }
   for (const dependency of dependsOn) assertWellFormedString(dependency, "Step dependency")
   return Object.freeze({
-    ...step,
     activation,
+    checkpoint: step.checkpoint,
     completionRole,
     dependsOn: Object.freeze(dependsOn),
     effectProtocol,
+    idempotencyKey: step.idempotencyKey,
+    inputChecksum: step.inputChecksum,
+    leaseKey: step.leaseKey,
+    postconditionChecksum: step.postconditionChecksum,
+    preconditionChecksum: step.preconditionChecksum,
+    recoveryInstructions: step.recoveryInstructions,
+    retryClassification: step.retryClassification,
+    stepId: step.stepId,
   })
 }
 
 function normalizePlan(input: OperationPlanInput): Omit<OperationPlan, "planChecksum"> {
+  if (
+    !plainRecord(input) ||
+    Object.keys(input).length !== OPERATION_PLAN_INPUT_KEYS.size ||
+    !Object.keys(input).every((key) => OPERATION_PLAN_INPUT_KEYS.has(key))
+  ) {
+    configurationError("Operation plan input fields are malformed.")
+  }
   assertWellFormedString(input.operationId, "Operation ID")
   assertWellFormedString(input.operationType, "Operation type")
   assertWellFormedString(input.idempotencyKey, "Operation idempotency key")
   assertWellFormedString(input.inputChecksum, "Operation input checksum")
   assertWellFormedString(input.capabilitySnapshotChecksum, "Capability snapshot checksum")
+  if (!exactDenseArray(input.steps)) configurationError("Operation plan steps must be an array.")
   if (input.steps.length === 0) configurationError("An operation requires at least one step.")
 
   const steps = input.steps.map(normalizeStep).sort((left, right) => {
@@ -453,7 +567,9 @@ async function digestChecksum(input: Uint8Array, digest: DigestFunction, label: 
 }
 
 export function encodeOperationPlanChecksumInput(input: OperationPlanInput): Uint8Array {
-  const plan = normalizePlan(input)
+  const plan = normalizePlan(
+    captureConfiguration(input, "Operation plan input could not be captured safely."),
+  )
   return frameStrings(OPERATION_PLAN_DOMAIN, planChecksumValues(plan))
 }
 
@@ -461,7 +577,9 @@ export async function sealOperationPlan(
   input: OperationPlanInput,
   digest: DigestFunction,
 ): Promise<OperationPlan> {
-  const plan = normalizePlan(input)
+  const plan = normalizePlan(
+    captureConfiguration(input, "Operation plan input could not be captured safely."),
+  )
   const planChecksum = await digestChecksum(
     frameStrings(OPERATION_PLAN_DOMAIN, planChecksumValues(plan)),
     digest,
@@ -476,27 +594,38 @@ export async function loadOperationPlan(
   candidate: OperationPlan,
   digest: DigestFunction,
 ): Promise<OperationPlan> {
-  if (candidate.schemaVersion !== 1) {
+  const snapshot: unknown = capturePersisted(
+    candidate,
+    "The persisted operation plan could not be captured safely.",
+  )
+  persistedInvariant(plainRecord(snapshot), "The persisted operation plan is malformed.")
+  persistedInvariant(
+    Object.keys(snapshot).length === PERSISTED_OPERATION_PLAN_KEYS.size &&
+      Object.keys(snapshot).every((key) => PERSISTED_OPERATION_PLAN_KEYS.has(key)),
+    "The persisted operation plan fields are malformed.",
+  )
+  if (snapshot.schemaVersion !== 1) {
     interventionError("The persisted operation plan version is unsupported.")
   }
-  assertWellFormedString(candidate.planChecksum, "Operation plan checksum")
+  assertWellFormedString(snapshot.planChecksum as string, "Operation plan checksum")
+  const planChecksum = snapshot.planChecksum as string
   const normalized = normalizePlan({
-    capabilitySnapshotChecksum: candidate.capabilitySnapshotChecksum,
-    idempotencyKey: candidate.idempotencyKey,
-    inputChecksum: candidate.inputChecksum,
-    operationId: candidate.operationId,
-    operationType: candidate.operationType,
-    steps: candidate.steps,
+    capabilitySnapshotChecksum: snapshot.capabilitySnapshotChecksum as string,
+    idempotencyKey: snapshot.idempotencyKey as string,
+    inputChecksum: snapshot.inputChecksum as string,
+    operationId: snapshot.operationId as string,
+    operationType: snapshot.operationType as string,
+    steps: snapshot.steps as readonly OperationStepPlanInput[],
   })
   const actual = await digestChecksum(
     frameStrings(OPERATION_PLAN_DOMAIN, planChecksumValues(normalized)),
     digest,
     "Operation plan checksum",
   )
-  if (actual !== candidate.planChecksum) {
+  if (actual !== planChecksum) {
     interventionError("The persisted operation plan checksum does not match its contents.")
   }
-  const loaded = Object.freeze({ ...normalized, planChecksum: candidate.planChecksum })
+  const loaded = Object.freeze({ ...normalized, planChecksum })
   TRUSTED_OPERATION_PLANS.add(loaded)
   return loaded
 }
@@ -567,6 +696,20 @@ function plainRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false
   const prototype = Object.getPrototypeOf(value)
   return prototype === Object.prototype || prototype === null
+}
+
+function exactDenseArray(value: unknown): value is readonly unknown[] {
+  if (!Array.isArray(value)) return false
+  const keys = Object.keys(value)
+  return keys.length === value.length && keys.every((key, index) => key === String(index))
+}
+
+function exactRecordKeys(value: unknown, expectedKeys: ReadonlySet<string>): boolean {
+  return (
+    plainRecord(value) &&
+    Object.keys(value).length === expectedKeys.size &&
+    Object.keys(value).every((key) => expectedKeys.has(key))
+  )
 }
 
 function persistedInvariant(condition: boolean, message: string): asserts condition {
@@ -655,6 +798,10 @@ function loadPersistedStepRecord(value: unknown, planStep: OperationStepPlan): O
     "Persisted progress counters",
   )
   const state = value.state as OperationStepState
+  persistedInvariant(
+    state !== "retryable_failed" || planStep.retryClassification !== "never",
+    "A persisted never-retry step cannot remain retryable.",
+  )
   const pending = state === "pending"
   const neverAttempted = pending || state === "not_required"
   persistedInvariant(
@@ -752,16 +899,20 @@ export async function loadOperationRecord(
   candidate: unknown,
   digest: DigestFunction,
 ): Promise<OperationRecord> {
-  persistedInvariant(plainRecord(candidate), "The persisted operation record is malformed.")
+  const snapshot: unknown = capturePersisted(
+    candidate,
+    "The persisted operation record could not be captured safely.",
+  )
+  persistedInvariant(plainRecord(snapshot), "The persisted operation record is malformed.")
   persistedInvariant(
-    Object.keys(candidate).every((key) => key === "plan" || key === "steps"),
+    Object.keys(snapshot).every((key) => key === "plan" || key === "steps"),
     "The persisted operation record contains unknown fields.",
   )
-  persistedInvariant(plainRecord(candidate.plan), "The persisted operation plan is malformed.")
-  persistedInvariant(plainRecord(candidate.steps), "The persisted operation steps are malformed.")
-  const plan = await loadOperationPlan(candidate.plan as unknown as OperationPlan, digest)
+  persistedInvariant(plainRecord(snapshot.plan), "The persisted operation plan is malformed.")
+  persistedInvariant(plainRecord(snapshot.steps), "The persisted operation steps are malformed.")
+  const plan = await loadOperationPlan(snapshot.plan as unknown as OperationPlan, digest)
   const expectedStepIds = plan.steps.map((step) => step.stepId)
-  const persistedStepIds = Object.keys(candidate.steps).sort()
+  const persistedStepIds = Object.keys(snapshot.steps).sort()
   persistedInvariant(
     expectedStepIds.length === persistedStepIds.length &&
       expectedStepIds.every((stepId, index) => stepId === persistedStepIds[index]),
@@ -769,7 +920,7 @@ export async function loadOperationRecord(
   )
   const steps: Record<string, OperationStepRecord> = {}
   for (const planStep of plan.steps) {
-    steps[planStep.stepId] = loadPersistedStepRecord(candidate.steps[planStep.stepId], planStep)
+    steps[planStep.stepId] = loadPersistedStepRecord(snapshot.steps[planStep.stepId], planStep)
   }
   return Object.freeze({ plan, steps: Object.freeze(steps) })
 }
@@ -1049,29 +1200,49 @@ export async function sealIrreversibleAuthorization(
   },
   digest: DigestFunction,
 ): Promise<IrreversibleAuthorization> {
-  assertWellFormedString(input.authorizationId, "Authorization ID")
-  assertWellFormedString(input.actorChecksum, "Authorization actor checksum")
-  assertWellFormedString(input.decisionChecksum, "Authorization decision checksum")
-  const step = plan.steps.find((candidate) => candidate.stepId === input.stepId)
+  if (!TRUSTED_OPERATION_PLANS.has(plan)) {
+    interventionError("Irreversible authorization requires a sealed or integrity-verified plan.")
+  }
+  const captured = captureConfiguration(
+    input,
+    "Irreversible authorization input could not be captured safely.",
+  )
+  if (
+    !plainRecord(captured) ||
+    Object.keys(captured).length !== IRREVERSIBLE_AUTHORIZATION_INPUT_KEYS.size ||
+    !Object.keys(captured).every((key) => IRREVERSIBLE_AUTHORIZATION_INPUT_KEYS.has(key))
+  ) {
+    configurationError("Irreversible authorization input fields are malformed.")
+  }
+  if (
+    !exactRecordKeys(captured.lease, FENCED_LEASE_RECORD_KEYS) ||
+    !exactRecordKeys(captured.leaseProof, LEASE_PROOF_KEYS)
+  ) {
+    configurationError("Irreversible authorization lease fields are malformed.")
+  }
+  assertWellFormedString(captured.authorizationId, "Authorization ID")
+  assertWellFormedString(captured.actorChecksum, "Authorization actor checksum")
+  assertWellFormedString(captured.decisionChecksum, "Authorization decision checksum")
+  const step = plan.steps.find((candidate) => candidate.stepId === captured.stepId)
   if (!step) configurationError("The authorized step is not part of the operation plan.")
   if (step.checkpoint !== "irreversible") {
     configurationError("Irreversible authorization can only seal an irreversible step.")
   }
-  assertLeaseAuthorized(input.lease, input.leaseProof, input.sealedAtServerTimeMs)
-  if (step.leaseKey !== input.lease.leaseKey)
+  assertLeaseAuthorized(captured.lease, captured.leaseProof, captured.sealedAtServerTimeMs)
+  if (step.leaseKey !== captured.lease.leaseKey)
     configurationError("Step and lease keys do not match.")
 
   const authorization = Object.freeze({
-    actorChecksum: input.actorChecksum,
-    authorizationId: input.authorizationId,
-    decisionChecksum: input.decisionChecksum,
-    fencingToken: input.leaseProof.fencingToken,
-    holderId: input.leaseProof.holderId,
-    leaseAcquisitionId: input.leaseProof.acquisitionId,
-    leaseKey: input.leaseProof.leaseKey,
+    actorChecksum: captured.actorChecksum,
+    authorizationId: captured.authorizationId,
+    decisionChecksum: captured.decisionChecksum,
+    fencingToken: captured.leaseProof.fencingToken,
+    holderId: captured.leaseProof.holderId,
+    leaseAcquisitionId: captured.leaseProof.acquisitionId,
+    leaseKey: captured.leaseProof.leaseKey,
     operationId: plan.operationId,
     planChecksum: plan.planChecksum,
-    sealedAtServerTimeMs: input.sealedAtServerTimeMs,
+    sealedAtServerTimeMs: captured.sealedAtServerTimeMs,
     schemaVersion: 1 as const,
     stepId: step.stepId,
     stepInputChecksum: step.inputChecksum,
@@ -1103,26 +1274,55 @@ export async function loadIrreversibleAuthorization(
   candidate: IrreversibleAuthorization,
   digest: DigestFunction,
 ): Promise<IrreversibleAuthorization> {
-  if (candidate.schemaVersion !== 1) {
+  const snapshot: unknown = capturePersisted(
+    candidate,
+    "The persisted irreversible authorization could not be captured safely.",
+  )
+  persistedInvariant(
+    plainRecord(snapshot) &&
+      Object.keys(snapshot).length === IRREVERSIBLE_AUTHORIZATION_KEYS.size &&
+      Object.keys(snapshot).every((key) => IRREVERSIBLE_AUTHORIZATION_KEYS.has(key)),
+    "The persisted irreversible authorization fields are malformed.",
+  )
+  if (snapshot.schemaVersion !== 1) {
     interventionError("The persisted irreversible authorization version is unsupported.")
   }
-  assertWellFormedString(candidate.actorChecksum, "Authorization actor checksum")
-  assertWellFormedString(candidate.authorizationChecksum, "Authorization checksum")
-  assertWellFormedString(candidate.authorizationId, "Authorization ID")
-  assertWellFormedString(candidate.decisionChecksum, "Authorization decision checksum")
-  assertPositiveSafeInteger(candidate.fencingToken, "Authorization fencing token")
-  assertWellFormedString(candidate.holderId, "Authorization holder ID")
-  assertWellFormedString(candidate.leaseAcquisitionId, "Authorization lease acquisition ID")
-  assertWellFormedString(candidate.leaseKey, "Authorization lease key")
-  assertWellFormedString(candidate.operationId, "Authorization operation ID")
-  assertWellFormedString(candidate.planChecksum, "Authorization plan checksum")
-  assertServerTime(candidate.sealedAtServerTimeMs, "Authorization seal time")
-  assertWellFormedString(candidate.stepId, "Authorization step ID")
-  assertWellFormedString(candidate.stepInputChecksum, "Authorization step input checksum")
-  if (!(await verifyIrreversibleAuthorizationChecksum(candidate, digest))) {
+  assertWellFormedString(snapshot.actorChecksum as string, "Authorization actor checksum")
+  assertWellFormedString(snapshot.authorizationChecksum as string, "Authorization checksum")
+  assertWellFormedString(snapshot.authorizationId as string, "Authorization ID")
+  assertWellFormedString(snapshot.decisionChecksum as string, "Authorization decision checksum")
+  assertPositiveSafeInteger(snapshot.fencingToken as number, "Authorization fencing token")
+  assertWellFormedString(snapshot.holderId as string, "Authorization holder ID")
+  assertWellFormedString(
+    snapshot.leaseAcquisitionId as string,
+    "Authorization lease acquisition ID",
+  )
+  assertWellFormedString(snapshot.leaseKey as string, "Authorization lease key")
+  assertWellFormedString(snapshot.operationId as string, "Authorization operation ID")
+  assertWellFormedString(snapshot.planChecksum as string, "Authorization plan checksum")
+  assertServerTime(snapshot.sealedAtServerTimeMs as number, "Authorization seal time")
+  assertWellFormedString(snapshot.stepId as string, "Authorization step ID")
+  assertWellFormedString(snapshot.stepInputChecksum as string, "Authorization step input checksum")
+  const authorization: IrreversibleAuthorization = {
+    actorChecksum: snapshot.actorChecksum as string,
+    authorizationId: snapshot.authorizationId as string,
+    decisionChecksum: snapshot.decisionChecksum as string,
+    fencingToken: snapshot.fencingToken as number,
+    holderId: snapshot.holderId as string,
+    leaseAcquisitionId: snapshot.leaseAcquisitionId as string,
+    leaseKey: snapshot.leaseKey as string,
+    operationId: snapshot.operationId as string,
+    planChecksum: snapshot.planChecksum as string,
+    sealedAtServerTimeMs: snapshot.sealedAtServerTimeMs as number,
+    schemaVersion: 1,
+    stepId: snapshot.stepId as string,
+    stepInputChecksum: snapshot.stepInputChecksum as string,
+    authorizationChecksum: snapshot.authorizationChecksum as string,
+  }
+  if (!(await verifyIrreversibleAuthorizationChecksum(authorization, digest))) {
     interventionError("The persisted irreversible authorization checksum does not match.")
   }
-  const loaded = Object.freeze({ ...candidate })
+  const loaded = Object.freeze(authorization)
   TRUSTED_IRREVERSIBLE_AUTHORIZATIONS.add(loaded)
   return loaded
 }
@@ -1517,6 +1717,7 @@ function recoverRunningStepAfterCrash(
   state: "retryable_failed" | "unknown",
   errorChecksum?: string,
 ): OperationRecord {
+  const planStep = getPlanStep(operation, stepId)
   const record = getStepRecord(operation, stepId)
   if (record.state !== "running") {
     resumeError("Only a running step can be recovered as an unknown crash outcome.")
@@ -1534,7 +1735,8 @@ function recoverRunningStepAfterCrash(
     lastAttemptId: record.lastAttemptId,
     progressCounters: record.progressCounters,
     startedAttempts: record.startedAttempts,
-    state,
+    state:
+      state === "retryable_failed" && planStep.retryClassification === "never" ? "failed" : state,
   }
   return updateStep(operation, stepId, recovered)
 }
@@ -1655,6 +1857,17 @@ export function recordStepReconciliation(
  * Records terminal non-application for a saga-receipt step. Generic success means the receipt was
  * classified; the coupled saga projection remains the authority for the business outcome.
  */
+function assertSagaClassificationMetadata(
+  record: OperationStepRecord,
+): asserts record is OperationStepRecord & {
+  readonly fencingToken: number
+  readonly lastAttemptId: string
+} {
+  if (!record.fencingToken || !record.lastAttemptId) {
+    interventionError("The saga step has incomplete classification metadata.")
+  }
+}
+
 export function recordSagaStepTerminalClassification(
   operation: OperationRecord,
   input: {
@@ -1668,17 +1881,40 @@ export function recordSagaStepTerminalClassification(
   if (planStep.effectProtocol !== "saga_receipt") {
     configurationError("Terminal saga classification requires a saga-receipt step.")
   }
-  const record = getStepRecord(operation, input.stepId)
-  if (record.state !== "unknown") {
-    resumeError("Only an unknown saga step can receive terminal classification.")
-  }
-  if (!record.fencingToken || !record.lastAttemptId) {
-    interventionError("The unknown saga step has incomplete classification metadata.")
-  }
   if (input.outcome !== "not_applied") {
     configurationError("Terminal saga classification outcome is invalid.")
   }
   assertWellFormedString(input.receiptOutcomeChecksum, "Terminal saga receipt-outcome checksum")
+  const record = getStepRecord(operation, input.stepId)
+  if (
+    record.state === "succeeded" ||
+    record.state === "unknown" ||
+    record.state === "retryable_failed"
+  ) {
+    assertSagaClassificationMetadata(record)
+  }
+  loadPersistedStepRecord(record, planStep)
+  if (record.state === "succeeded") {
+    if (
+      record.reconciliationEvidenceChecksum === input.receiptOutcomeChecksum &&
+      record.resultChecksum === input.receiptOutcomeChecksum
+    ) {
+      return operation
+    }
+    interventionError("A duplicate terminal saga classification contradicts durable evidence.")
+  }
+  if (record.state !== "unknown" && record.state !== "retryable_failed") {
+    resumeError("Only an unknown or retryable saga step can receive terminal classification.")
+  }
+  assertSagaClassificationMetadata(record)
+  if (
+    record.state === "retryable_failed" &&
+    input.receiptOutcomeChecksum !== (record.reconciliationEvidenceChecksum ?? record.errorChecksum)
+  ) {
+    interventionError(
+      "The terminal saga classification contradicts durable non-application evidence.",
+    )
+  }
 
   return updateStep(
     operation,
@@ -1735,16 +1971,39 @@ export async function appendAuditEvent(
   input: AuditEventInput,
   digest: DigestFunction,
 ): Promise<AuditEvent> {
-  validateAuditInput(input)
-  if (previous && input.serverTimeMs < previous.serverTimeMs) {
+  const captured = captureConfiguration(
+    { input, previous },
+    "Audit append input could not be captured safely.",
+  )
+  if (
+    !plainRecord(captured.input) ||
+    Object.keys(captured.input).length !== AUDIT_EVENT_INPUT_KEYS.size ||
+    !Object.keys(captured.input).every((key) => AUDIT_EVENT_INPUT_KEYS.has(key))
+  ) {
+    configurationError("Audit input fields are malformed.")
+  }
+  validateAuditInput(captured.input)
+  const verifiedPrevious =
+    captured.previous === undefined
+      ? undefined
+      : await loadAuditEventSnapshot(captured.previous, digest)
+  if (verifiedPrevious && captured.input.serverTimeMs < verifiedPrevious.serverTimeMs) {
     configurationError("Audit server time cannot decrease.")
   }
-  const sequence = checkedAdd(previous?.sequence ?? 0, 1, "Audit sequence")
+  const sequence = checkedAdd(verifiedPrevious?.sequence ?? 0, 1, "Audit sequence")
   const event = Object.freeze({
-    ...input,
-    previousHash: previous?.eventHash ?? null,
+    actorChecksum: captured.input.actorChecksum,
+    environmentId: captured.input.environmentId,
+    eventType: captured.input.eventType,
+    fencingToken: captured.input.fencingToken,
+    idempotencyKey: captured.input.idempotencyKey,
+    operationId: captured.input.operationId,
+    payloadChecksum: captured.input.payloadChecksum,
+    previousHash: verifiedPrevious?.eventHash ?? null,
     schemaVersion: 1 as const,
     sequence,
+    serverTimeMs: captured.input.serverTimeMs,
+    stepId: captured.input.stepId,
   })
   const eventHash = await digestChecksum(
     encodeAuditEventChecksumInput(event),
@@ -1770,47 +2029,48 @@ const PERSISTED_AUDIT_EVENT_KEYS = new Set([
   "stepId",
 ])
 
-export async function loadAuditEvent(
-  candidate: unknown,
+async function loadAuditEventSnapshot(
+  snapshot: unknown,
   digest: DigestFunction,
 ): Promise<AuditEvent> {
-  persistedInvariant(plainRecord(candidate), "The persisted audit event is malformed.")
+  persistedInvariant(plainRecord(snapshot), "The persisted audit event is malformed.")
   persistedInvariant(
-    Object.keys(candidate).every((key) => PERSISTED_AUDIT_EVENT_KEYS.has(key)),
-    "The persisted audit event contains unknown fields.",
+    Object.keys(snapshot).length === PERSISTED_AUDIT_EVENT_KEYS.size &&
+      Object.keys(snapshot).every((key) => PERSISTED_AUDIT_EVENT_KEYS.has(key)),
+    "The persisted audit event fields are malformed.",
   )
   persistedInvariant(
-    candidate.schemaVersion === 1,
+    snapshot.schemaVersion === 1,
     "The persisted audit event version is unsupported.",
   )
   persistedInvariant(
-    typeof candidate.sequence === "number" &&
-      Number.isSafeInteger(candidate.sequence) &&
-      candidate.sequence >= 1,
+    typeof snapshot.sequence === "number" &&
+      Number.isSafeInteger(snapshot.sequence) &&
+      snapshot.sequence >= 1,
     "The persisted audit sequence is malformed.",
   )
   persistedInvariant(
-    typeof candidate.serverTimeMs === "number" &&
-      Number.isSafeInteger(candidate.serverTimeMs) &&
-      candidate.serverTimeMs >= 0,
+    typeof snapshot.serverTimeMs === "number" &&
+      Number.isSafeInteger(snapshot.serverTimeMs) &&
+      snapshot.serverTimeMs >= 0,
     "The persisted audit server time is malformed.",
   )
-  const actorChecksum = persistedOptionalString(candidate.actorChecksum, "Audit actor checksum")
-  const environmentId = persistedOptionalString(candidate.environmentId, "Audit environment ID")
-  const eventHash = persistedOptionalString(candidate.eventHash, "Audit event checksum")
-  const eventType = persistedOptionalString(candidate.eventType, "Audit event type")
-  const idempotencyKey = persistedOptionalString(candidate.idempotencyKey, "Audit idempotency key")
-  const operationId = persistedOptionalString(candidate.operationId, "Audit operation ID")
+  const actorChecksum = persistedOptionalString(snapshot.actorChecksum, "Audit actor checksum")
+  const environmentId = persistedOptionalString(snapshot.environmentId, "Audit environment ID")
+  const eventHash = persistedOptionalString(snapshot.eventHash, "Audit event checksum")
+  const eventType = persistedOptionalString(snapshot.eventType, "Audit event type")
+  const idempotencyKey = persistedOptionalString(snapshot.idempotencyKey, "Audit idempotency key")
+  const operationId = persistedOptionalString(snapshot.operationId, "Audit operation ID")
   const payloadChecksum = persistedOptionalString(
-    candidate.payloadChecksum,
+    snapshot.payloadChecksum,
     "Audit payload checksum",
   )
   const previousHash =
-    candidate.previousHash === null
+    snapshot.previousHash === null
       ? null
-      : persistedOptionalString(candidate.previousHash, "Previous audit checksum")
+      : persistedOptionalString(snapshot.previousHash, "Previous audit checksum")
   const stepId =
-    candidate.stepId === null ? null : persistedOptionalString(candidate.stepId, "Audit step ID")
+    snapshot.stepId === null ? null : persistedOptionalString(snapshot.stepId, "Audit step ID")
   persistedInvariant(
     actorChecksum !== undefined &&
       environmentId !== undefined &&
@@ -1823,7 +2083,7 @@ export async function loadAuditEvent(
       stepId !== undefined,
     "The persisted audit event is incomplete.",
   )
-  const fencingToken = candidate.fencingToken
+  const fencingToken = snapshot.fencingToken
   persistedInvariant(
     fencingToken === null ||
       (typeof fencingToken === "number" && Number.isSafeInteger(fencingToken) && fencingToken >= 1),
@@ -1839,8 +2099,8 @@ export async function loadAuditEvent(
     payloadChecksum,
     previousHash,
     schemaVersion: 1,
-    sequence: candidate.sequence,
-    serverTimeMs: candidate.serverTimeMs,
+    sequence: snapshot.sequence,
+    serverTimeMs: snapshot.serverTimeMs,
     stepId,
   })
   const actual = await digestChecksum(
@@ -1852,22 +2112,39 @@ export async function loadAuditEvent(
   return Object.freeze({ ...event, eventHash })
 }
 
+export async function loadAuditEvent(
+  candidate: unknown,
+  digest: DigestFunction,
+): Promise<AuditEvent> {
+  const snapshot: unknown = capturePersisted(
+    candidate,
+    "The persisted audit event could not be captured safely.",
+  )
+  return loadAuditEventSnapshot(snapshot, digest)
+}
+
 export async function verifyAuditChain(
   events: readonly AuditEvent[],
   digest: DigestFunction,
 ): Promise<boolean> {
+  let snapshot: unknown
+  try {
+    snapshot = structuredClone(events)
+  } catch {
+    return false
+  }
+  if (!exactDenseArray(snapshot)) return false
   let previous: AuditEvent | undefined
-  for (const event of events) {
+  for (const candidate of snapshot) {
+    let event: AuditEvent
+    try {
+      event = await loadAuditEventSnapshot(candidate, digest)
+    } catch {
+      return false
+    }
     if (event.sequence !== (previous?.sequence ?? 0) + 1) return false
     if (event.previousHash !== (previous?.eventHash ?? null)) return false
     if (previous && event.serverTimeMs < previous.serverTimeMs) return false
-    const { eventHash, ...unsigned } = event
-    const actual = await digestChecksum(
-      encodeAuditEventChecksumInput(unsigned),
-      digest,
-      "Audit event checksum",
-    )
-    if (actual !== eventHash) return false
     previous = event
   }
   return true

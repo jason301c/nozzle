@@ -10,6 +10,7 @@ import {
   loadAuditEvent,
   loadOperationRecord,
   markOperationStepNotRequired,
+  markRunningStepNotDispatchedAfterCrash,
   markRunningStepsUnknownAfterCrash,
   type OperationPlan,
   type OperationRecord,
@@ -201,6 +202,22 @@ describe("persisted operation record integrity", () => {
       receiptOutcomeChecksum: "saga-terminal-receipt",
       stepId: "one",
     })
+    const sagaRetryable = recordStepFailure(
+      await started({ effectProtocol: "saga_receipt", retryClassification: "reconcile_first" }),
+      {
+        attemptId: "attempt-1",
+        counters: { cost: { calls: 1 }, progress: { receipts: 2 } },
+        errorChecksum: "saga-proven-absence",
+        outcome: "definitely_not_applied",
+        stepId: "one",
+      },
+    )
+    const classifiedSagaRetryable = recordSagaStepTerminalClassification(sagaRetryable, {
+      counters: { cost: { calls: 3 }, progress: { receipts: 4 } },
+      outcome: "not_applied",
+      receiptOutcomeChecksum: "saga-proven-absence",
+      stepId: "one",
+    })
     const conditional = createOperationRecord(
       await sealOperationPlan(
         {
@@ -246,6 +263,7 @@ describe("persisted operation record integrity", () => {
       reconciledCrash,
       reconciledNever,
       reconciledSagaTerminal,
+      classifiedSagaRetryable,
       notRequired,
     ]) {
       const loaded = await roundTrip(operation)
@@ -276,6 +294,82 @@ describe("persisted operation record integrity", () => {
       const loaded = await roundTrip(committed)
       expect(recordAtomicStepOutcome(loaded, input)).toBe(loaded)
     }
+  })
+
+  it("round trips exact saga terminal classification replays from both eligible states", async () => {
+    for (const outcome of ["unknown", "definitely_not_applied"] as const) {
+      const source = recordStepFailure(
+        await started({ effectProtocol: "saga_receipt", retryClassification: "reconcile_first" }),
+        {
+          attemptId: "attempt-1",
+          counters: { cost: { calls: 1 }, progress: { receipts: 2 } },
+          errorChecksum: `saga-${outcome}`,
+          outcome,
+          stepId: "one",
+        },
+      )
+      const input = {
+        counters: { cost: { calls: 3 }, progress: { receipts: 4 } },
+        outcome: "not_applied" as const,
+        receiptOutcomeChecksum:
+          outcome === "definitely_not_applied"
+            ? "saga-definitely_not_applied"
+            : `saga-terminal-${outcome}`,
+        stepId: "one",
+      }
+      const classified = recordSagaStepTerminalClassification(source, input)
+      const loaded = await roundTrip(classified)
+
+      expect(loaded).toEqual(classified)
+      expect(recordSagaStepTerminalClassification(loaded, input)).toBe(loaded)
+      expect(loaded.steps.one).toMatchObject({
+        costCounters: { calls: 4 },
+        progressCounters: { receipts: 6 },
+        reconciliationEvidenceChecksum: input.receiptOutcomeChecksum,
+        resultChecksum: input.receiptOutcomeChecksum,
+        state: "succeeded",
+      })
+      expect(() =>
+        recordSagaStepTerminalClassification(loaded, {
+          ...input,
+          receiptOutcomeChecksum: `${input.receiptOutcomeChecksum}:different`,
+        }),
+      ).toThrowError(expect.objectContaining({ code: "OperationInterventionRequiredError" }))
+    }
+  })
+
+  it("round trips terminal dispatch-absence evidence for a never-retry step", async () => {
+    const recovered = markRunningStepNotDispatchedAfterCrash(
+      await started({ effectProtocol: "provider_receipt", retryClassification: "never" }),
+      "one",
+      "provider-dispatch-absence",
+    )
+    const loaded = await roundTrip(recovered)
+
+    expect(loaded).toEqual(recovered)
+    expect(loaded.steps.one).toEqual({
+      costCounters: {},
+      fencingToken: 1,
+      lastAttemptId: "attempt-1",
+      progressCounters: {},
+      reconciliationEvidenceChecksum: "provider-dispatch-absence",
+      startedAttempts: 1,
+      state: "failed",
+    })
+    expect(Object.isFrozen(loaded.steps.one)).toBe(true)
+
+    const activeLease = lease()
+    expect(
+      beginOperationStep(loaded, {
+        attemptId: "attempt-2",
+        idempotencyKey: "step-key",
+        lease: activeLease,
+        leaseProof: leaseProof(activeLease),
+        observedPreconditionChecksum: "precondition",
+        serverTimeMs: 110,
+        stepId: "one",
+      }),
+    ).toEqual({ disposition: "blocked", operation: loaded })
   })
 
   it("round trips irreversible authorization only after an authorized attempt starts", async () => {
@@ -346,6 +440,30 @@ describe("persisted operation record integrity", () => {
         digest,
       ),
     ).rejects.toThrow(/membership/u)
+  })
+
+  it("owns the complete persisted record before awaiting plan verification", async () => {
+    const operation = createOperationRecord(await plan())
+    const serialized = structuredClone(operation) as {
+      plan: OperationPlan
+      steps: Record<string, unknown>
+    }
+    let mutated = false
+    const mutatingDigest: DigestFunction = async (input) => {
+      mutated = true
+      serialized.steps.one = { unexpected: "post-capture mutation" }
+      return digest(input)
+    }
+
+    await expect(loadOperationRecord(serialized, mutatingDigest)).resolves.toEqual(operation)
+    expect(mutated).toBe(true)
+    expect(serialized.steps.one).toEqual({ unexpected: "post-capture mutation" })
+    await expect(
+      loadOperationRecord(new Proxy(structuredClone(operation), {}), digest),
+    ).rejects.toMatchObject({
+      code: "OperationInterventionRequiredError",
+      message: "The persisted operation record could not be captured safely.",
+    })
   })
 
   it("rejects malformed step record structure, strings, counters, and scalar metadata", async () => {
@@ -434,6 +552,26 @@ describe("persisted operation record integrity", () => {
         loadOperationRecord(replaceStep(item.operation, item.step), digest),
       ).rejects.toThrow()
     }
+  })
+
+  it("rejects retryable persisted state under a sealed never-retry policy", async () => {
+    const failed = recordStepFailure(
+      await started({ effectProtocol: "saga_receipt", retryClassification: "never" }),
+      {
+        attemptId: "attempt-1",
+        errorChecksum: "confirmed-non-application",
+        outcome: "definitely_not_applied",
+        stepId: "one",
+      },
+    )
+    expect(failed.steps.one?.state).toBe("failed")
+
+    await expect(
+      loadOperationRecord(
+        replaceStep(failed, { ...failed.steps.one, state: "retryable_failed" }),
+        digest,
+      ),
+    ).rejects.toThrow(/never-retry/u)
   })
 
   it("rejects authorization on reversible steps and missing authorization after irreversible start", async () => {
