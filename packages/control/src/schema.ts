@@ -1,4 +1,4 @@
-export const CONTROL_SCHEMA_VERSION = 3 as const
+export const CONTROL_SCHEMA_VERSION = 4 as const
 
 export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_audit_log",
@@ -22,9 +22,11 @@ export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_provider_attempts",
   "nozzle_route_overrides",
   "nozzle_route_versions",
+  "nozzle_saga_action_attempt_outcome_payloads",
   "nozzle_saga_action_attempt_outcomes",
   "nozzle_saga_action_attempt_protocols",
   "nozzle_saga_action_attempts",
+  "nozzle_saga_outcome_payload_activations",
   "nozzle_sagas",
   "nozzle_schema_artifacts",
   "nozzle_schema_versions",
@@ -431,6 +433,135 @@ WHEN NEW."purpose" = 'effect'
         json_extract("step"."record_json", '$.authorizationChecksum')
   )
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_IRREVERSIBLE_AUTHORIZATION_RECEIPT_REQUIRED'); END`
+
+const SAGA_OUTCOME_PAYLOAD_TABLE_DEFINITION = `CREATE TABLE "nozzle_saga_action_attempt_outcome_payloads" (
+  "attempt_id" TEXT NOT NULL
+    REFERENCES "nozzle_saga_action_attempt_outcomes" ("attempt_id"),
+  "payload_kind" TEXT NOT NULL CHECK ("payload_kind" IN ('evidence', 'output', 'error')),
+  "payload_checksum" TEXT NOT NULL CHECK (
+    length("payload_checksum") = 64
+      AND "payload_checksum" NOT GLOB '*[^0-9a-f]*'
+  ),
+  "payload_json" TEXT NOT NULL CHECK (
+    json_valid("payload_json")
+      AND length(CAST("payload_json" AS BLOB)) BETWEEN 1 AND 1048576
+  ),
+  PRIMARY KEY ("attempt_id", "payload_kind")
+)`
+
+const SAGA_OUTCOME_PAYLOAD_ACTIVATION_TABLE_DEFINITION = `CREATE TABLE "nozzle_saga_outcome_payload_activations" (
+  "protocol_version" INTEGER PRIMARY KEY NOT NULL CHECK ("protocol_version" = 1),
+  "reader_barrier_checksum" TEXT NOT NULL CHECK (
+    length("reader_barrier_checksum") = 64
+      AND "reader_barrier_checksum" NOT GLOB '*[^0-9a-f]*'
+  ),
+  "activated_at_ms" INTEGER NOT NULL CHECK ("activated_at_ms" >= 0)
+)`
+
+const SAGA_OUTCOME_PAYLOAD_ACTIVATION_INSERT_V4_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_outcome_payload_activation_insert_v4"
+BEFORE INSERT ON "nozzle_saga_outcome_payload_activations"
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 4
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_ACTIVATION_UNPUBLISHED'); END`
+
+const SAGA_OUTCOME_PAYLOAD_ACTIVATION_UPDATE_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_outcome_payload_activation_update"
+BEFORE UPDATE ON "nozzle_saga_outcome_payload_activations"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_ACTIVATION_IMMUTABLE'); END`
+
+const SAGA_OUTCOME_PAYLOAD_ACTIVATION_DELETE_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_outcome_payload_activation_delete"
+BEFORE DELETE ON "nozzle_saga_outcome_payload_activations"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_ACTIVATION_PERSISTENT'); END`
+
+const SAGA_OUTCOME_PAYLOAD_INSERT_V4_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_outcome_payload_insert_v4"
+BEFORE INSERT ON "nozzle_saga_action_attempt_outcome_payloads"
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 4
+)
+OR NOT EXISTS (
+  SELECT 1 FROM "nozzle_saga_outcome_payload_activations" WHERE "protocol_version" = 1
+)
+OR NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_saga_action_attempt_outcomes" AS "outcome"
+  WHERE "outcome"."attempt_id" = NEW."attempt_id"
+    AND "outcome"."evidence_json" =
+      '{"kind":"evidence","storage":"nozzle.saga-outcome-payload.v1"}'
+    AND (
+      (
+        "outcome"."state" = 'confirmed'
+        AND "outcome"."output_json" =
+          '{"kind":"output","storage":"nozzle.saga-outcome-payload.v1"}'
+        AND "outcome"."error_json" IS NULL
+      )
+      OR (
+        "outcome"."state" <> 'confirmed'
+        AND "outcome"."error_json" =
+          '{"kind":"error","storage":"nozzle.saga-outcome-payload.v1"}'
+        AND "outcome"."output_json" IS NULL
+      )
+    )
+    AND (
+      (
+        NEW."payload_kind" = 'evidence'
+        AND NEW."payload_checksum" = "outcome"."evidence_checksum"
+      )
+      OR (
+        NEW."payload_kind" = 'output'
+        AND "outcome"."state" = 'confirmed'
+        AND NEW."payload_checksum" = "outcome"."output_checksum"
+      )
+      OR (
+        NEW."payload_kind" = 'error'
+        AND "outcome"."state" <> 'confirmed'
+        AND NEW."payload_checksum" = "outcome"."error_checksum"
+      )
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_FENCED'); END`
+
+const SAGA_OUTCOME_INLINE_BYTES_V4_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_outcome_inline_bytes_v4"
+BEFORE INSERT ON "nozzle_saga_action_attempt_outcomes"
+WHEN EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 4
+)
+AND NOT (
+  EXISTS (
+    SELECT 1 FROM "nozzle_saga_outcome_payload_activations" WHERE "protocol_version" = 1
+  )
+  AND NEW."evidence_json" =
+    '{"kind":"evidence","storage":"nozzle.saga-outcome-payload.v1"}'
+  AND (
+    (
+      NEW."state" = 'confirmed'
+      AND NEW."output_json" =
+        '{"kind":"output","storage":"nozzle.saga-outcome-payload.v1"}'
+      AND NEW."error_json" IS NULL
+    )
+    OR (
+      NEW."state" <> 'confirmed'
+      AND NEW."error_json" =
+        '{"kind":"error","storage":"nozzle.saga-outcome-payload.v1"}'
+      AND NEW."output_json" IS NULL
+    )
+  )
+)
+AND (
+  SELECT length(CAST("input_json" AS BLOB))
+  FROM "nozzle_saga_action_attempts"
+  WHERE "attempt_id" = NEW."attempt_id"
+)
+  + length(CAST(NEW."evidence_json" AS BLOB))
+  + length(CAST(COALESCE(NEW."output_json", NEW."error_json") AS BLOB)) > 1048576
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_INLINE_PAYLOAD_TOO_LARGE'); END`
+
+const SAGA_OUTCOME_PAYLOAD_UPDATE_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_outcome_payload_update"
+BEFORE UPDATE ON "nozzle_saga_action_attempt_outcome_payloads"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_IMMUTABLE'); END`
+
+const SAGA_OUTCOME_PAYLOAD_DELETE_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_outcome_payload_delete"
+BEFORE DELETE ON "nozzle_saga_action_attempt_outcome_payloads"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_PERSISTENT'); END`
 
 const SAGA_ATTEMPT_V2_BINDING = `EXISTS (
   SELECT 1
@@ -965,7 +1096,7 @@ ON CONFLICT ("schema_version") DO NOTHING;`,
   `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
 SELECT 0, 0
 WHERE EXISTS (
-  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 3
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 4
 );`,
   `INSERT INTO "nozzle_control_meta" ("schema_version", "installed_at_ms")
 VALUES (1, CAST(unixepoch('subsec') * 1000 AS INTEGER))
@@ -2040,17 +2171,79 @@ WHERE EXISTS (
   `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
 VALUES (3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
 ON CONFLICT ("schema_version") DO NOTHING;`,
+  tableInstallStatement(SAGA_OUTCOME_PAYLOAD_ACTIVATION_TABLE_DEFINITION),
+  tableDefinitionGuard(SAGA_OUTCOME_PAYLOAD_ACTIVATION_TABLE_DEFINITION),
+  triggerInstallStatement(SAGA_OUTCOME_PAYLOAD_ACTIVATION_INSERT_V4_DEFINITION),
+  triggerDefinitionGuard(SAGA_OUTCOME_PAYLOAD_ACTIVATION_INSERT_V4_DEFINITION),
+  triggerInstallStatement(SAGA_OUTCOME_PAYLOAD_ACTIVATION_UPDATE_DEFINITION),
+  triggerDefinitionGuard(SAGA_OUTCOME_PAYLOAD_ACTIVATION_UPDATE_DEFINITION),
+  triggerInstallStatement(SAGA_OUTCOME_PAYLOAD_ACTIVATION_DELETE_DEFINITION),
+  triggerDefinitionGuard(SAGA_OUTCOME_PAYLOAD_ACTIVATION_DELETE_DEFINITION),
+  tableInstallStatement(SAGA_OUTCOME_PAYLOAD_TABLE_DEFINITION),
+  tableDefinitionGuard(SAGA_OUTCOME_PAYLOAD_TABLE_DEFINITION),
+  triggerInstallStatement(SAGA_OUTCOME_INLINE_BYTES_V4_DEFINITION),
+  triggerDefinitionGuard(SAGA_OUTCOME_INLINE_BYTES_V4_DEFINITION),
+  triggerInstallStatement(SAGA_OUTCOME_PAYLOAD_INSERT_V4_DEFINITION),
+  triggerDefinitionGuard(SAGA_OUTCOME_PAYLOAD_INSERT_V4_DEFINITION),
+  triggerInstallStatement(SAGA_OUTCOME_PAYLOAD_UPDATE_DEFINITION),
+  triggerDefinitionGuard(SAGA_OUTCOME_PAYLOAD_UPDATE_DEFINITION),
+  triggerInstallStatement(SAGA_OUTCOME_PAYLOAD_DELETE_DEFINITION),
+  triggerDefinitionGuard(SAGA_OUTCOME_PAYLOAD_DELETE_DEFINITION),
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 4
+)
+AND EXISTS (
+  SELECT 1 FROM "nozzle_saga_outcome_payload_activations"
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 4
+)
+AND EXISTS (
+  SELECT 1 FROM "nozzle_saga_action_attempt_outcome_payloads"
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (4, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`,
 ])
 
 const CONTROL_SCHEMA_VERSION_TWO_PUBLICATION = `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
 VALUES (2, CAST(unixepoch('subsec') * 1000 AS INTEGER))
 ON CONFLICT ("schema_version") DO NOTHING;`
 
+const CONTROL_SCHEMA_VERSION_THREE_PUBLICATION = `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`
+
+function versionThreeArtifactStatement(statement: string): string {
+  return statement.includes(
+    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 4',
+  )
+    ? statement.replace('WHERE "schema_version" > 4', 'WHERE "schema_version" > 3')
+    : statement
+}
+
+const versionThreePublicationIndex = CONTROL_SCHEMA_STATEMENTS.indexOf(
+  CONTROL_SCHEMA_VERSION_THREE_PUBLICATION,
+)
+
+export const CONTROL_SCHEMA_VERSION_THREE_STATEMENTS = Object.freeze(
+  CONTROL_SCHEMA_STATEMENTS.slice(0, versionThreePublicationIndex + 1).map(
+    versionThreeArtifactStatement,
+  ),
+)
+
+export const CONTROL_SCHEMA_VERSION_THREE_ARTIFACT_SHA256 =
+  "9832be0c7203fb9bd45c648486a414e7a0a61cf605bfbcd38c324a92440de27d" as const
+
 function versionTwoArtifactStatement(statement: string): string {
   return statement.includes(
-    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 3',
+    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 4',
   )
-    ? statement.replace('WHERE "schema_version" > 3', 'WHERE "schema_version" > 2')
+    ? statement.replace('WHERE "schema_version" > 4', 'WHERE "schema_version" > 2')
     : statement
 }
 
@@ -2109,4 +2302,8 @@ export function controlSchemaVersionOneSql(): string {
 
 export function controlSchemaVersionTwoSql(): string {
   return `${CONTROL_SCHEMA_VERSION_TWO_STATEMENTS.join("\n\n")}\n`
+}
+
+export function controlSchemaVersionThreeSql(): string {
+  return `${CONTROL_SCHEMA_VERSION_THREE_STATEMENTS.join("\n\n")}\n`
 }

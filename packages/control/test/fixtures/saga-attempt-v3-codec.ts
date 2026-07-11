@@ -63,18 +63,18 @@ export const SAGA_ATTEMPT_ERROR_DOMAIN = "nozzle.saga-action-error.v1"
 const ACCEPTANCE_DOMAIN = "nozzle.saga-action-acceptance.v2"
 const OUTCOME_DOMAIN = "nozzle.saga-action-outcome.v1"
 
-const SAGA_OUTCOME_PAYLOAD_STORAGE = "nozzle.saga-outcome-payload.v1"
-export const SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON = `{"kind":"evidence","storage":"${SAGA_OUTCOME_PAYLOAD_STORAGE}"}`
-export const SAGA_OUTCOME_OUTPUT_REFERENCE_JSON = `{"kind":"output","storage":"${SAGA_OUTCOME_PAYLOAD_STORAGE}"}`
-export const SAGA_OUTCOME_ERROR_REFERENCE_JSON = `{"kind":"error","storage":"${SAGA_OUTCOME_PAYLOAD_STORAGE}"}`
-
-export interface SagaAttemptIdentityRow {
+export interface SagaAttemptRow {
   readonly acceptance_checksum: string
   readonly accepted_at_ms: number
   readonly acquisition_id: string
   readonly action_key: string
   readonly attempt_id: string
   readonly causal_attempt_id: string | null
+  readonly completed_at_ms: number | null
+  readonly error_checksum: string | null
+  readonly error_json: string | null
+  readonly evidence_checksum: string | null
+  readonly evidence_json: string | null
   readonly fencing_token: number
   readonly holder_id: string
   readonly idempotency_key: string
@@ -83,41 +83,30 @@ export interface SagaAttemptIdentityRow {
   readonly lease_key: string
   readonly operation_id: string
   readonly operation_step_id: string
+  readonly outcome_checksum: string | null
+  readonly output_checksum: string | null
+  readonly output_json: string | null
   readonly phase: string
   readonly protocol_classified_at_ms: number | null
   readonly protocol_version: number | null
   readonly purpose: string
   readonly saga_id: string
   readonly saga_step_id: string
+  readonly state: string | null
 }
 
-export interface SagaAttemptOutcomeRow {
-  readonly attempt_id: string
-  readonly completed_at_ms: number
-  readonly error_checksum: string | null
-  readonly error_json: string | null
-  readonly evidence_checksum: string
-  readonly evidence_json: string
-  readonly outcome_checksum: string
-  readonly output_checksum: string | null
-  readonly output_json: string | null
-  readonly state: string
-}
-
-export interface SagaAttemptPayloadRow {
-  readonly attempt_id: string
-  readonly payload_checksum: string
-  readonly payload_json: string
-  readonly payload_kind: string
-}
-
-const SAGA_ATTEMPT_IDENTITY_ROW_KEYS = [
+const SAGA_ATTEMPT_ROW_KEYS = [
   "acceptance_checksum",
   "accepted_at_ms",
   "acquisition_id",
   "action_key",
   "attempt_id",
   "causal_attempt_id",
+  "completed_at_ms",
+  "error_checksum",
+  "error_json",
+  "evidence_checksum",
+  "evidence_json",
   "fencing_token",
   "holder_id",
   "idempotency_key",
@@ -126,35 +115,19 @@ const SAGA_ATTEMPT_IDENTITY_ROW_KEYS = [
   "lease_key",
   "operation_id",
   "operation_step_id",
+  "outcome_checksum",
+  "output_checksum",
+  "output_json",
   "phase",
   "protocol_classified_at_ms",
   "protocol_version",
   "purpose",
   "saga_id",
   "saga_step_id",
-] as const satisfies readonly (keyof SagaAttemptIdentityRow)[]
-
-const SAGA_ATTEMPT_OUTCOME_ROW_KEYS = [
-  "attempt_id",
-  "completed_at_ms",
-  "error_checksum",
-  "error_json",
-  "evidence_checksum",
-  "evidence_json",
-  "outcome_checksum",
-  "output_checksum",
-  "output_json",
   "state",
-] as const satisfies readonly (keyof SagaAttemptOutcomeRow)[]
+] as const satisfies readonly (keyof SagaAttemptRow)[]
 
-const SAGA_ATTEMPT_PAYLOAD_ROW_KEYS = [
-  "attempt_id",
-  "payload_checksum",
-  "payload_json",
-  "payload_kind",
-] as const satisfies readonly (keyof SagaAttemptPayloadRow)[]
-
-export const SAGA_ATTEMPT_IDENTITY_ROW_SELECT = `
+export const SAGA_ATTEMPT_ROW_SELECT = `
   "attempt"."acceptance_checksum", "attempt"."accepted_at_ms",
   "attempt"."acquisition_id", "attempt"."action_key", "attempt"."attempt_id",
   "attempt"."causal_attempt_id", "attempt"."fencing_token", "attempt"."holder_id",
@@ -162,17 +135,10 @@ export const SAGA_ATTEMPT_IDENTITY_ROW_SELECT = `
   "attempt"."lease_key", "attempt"."operation_id", "attempt"."operation_step_id",
   "attempt"."phase", "attempt"."purpose", "attempt"."saga_id",
   "attempt"."saga_step_id", "protocol"."protocol_version",
-  "protocol"."classified_at_ms" AS "protocol_classified_at_ms"`
-
-export const SAGA_ATTEMPT_OUTCOME_ROW_SELECT = `
-  "outcome"."attempt_id", "outcome"."state", "outcome"."evidence_checksum",
-  "outcome"."evidence_json", "outcome"."output_checksum", "outcome"."output_json",
-  "outcome"."error_checksum", "outcome"."error_json", "outcome"."outcome_checksum",
-  "outcome"."completed_at_ms"`
-
-export const SAGA_ATTEMPT_PAYLOAD_ROW_SELECT = `
-  "payload"."attempt_id", "payload"."payload_kind", "payload"."payload_checksum",
-  "payload"."payload_json"`
+  "protocol"."classified_at_ms" AS "protocol_classified_at_ms",
+  "outcome"."state", "outcome"."evidence_checksum", "outcome"."evidence_json",
+  "outcome"."output_checksum", "outcome"."output_json", "outcome"."error_checksum",
+  "outcome"."error_json", "outcome"."outcome_checksum", "outcome"."completed_at_ms"`
 
 function configuration(message: string): never {
   throw new NozzleError("ConfigurationError", message)
@@ -187,46 +153,23 @@ function plainRecord(value: unknown): value is Record<string, unknown> {
   return Object.getPrototypeOf(value) === Object.prototype
 }
 
-function exactRow<T extends object>(value: unknown, keys: readonly (keyof T)[]): value is T {
+function exactRow(value: unknown): value is SagaAttemptRow {
   return (
     plainRecord(value) &&
-    Object.keys(value).length === keys.length &&
-    keys.every((key) => Object.hasOwn(value, key))
+    Object.keys(value).length === SAGA_ATTEMPT_ROW_KEYS.length &&
+    SAGA_ATTEMPT_ROW_KEYS.every((key) => Object.hasOwn(value, key))
   )
 }
 
-function captureRow<T extends object>(
-  value: unknown,
-  keys: readonly (keyof T)[],
-  label: string,
-): T {
+function captureRow(value: unknown): SagaAttemptRow {
   let snapshot: unknown
   try {
     snapshot = structuredClone(value)
   } catch {
-    return intervention(`The persisted ${label} row could not be captured safely.`)
+    return intervention("The persisted saga-attempt row could not be captured safely.")
   }
-  if (!exactRow<T>(snapshot, keys)) {
-    return intervention(`Persisted ${label} row fields are malformed.`)
-  }
-  return snapshot
-}
-
-function capturePayloadRows(value: unknown): readonly SagaAttemptPayloadRow[] {
-  let snapshot: unknown
-  try {
-    snapshot = structuredClone(value)
-  } catch {
-    return intervention("The persisted saga-attempt payload rows could not be captured safely.")
-  }
-  if (
-    !Array.isArray(snapshot) ||
-    snapshot.length > 3 ||
-    Object.keys(snapshot).length !== snapshot.length ||
-    Object.keys(snapshot).some((key, index) => key !== String(index)) ||
-    !snapshot.every((row) => exactRow<SagaAttemptPayloadRow>(row, SAGA_ATTEMPT_PAYLOAD_ROW_KEYS))
-  ) {
-    return intervention("Persisted saga-attempt payload row fields are malformed.")
+  if (!exactRow(snapshot)) {
+    return intervention("Persisted saga-attempt row fields are malformed.")
   }
   return snapshot
 }
@@ -237,10 +180,6 @@ function persistedText(value: unknown, maximumBytes = MAX_TEXT_BYTES): value is 
     value.trim().length > 0 &&
     new TextEncoder().encode(value).byteLength <= maximumBytes
   )
-}
-
-function persistedChecksum(value: unknown): value is string {
-  return typeof value === "string" && CHECKSUM.test(value)
 }
 
 export function boundedSagaReceiptText(
@@ -383,17 +322,13 @@ export async function sagaAttemptOutcomeChecksum(
   ])
 }
 
-export async function loadSagaAttemptIdentityRow(
+export async function loadSagaAttemptRecordRow(
   candidate: unknown,
   digest: DigestFunction,
   expectedAttemptId?: string,
-): Promise<SagaAttemptIdentity> {
+): Promise<SagaAttemptRecord> {
   if (typeof digest !== "function") configuration("A saga-attempt digest is required.")
-  const row = captureRow<SagaAttemptIdentityRow>(
-    candidate,
-    SAGA_ATTEMPT_IDENTITY_ROW_KEYS,
-    "saga-attempt identity",
-  )
+  const row = captureRow(candidate)
   if (
     !persistedText(row.attempt_id) ||
     (expectedAttemptId !== undefined && row.attempt_id !== expectedAttemptId) ||
@@ -408,8 +343,8 @@ export async function loadSagaAttemptIdentityRow(
     (row.purpose !== "effect" && row.purpose !== "observation") ||
     !persistedText(row.action_key) ||
     !persistedText(row.idempotency_key) ||
-    !persistedChecksum(row.input_checksum) ||
-    !persistedChecksum(row.acceptance_checksum) ||
+    !persistedText(row.input_checksum) ||
+    !persistedText(row.acceptance_checksum) ||
     !persistedText(row.lease_key) ||
     !persistedText(row.holder_id) ||
     !persistedText(row.acquisition_id) ||
@@ -462,134 +397,77 @@ export async function loadSagaAttemptIdentityRow(
   if (actualInputChecksum !== row.input_checksum || actualAcceptance !== row.acceptance_checksum) {
     return intervention("Persisted saga-attempt acceptance checksums do not match.")
   }
-  return Object.freeze({
+  const identity: SagaAttemptIdentity = Object.freeze({
     ...identityWithoutReceipt,
     acceptanceChecksum: row.acceptance_checksum,
     acceptedAtMs: row.accepted_at_ms,
     protocolVersion,
   })
-}
-
-export function acceptedSagaAttemptRecord(identity: SagaAttemptIdentity): SagaAttemptRecord {
-  return Object.freeze({ ...identity, state: "accepted" })
-}
-
-export async function loadSagaAttemptOutcomeRow(
-  candidate: unknown,
-  payloadCandidates: unknown,
-  identity: SagaAttemptIdentity,
-  digest: DigestFunction,
-): Promise<SagaAttemptRecord> {
-  if (typeof digest !== "function") configuration("A saga-attempt digest is required.")
-  const row = captureRow<SagaAttemptOutcomeRow>(
-    candidate,
-    SAGA_ATTEMPT_OUTCOME_ROW_KEYS,
-    "saga-attempt outcome",
-  )
-  const payloadRows = capturePayloadRows(payloadCandidates)
-  if (
-    row.attempt_id !== identity.attemptId ||
-    (row.state !== "confirmed" &&
-      row.state !== "failed" &&
-      row.state !== "indeterminate" &&
-      row.state !== "not_applied" &&
-      row.state !== "unknown")
-  ) {
-    return intervention("Persisted saga-attempt outcome identity is malformed.")
+  if (row.state === null) {
+    if (
+      row.evidence_checksum !== null ||
+      row.evidence_json !== null ||
+      row.output_checksum !== null ||
+      row.output_json !== null ||
+      row.error_checksum !== null ||
+      row.error_json !== null ||
+      row.outcome_checksum !== null ||
+      row.completed_at_ms !== null
+    ) {
+      return intervention("Persisted accepted saga attempt contains partial outcome data.")
+    }
+    return Object.freeze({ ...identity, state: "accepted" })
   }
-  const state = row.state as SagaAttemptOutcomeState
+  if (
+    row.state !== "confirmed" &&
+    row.state !== "failed" &&
+    row.state !== "indeterminate" &&
+    row.state !== "not_applied" &&
+    row.state !== "unknown"
+  ) {
+    return intervention("Persisted saga-attempt outcome state is unsupported.")
+  }
   const compatibleState =
-    identity.purpose === "effect"
-      ? state !== "indeterminate"
-      : state !== "failed" && state !== "unknown"
+    purpose === "effect"
+      ? row.state !== "indeterminate"
+      : row.state !== "failed" && row.state !== "unknown"
   if (!compatibleState) {
     return intervention("Persisted saga-attempt has an incompatible outcome for its purpose.")
   }
   if (
     !Number.isSafeInteger(row.completed_at_ms) ||
-    row.completed_at_ms < identity.acceptedAtMs ||
-    !persistedChecksum(row.evidence_checksum) ||
-    !persistedChecksum(row.outcome_checksum)
+    (row.completed_at_ms as number) < identity.acceptedAtMs ||
+    !persistedText(row.evidence_checksum) ||
+    !persistedText(row.outcome_checksum)
   ) {
     return intervention("Persisted terminal saga attempt is incomplete.")
   }
-  const confirmed = state === "confirmed"
+  const confirmed = row.state === "confirmed"
   if (
     (confirmed && (row.error_checksum !== null || row.error_json !== null)) ||
     (!confirmed && (row.output_checksum !== null || row.output_json !== null))
   ) {
     return intervention("Persisted terminal saga attempt value columns are contradictory.")
   }
-  const valueChecksum = confirmed ? row.output_checksum : row.error_checksum
-  const inlineValueJson = confirmed ? row.output_json : row.error_json
-  if (!persistedChecksum(valueChecksum)) {
-    return intervention("Persisted terminal saga attempt value checksum is missing.")
-  }
-
-  let evidenceJson: string
-  let valueJson: string
-  if (payloadRows.length === 0) {
-    evidenceJson = canonicalSagaReceiptJson(
-      row.evidence_json,
-      "Persisted saga action evidence",
-      true,
-    )
-    valueJson = canonicalSagaReceiptJson(
-      inlineValueJson,
-      confirmed ? "Persisted saga action output" : "Persisted saga action error",
-      true,
-    )
-  } else {
-    const expectedValueKind = confirmed ? "output" : "error"
-    const expectedValueReference = confirmed
-      ? SAGA_OUTCOME_OUTPUT_REFERENCE_JSON
-      : SAGA_OUTCOME_ERROR_REFERENCE_JSON
-    if (
-      row.evidence_json !== SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON ||
-      inlineValueJson !== expectedValueReference ||
-      payloadRows.length !== 2
-    ) {
-      return intervention("Persisted saga-attempt payload references are malformed.")
-    }
-    const byKind = new Map<string, SagaAttemptPayloadRow>()
-    for (const payload of payloadRows) {
-      if (
-        payload.attempt_id !== identity.attemptId ||
-        (payload.payload_kind !== "evidence" && payload.payload_kind !== expectedValueKind) ||
-        !persistedChecksum(payload.payload_checksum) ||
-        byKind.has(payload.payload_kind)
-      ) {
-        return intervention("Persisted saga-attempt payload identity is malformed.")
-      }
-      byKind.set(payload.payload_kind, payload)
-    }
-    const evidence = byKind.get("evidence")
-    const value = byKind.get(expectedValueKind)
-    if (
-      evidence === undefined ||
-      value === undefined ||
-      evidence.payload_checksum !== row.evidence_checksum ||
-      value.payload_checksum !== valueChecksum
-    ) {
-      return intervention("Persisted saga-attempt payload set is incomplete or contradictory.")
-    }
-    evidenceJson = canonicalSagaReceiptJson(
-      evidence.payload_json,
-      "Persisted saga action evidence payload",
-      true,
-    )
-    valueJson = canonicalSagaReceiptJson(
-      value.payload_json,
-      confirmed ? "Persisted saga action output payload" : "Persisted saga action error payload",
-      true,
-    )
-  }
-
+  const evidenceJson = canonicalSagaReceiptJson(
+    row.evidence_json,
+    "Persisted saga action evidence",
+    true,
+  )
   const actualEvidenceChecksum = await sagaReceiptPayloadChecksum(
     digest,
     SAGA_ATTEMPT_EVIDENCE_DOMAIN,
     evidenceJson,
   )
+  const valueJson = canonicalSagaReceiptJson(
+    confirmed ? row.output_json : row.error_json,
+    confirmed ? "Persisted saga action output" : "Persisted saga action error",
+    true,
+  )
+  const valueChecksum = confirmed ? row.output_checksum : row.error_checksum
+  if (!persistedText(valueChecksum)) {
+    return intervention("Persisted terminal saga attempt value checksum is missing.")
+  }
   const actualValueChecksum = await sagaReceiptPayloadChecksum(
     digest,
     confirmed ? SAGA_ATTEMPT_OUTPUT_DOMAIN : SAGA_ATTEMPT_ERROR_DOMAIN,
@@ -598,8 +476,8 @@ export async function loadSagaAttemptOutcomeRow(
   const actualOutcome = await sagaAttemptOutcomeChecksum(
     digest,
     identity.acceptanceChecksum,
-    state,
-    row.evidence_checksum,
+    row.state,
+    row.evidence_checksum as string,
     evidenceJson,
     valueChecksum,
     valueJson,
@@ -615,23 +493,23 @@ export async function loadSagaAttemptOutcomeRow(
     confirmed
       ? {
           ...identity,
-          completedAtMs: row.completed_at_ms,
-          evidenceChecksum: row.evidence_checksum,
+          completedAtMs: row.completed_at_ms as number,
+          evidenceChecksum: row.evidence_checksum as string,
           evidenceJson,
-          outcomeChecksum: row.outcome_checksum,
+          outcomeChecksum: row.outcome_checksum as string,
           outputChecksum: valueChecksum,
           outputJson: valueJson,
           state: "confirmed",
         }
       : {
           ...identity,
-          completedAtMs: row.completed_at_ms,
+          completedAtMs: row.completed_at_ms as number,
           errorChecksum: valueChecksum,
           errorJson: valueJson,
-          evidenceChecksum: row.evidence_checksum,
+          evidenceChecksum: row.evidence_checksum as string,
           evidenceJson,
-          outcomeChecksum: row.outcome_checksum,
-          state: state as Exclude<SagaAttemptOutcomeState, "confirmed">,
+          outcomeChecksum: row.outcome_checksum as string,
+          state: row.state,
         },
   )
 }

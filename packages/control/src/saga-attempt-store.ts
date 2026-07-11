@@ -11,19 +11,28 @@ import {
 import type { ControlRunResult, TransactionalControlDatabase } from "./database.js"
 import { D1OperationStore } from "./operation-store.js"
 import {
+  acceptedSagaAttemptRecord,
   boundedSagaReceiptText,
   canonicalSagaReceiptJson,
-  loadSagaAttemptRecordRow,
+  loadSagaAttemptIdentityRow,
+  loadSagaAttemptOutcomeRow,
   MAX_SAGA_RECEIPT_IDENTITY_BYTES,
   SAGA_ATTEMPT_ERROR_DOMAIN,
   SAGA_ATTEMPT_EVIDENCE_DOMAIN,
+  SAGA_ATTEMPT_IDENTITY_ROW_SELECT,
   SAGA_ATTEMPT_INPUT_DOMAIN,
+  SAGA_ATTEMPT_OUTCOME_ROW_SELECT,
   SAGA_ATTEMPT_OUTPUT_DOMAIN,
-  SAGA_ATTEMPT_ROW_SELECT,
+  SAGA_ATTEMPT_PAYLOAD_ROW_SELECT,
+  SAGA_OUTCOME_ERROR_REFERENCE_JSON,
+  SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON,
+  SAGA_OUTCOME_OUTPUT_REFERENCE_JSON,
+  type SagaAttemptIdentityRow,
+  type SagaAttemptOutcomeRow,
   type SagaAttemptOutcomeState,
+  type SagaAttemptPayloadRow,
   type SagaAttemptPurpose,
   type SagaAttemptRecord,
-  type SagaAttemptRow,
   sagaAttemptAcceptanceChecksum,
   sagaAttemptOutcomeChecksum,
   sagaReceiptPayloadChecksum,
@@ -38,6 +47,7 @@ export type {
 } from "./saga-attempt-codec.js"
 
 const SERVER_TIME_SQL = `CAST(unixepoch('subsec') * 1000 AS INTEGER)`
+const CHECKSUM = /^[0-9a-f]{64}$/u
 
 export interface AcceptSagaAttemptInput {
   readonly attemptId: string
@@ -73,6 +83,48 @@ export interface ValidateSagaProjectionReceiptInput {
 
 interface SagaProjectionRow {
   readonly operation_id: string
+}
+
+interface SagaOutcomePayloadActivationRow {
+  readonly activated_at_ms: unknown
+  readonly protocol_version: unknown
+  readonly reader_barrier_checksum: unknown
+}
+
+interface SagaSchemaVersionRow {
+  readonly schema_version: unknown
+}
+
+function capturedPlainRecord(value: unknown, label: string): Record<string, unknown> {
+  let snapshot: unknown
+  try {
+    snapshot = structuredClone(value)
+  } catch {
+    return intervention(`${label} could not be captured safely.`)
+  }
+  if (
+    typeof snapshot !== "object" ||
+    snapshot === null ||
+    Array.isArray(snapshot) ||
+    Object.getPrototypeOf(snapshot) !== Object.prototype
+  ) {
+    return intervention(`${label} is malformed.`)
+  }
+  return snapshot as Record<string, unknown>
+}
+
+function capturedQueryRows(value: unknown): readonly unknown[] {
+  const result = capturedPlainRecord(value, "Control D1 saga-payload query metadata")
+  if (
+    result.success !== true ||
+    typeof result.meta !== "object" ||
+    result.meta === null ||
+    Array.isArray(result.meta) ||
+    !Array.isArray(result.results)
+  ) {
+    return intervention("Control D1 saga-payload query metadata is malformed.")
+  }
+  return result.results
 }
 
 interface ActionBinding {
@@ -191,6 +243,40 @@ export class D1SagaAttemptStore {
     this.#digest = digest
     this.#operations = new D1OperationStore(database, digest)
     this.#sagas = new D1SagaStore(database, digest)
+  }
+
+  async #rowSafeOutcomePayloadsActivated(): Promise<boolean> {
+    const publicationRow = await this.#database
+      .prepare(
+        `SELECT "schema_version" FROM "nozzle_control_schema_versions"
+         WHERE "schema_version" = 4`,
+      )
+      .first<SagaSchemaVersionRow>()
+    if (publicationRow === null) return false
+    const publication = capturedPlainRecord(publicationRow, "Persisted control schema publication")
+    if (Object.keys(publication).length !== 1 || publication.schema_version !== 4) {
+      return intervention("Persisted control schema publication is malformed.")
+    }
+    const row = await this.#database
+      .prepare(
+        `SELECT "protocol_version", "reader_barrier_checksum", "activated_at_ms"
+         FROM "nozzle_saga_outcome_payload_activations"
+         WHERE "protocol_version" = 1`,
+      )
+      .first<SagaOutcomePayloadActivationRow>()
+    if (row === null) return false
+    const snapshot = capturedPlainRecord(row, "Persisted saga-outcome payload activation")
+    if (
+      Object.keys(snapshot).length !== 3 ||
+      snapshot.protocol_version !== 1 ||
+      typeof snapshot.reader_barrier_checksum !== "string" ||
+      !CHECKSUM.test(snapshot.reader_barrier_checksum) ||
+      !Number.isSafeInteger(snapshot.activated_at_ms) ||
+      (snapshot.activated_at_ms as number) < 0
+    ) {
+      return intervention("Persisted saga-outcome payload activation is malformed.")
+    }
+    return true
   }
 
   async #binding(
@@ -368,18 +454,42 @@ export class D1SagaAttemptStore {
       "Saga attempt ID",
       MAX_SAGA_RECEIPT_IDENTITY_BYTES,
     )
-    const row = await this.#database
+    const identityRow = await this.#database
       .prepare(
-        `SELECT ${SAGA_ATTEMPT_ROW_SELECT}
+        `SELECT ${SAGA_ATTEMPT_IDENTITY_ROW_SELECT}
          FROM "nozzle_saga_action_attempts" AS "attempt"
          LEFT JOIN "nozzle_saga_action_attempt_protocols" AS "protocol" USING ("attempt_id")
-         LEFT JOIN "nozzle_saga_action_attempt_outcomes" AS "outcome" USING ("attempt_id")
          WHERE "attempt"."attempt_id" = ?1`,
       )
       .bind(attemptId)
-      .first<SagaAttemptRow>()
-    if (row === null) return undefined
-    return loadSagaAttemptRecordRow(row, this.#digest, attemptId)
+      .first<SagaAttemptIdentityRow>()
+    if (identityRow === null) return undefined
+    const identity = await loadSagaAttemptIdentityRow(identityRow, this.#digest, attemptId)
+    const outcomeRow = await this.#database
+      .prepare(
+        `SELECT ${SAGA_ATTEMPT_OUTCOME_ROW_SELECT}
+         FROM "nozzle_saga_action_attempt_outcomes" AS "outcome"
+         WHERE "outcome"."attempt_id" = ?1`,
+      )
+      .bind(attemptId)
+      .first<SagaAttemptOutcomeRow>()
+    if (outcomeRow === null) return acceptedSagaAttemptRecord(identity)
+    const rowSafeOutcomePayloads = await this.#rowSafeOutcomePayloadsActivated()
+    const payloadRows = rowSafeOutcomePayloads
+      ? capturedQueryRows(
+          await this.#database
+            .prepare(
+              `SELECT ${SAGA_ATTEMPT_PAYLOAD_ROW_SELECT}
+               FROM "nozzle_saga_action_attempt_outcome_payloads" AS "payload"
+               WHERE "payload"."attempt_id" = ?1
+               ORDER BY "payload"."payload_kind"
+               LIMIT 4`,
+            )
+            .bind(attemptId)
+            .all<SagaAttemptPayloadRow>(),
+        )
+      : []
+    return loadSagaAttemptOutcomeRow(outcomeRow, payloadRows, identity, this.#digest)
   }
 
   async validateProjectionReceipt(
@@ -633,7 +743,8 @@ export class D1SagaAttemptStore {
     ) {
       return resume("The saga attempt outcome was fenced by a different lease owner.")
     }
-    const result = await this.#database
+    const rowSafeOutcomePayloads = await this.#rowSafeOutcomePayloadsActivated()
+    const outcomeStatement = this.#database
       .prepare(
         `INSERT INTO "nozzle_saga_action_attempt_outcomes"
          ("attempt_id", "state", "evidence_checksum", "evidence_json", "output_checksum",
@@ -643,26 +754,66 @@ export class D1SagaAttemptStore {
            SELECT 1 FROM "nozzle_leases"
            WHERE "lease_key" = ?10 AND "holder_id" = ?11 AND "acquisition_id" = ?12
              AND "fencing_token" = ?13 AND "expires_at_ms" > ${SERVER_TIME_SQL}
-         )
-         ON CONFLICT ("attempt_id") DO NOTHING`,
+         )${rowSafeOutcomePayloads ? "" : '\n         ON CONFLICT ("attempt_id") DO NOTHING'}`,
       )
       .bind(
         attemptId,
         input.state,
         evidenceChecksum,
-        evidenceJson,
+        rowSafeOutcomePayloads ? SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON : evidenceJson,
         input.state === "confirmed" ? valueChecksum : null,
-        input.state === "confirmed" ? valueJson : null,
+        input.state === "confirmed"
+          ? rowSafeOutcomePayloads
+            ? SAGA_OUTCOME_OUTPUT_REFERENCE_JSON
+            : valueJson
+          : null,
         input.state === "confirmed" ? null : valueChecksum,
-        input.state === "confirmed" ? null : valueJson,
+        input.state === "confirmed"
+          ? null
+          : rowSafeOutcomePayloads
+            ? SAGA_OUTCOME_ERROR_REFERENCE_JSON
+            : valueJson,
         checksum,
         input.proof.leaseKey,
         input.proof.holderId,
         input.proof.acquisitionId,
         input.proof.fencingToken,
       )
-      .run()
-    changed(result)
+    if (rowSafeOutcomePayloads) {
+      const payloadStatement = `INSERT INTO "nozzle_saga_action_attempt_outcome_payloads"
+         ("attempt_id", "payload_kind", "payload_checksum", "payload_json")
+         VALUES (?1, ?2, ?3, ?4)`
+      let results: readonly ControlRunResult[] | undefined
+      try {
+        results = await this.#database.batch([
+          outcomeStatement,
+          this.#database
+            .prepare(payloadStatement)
+            .bind(attemptId, "evidence", evidenceChecksum, evidenceJson),
+          this.#database
+            .prepare(payloadStatement)
+            .bind(
+              attemptId,
+              input.state === "confirmed" ? "output" : "error",
+              valueChecksum,
+              valueJson,
+            ),
+        ])
+      } catch {
+        // A failed batch rolls back atomically; a lost response may still follow a committed batch.
+        // The checksum-verified reload below is the only authority in either case.
+      }
+      if (
+        results !== undefined &&
+        (!Array.isArray(results) ||
+          results.length !== 3 ||
+          results.some((result) => !changed(result)))
+      ) {
+        return intervention("Control D1 returned malformed saga-receipt batch metadata.")
+      }
+    } else {
+      changed(await outcomeStatement.run())
+    }
     const completed = await this.get(attemptId)
     if (completed === undefined || completed.state === "accepted") {
       return resume("The saga attempt outcome was not committed under the active exact fence.")

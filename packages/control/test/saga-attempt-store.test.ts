@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto"
+import { readFileSync } from "node:fs"
 import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite"
 import {
   type DigestFunction,
@@ -15,7 +17,13 @@ import type {
 } from "../src/database.js"
 import { D1LeaseStore } from "../src/lease-store.js"
 import { D1OperationStore, operationTransitionIdentity } from "../src/operation-store.js"
-import { loadSagaAttemptRecordRow } from "../src/saga-attempt-codec.js"
+import {
+  acceptedSagaAttemptRecord,
+  loadSagaAttemptIdentityRow,
+  loadSagaAttemptOutcomeRow,
+  SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON,
+  SAGA_OUTCOME_OUTPUT_REFERENCE_JSON,
+} from "../src/saga-attempt-codec.js"
 import {
   D1SagaAttemptStore,
   sagaActionInputChecksum,
@@ -29,13 +37,47 @@ import {
   type SagaEffectContext,
   sagaActionOperationStepId,
 } from "../src/saga-store.js"
-import { controlSchemaSql } from "../src/schema.js"
+import { controlSchemaSql, controlSchemaVersionThreeSql } from "../src/schema.js"
+import {
+  SAGA_ATTEMPT_ROW_SELECT as FROZEN_VERSION_THREE_SAGA_ATTEMPT_ROW_SELECT,
+  type SagaAttemptRecord as FrozenVersionThreeSagaAttemptRecord,
+  loadSagaAttemptRecordRow as loadFrozenVersionThreeSagaAttemptRow,
+} from "./fixtures/saga-attempt-v3-codec.js"
 
 const digest: DigestFunction = async (input) => {
   const copy = new Uint8Array(input.byteLength)
   copy.set(input)
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", copy.buffer))
   return [...hash].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+}
+
+const TEST_READER_BARRIER_CHECKSUM = "7".repeat(64)
+
+function activateRowSafeSagaOutcomes(database: DatabaseSync): void {
+  database
+    .prepare(
+      `INSERT INTO "nozzle_saga_outcome_payload_activations"
+       ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
+       VALUES (1, ?, 1)`,
+    )
+    .run(TEST_READER_BARRIER_CHECKSUM)
+}
+
+async function frozenVersionThreeGet(
+  database: DatabaseSync,
+  attemptId: string,
+): Promise<FrozenVersionThreeSagaAttemptRecord | undefined> {
+  const row = database
+    .prepare(
+      `SELECT ${FROZEN_VERSION_THREE_SAGA_ATTEMPT_ROW_SELECT}
+       FROM "nozzle_saga_action_attempts" AS "attempt"
+       LEFT JOIN "nozzle_saga_action_attempt_protocols" AS "protocol" USING ("attempt_id")
+       LEFT JOIN "nozzle_saga_action_attempt_outcomes" AS "outcome" USING ("attempt_id")
+       WHERE "attempt"."attempt_id" = ?`,
+    )
+    .get(attemptId)
+  if (row === undefined) return undefined
+  return loadFrozenVersionThreeSagaAttemptRow(row, digest, attemptId)
 }
 
 class StatementAdapter implements ControlStatement {
@@ -81,9 +123,10 @@ class StatementAdapter implements ControlStatement {
 class DatabaseAdapter implements TransactionalControlDatabase {
   readonly database = new DatabaseSync(":memory:")
 
-  constructor() {
+  constructor(schemaSql = controlSchemaSql(), activate = schemaSql === controlSchemaSql()) {
     this.database.exec("PRAGMA foreign_keys = ON;")
-    this.database.exec(controlSchemaSql())
+    this.database.exec(schemaSql)
+    if (activate) activateRowSafeSagaOutcomes(this.database)
   }
 
   async batch(statements: readonly ControlStatement[]): Promise<readonly ControlRunResult[]> {
@@ -109,10 +152,16 @@ class DatabaseAdapter implements TransactionalControlDatabase {
 }
 
 class FixedStatement implements ControlStatement {
+  readonly #allResult: unknown
   readonly #row: unknown
   readonly #runResult: ControlRunResult
 
-  constructor(input: { readonly row?: unknown; readonly runResult?: ControlRunResult }) {
+  constructor(input: {
+    readonly allResult?: unknown
+    readonly row?: unknown
+    readonly runResult?: ControlRunResult
+  }) {
+    this.#allResult = input.allResult
     this.#row = input.row ?? null
     this.#runResult = input.runResult ?? { meta: { changes: 0 }, success: true }
   }
@@ -122,7 +171,7 @@ class FixedStatement implements ControlStatement {
   }
 
   async all<T>(): Promise<ControlQueryResult<T>> {
-    return { meta: {}, results: [], success: true }
+    return (this.#allResult ?? { meta: {}, results: [], success: true }) as ControlQueryResult<T>
   }
 
   async first<T>(): Promise<T | null> {
@@ -131,6 +180,24 @@ class FixedStatement implements ControlStatement {
 
   async run(): Promise<ControlRunResult> {
     return this.#runResult
+  }
+}
+
+class ThrowStatement implements ControlStatement {
+  bind(): ControlStatement {
+    return this
+  }
+
+  async all<T>(): Promise<ControlQueryResult<T>> {
+    throw new Error("injected batch failure")
+  }
+
+  async first<T>(): Promise<T | null> {
+    throw new Error("injected batch failure")
+  }
+
+  async run(): Promise<ControlRunResult> {
+    throw new Error("injected batch failure")
   }
 }
 
@@ -164,13 +231,64 @@ class TransformStatement implements ControlStatement {
 }
 
 interface AttemptFaults {
+  readonly activationRow?: unknown
   readonly attemptRow?: unknown | (() => unknown)
+  readonly batchBefore?: () => Promise<void>
+  readonly batchCommitThenThrow?: boolean
+  readonly batchFailureIndex?: 0 | 1 | 2
+  readonly outcomeRow?: unknown | (() => unknown)
   readonly operationProjectionMissing?: boolean
   readonly operationStepChanges?: null | Readonly<Record<string, unknown>>
   readonly runResult?: ControlRunResult
   readonly sagaBindingRow?: unknown
   readonly sagaProjectionMissing?: boolean
   readonly sagaProjectionChanges?: Readonly<Record<string, unknown>>
+  readonly schemaVersionRow?: unknown
+  readonly payloadQueryResult?: unknown
+}
+
+const identityRowKeys = [
+  "acceptance_checksum",
+  "accepted_at_ms",
+  "acquisition_id",
+  "action_key",
+  "attempt_id",
+  "causal_attempt_id",
+  "fencing_token",
+  "holder_id",
+  "idempotency_key",
+  "input_checksum",
+  "input_json",
+  "lease_key",
+  "operation_id",
+  "operation_step_id",
+  "phase",
+  "protocol_classified_at_ms",
+  "protocol_version",
+  "purpose",
+  "saga_id",
+  "saga_step_id",
+] as const
+
+const outcomeRowKeys = [
+  "attempt_id",
+  "completed_at_ms",
+  "error_checksum",
+  "error_json",
+  "evidence_checksum",
+  "evidence_json",
+  "outcome_checksum",
+  "output_checksum",
+  "output_json",
+  "state",
+] as const
+
+function projectedRow(value: unknown, keys: readonly string[]): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value
+  const record = value as Record<string, unknown>
+  return Object.fromEntries(
+    keys.filter((key) => Object.hasOwn(record, key)).map((key) => [key, record[key]]),
+  )
 }
 
 class FaultDatabase implements TransactionalControlDatabase {
@@ -183,20 +301,62 @@ class FaultDatabase implements TransactionalControlDatabase {
   }
 
   async batch(statements: readonly ControlStatement[]): Promise<readonly ControlRunResult[]> {
-    return this.#base.batch(statements)
+    await this.#faults.batchBefore?.()
+    const batch = [...statements]
+    if (this.#faults.batchFailureIndex !== undefined) {
+      batch[this.#faults.batchFailureIndex] = new ThrowStatement()
+    }
+    const results = await this.#base.batch(batch)
+    if (this.#faults.batchCommitThenThrow) throw new Error("injected lost batch response")
+    return results
   }
 
   prepare(sql: string): ControlStatement {
+    if (
+      sql.includes('FROM "nozzle_saga_outcome_payload_activations"') &&
+      this.#faults.activationRow !== undefined
+    ) {
+      return new FixedStatement({ row: this.#faults.activationRow })
+    }
+    if (
+      sql.includes('FROM "nozzle_control_schema_versions"') &&
+      sql.includes('"schema_version" = 4') &&
+      this.#faults.schemaVersionRow !== undefined
+    ) {
+      return new FixedStatement({ row: this.#faults.schemaVersionRow })
+    }
+    if (
+      sql.includes('FROM "nozzle_saga_action_attempt_outcome_payloads" AS "payload"') &&
+      this.#faults.payloadQueryResult !== undefined
+    ) {
+      return new FixedStatement({ allResult: this.#faults.payloadQueryResult })
+    }
     if (
       sql.includes('FROM "nozzle_saga_action_attempts" AS "attempt"') &&
       this.#faults.attemptRow !== undefined
     ) {
       return new FixedStatement({
-        row:
+        row: projectedRow(
           typeof this.#faults.attemptRow === "function"
             ? this.#faults.attemptRow()
             : this.#faults.attemptRow,
+          identityRowKeys,
+        ),
       })
+    }
+    if (sql.includes('FROM "nozzle_saga_action_attempt_outcomes" AS "outcome"')) {
+      const source =
+        this.#faults.outcomeRow === undefined ? this.#faults.attemptRow : this.#faults.outcomeRow
+      if (source !== undefined) {
+        const value = typeof source === "function" ? source() : source
+        const record = value as Record<string, unknown> | null
+        return new FixedStatement({
+          row:
+            record === null || record.state === null || record.state === undefined
+              ? null
+              : projectedRow(record, outcomeRowKeys),
+        })
+      }
     }
     if (
       sql.includes('SELECT "operation_id" FROM "nozzle_sagas"') &&
@@ -240,22 +400,56 @@ class FaultDatabase implements TransactionalControlDatabase {
   }
 }
 
-function rawAttempt(database: DatabaseSync, attemptId: string): Record<string, unknown> {
+class RecordingDatabase implements TransactionalControlDatabase {
+  readonly preparedSql: string[] = []
+  readonly #base: DatabaseAdapter
+
+  constructor(base: DatabaseAdapter) {
+    this.#base = base
+  }
+
+  async batch(statements: readonly ControlStatement[]): Promise<readonly ControlRunResult[]> {
+    return this.#base.batch(statements)
+  }
+
+  prepare(sql: string): ControlStatement {
+    this.preparedSql.push(sql)
+    return this.#base.prepare(sql)
+  }
+}
+
+function rawIdentity(database: DatabaseSync, attemptId: string): Record<string, unknown> {
   return database
     .prepare(
       `SELECT "attempt".*, "protocol"."protocol_version",
-              "protocol"."classified_at_ms" AS "protocol_classified_at_ms",
-              "outcome"."state", "outcome"."evidence_checksum",
-              "outcome"."evidence_json", "outcome"."output_checksum",
-              "outcome"."output_json", "outcome"."error_checksum",
-              "outcome"."error_json", "outcome"."outcome_checksum",
-              "outcome"."completed_at_ms"
+              "protocol"."classified_at_ms" AS "protocol_classified_at_ms"
        FROM "nozzle_saga_action_attempts" AS "attempt"
        LEFT JOIN "nozzle_saga_action_attempt_protocols" AS "protocol" USING ("attempt_id")
-       LEFT JOIN "nozzle_saga_action_attempt_outcomes" AS "outcome" USING ("attempt_id")
        WHERE "attempt"."attempt_id" = ?`,
     )
     .get(attemptId) as Record<string, unknown>
+}
+
+function rawOutcome(
+  database: DatabaseSync,
+  attemptId: string,
+): Record<string, unknown> | undefined {
+  return database
+    .prepare(`SELECT * FROM "nozzle_saga_action_attempt_outcomes" WHERE "attempt_id" = ?`)
+    .get(attemptId) as Record<string, unknown> | undefined
+}
+
+function rawPayloads(database: DatabaseSync, attemptId: string): Record<string, unknown>[] {
+  return database
+    .prepare(
+      `SELECT * FROM "nozzle_saga_action_attempt_outcome_payloads"
+       WHERE "attempt_id" = ? ORDER BY "payload_kind"`,
+    )
+    .all(attemptId) as Record<string, unknown>[]
+}
+
+function rawAttempt(database: DatabaseSync, attemptId: string): Record<string, unknown> {
+  return { ...rawIdentity(database, attemptId), ...rawOutcome(database, attemptId) }
 }
 
 async function framedChecksum(domain: string, parts: readonly string[]): Promise<string> {
@@ -323,6 +517,16 @@ describe("D1SagaAttemptStore", () => {
     attempts = new D1SagaAttemptStore(database, digest)
     coordinator = new D1SagaCoordinatorStore(database, digest)
     return () => database.close()
+  })
+
+  it("checksum-locks the complete frozen version-three joined reader codec", () => {
+    const source = readFileSync(
+      new URL("./fixtures/saga-attempt-v3-codec.ts", import.meta.url),
+      "utf8",
+    )
+    expect(createHash("sha256").update(source).digest("hex")).toBe(
+      "f80b94f7443ab634cadc4006039d4dfcdc9de4fc5812bea4dbce88e51521c9ce",
+    )
   })
 
   async function fixture(
@@ -593,6 +797,425 @@ describe("D1SagaAttemptStore", () => {
       sagaId,
     }
   }
+
+  async function acceptForwardEffect(run: Awaited<ReturnType<typeof fixture>>) {
+    return attempts.accept({
+      attemptId: run.actionAttemptId,
+      inputJson: run.actionInputJson,
+      phase: "forward",
+      proof: run.proof(),
+      purpose: "effect",
+      sagaId: run.sagaId,
+      sagaStepId: "a",
+    })
+  }
+
+  it("round-trips maximum logical payloads through three row-safe outcome rows", async () => {
+    const run = await fixture("row-safe-maximum")
+    await acceptForwardEffect(run)
+    const evidenceJson = JSON.stringify("e".repeat(1024 * 1024 - 2))
+    const outputJson = JSON.stringify("o".repeat(1024 * 1024 - 2))
+    expect(Buffer.byteLength(evidenceJson)).toBe(1024 * 1024)
+    expect(Buffer.byteLength(outputJson)).toBe(1024 * 1024)
+
+    const completed = await attempts.complete({
+      attemptId: run.actionAttemptId,
+      evidenceJson,
+      outputJson,
+      proof: run.proof(),
+      state: "confirmed",
+    })
+
+    expect(completed).toMatchObject({ evidenceJson, outputJson, state: "confirmed" })
+    expect(rawOutcome(database.database, run.actionAttemptId)).toMatchObject({
+      evidence_json: SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON,
+      output_json: SAGA_OUTCOME_OUTPUT_REFERENCE_JSON,
+    })
+    const payloads = rawPayloads(database.database, run.actionAttemptId)
+    expect(payloads).toHaveLength(2)
+    expect(payloads.map((row) => Buffer.byteLength(row.payload_json as string))).toEqual([
+      1024 * 1024,
+      1024 * 1024,
+    ])
+    expect(
+      database.database
+        .prepare(
+          `SELECT
+             (SELECT count(*) FROM "nozzle_saga_action_attempt_outcomes"
+              WHERE "attempt_id" = ?) AS "headers",
+             (SELECT count(*) FROM "nozzle_saga_action_attempt_outcome_payloads"
+              WHERE "attempt_id" = ?) AS "payloads"`,
+        )
+        .get(run.actionAttemptId, run.actionAttemptId),
+    ).toEqual({ headers: 1, payloads: 2 })
+    expect(() =>
+      database.database
+        .prepare(
+          `UPDATE "nozzle_saga_action_attempt_outcome_payloads" SET "payload_json" = '{}'
+           WHERE "attempt_id" = ? AND "payload_kind" = 'evidence'`,
+        )
+        .run(run.actionAttemptId),
+    ).toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_IMMUTABLE")
+    expect(() =>
+      database.database
+        .prepare(
+          `DELETE FROM "nozzle_saga_action_attempt_outcome_payloads"
+           WHERE "attempt_id" = ? AND "payload_kind" = 'evidence'`,
+        )
+        .run(run.actionAttemptId),
+    ).toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_PERSISTENT")
+    expect(() =>
+      database.database
+        .prepare(
+          `INSERT INTO "nozzle_saga_action_attempt_outcome_payloads"
+           ("attempt_id", "payload_kind", "payload_checksum", "payload_json")
+           VALUES (?, 'error', ?, '{}')`,
+        )
+        .run(run.actionAttemptId, "0".repeat(64)),
+    ).toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_FENCED")
+  })
+
+  it.each([
+    0, 1, 2,
+  ] as const)("rolls back the complete row-safe outcome batch when statement %i fails", async (batchFailureIndex) => {
+    const run = await fixture(`row-safe-rollback-${batchFailureIndex}`)
+    await acceptForwardEffect(run)
+    const faulted = new D1SagaAttemptStore(
+      new FaultDatabase(database, { batchFailureIndex }),
+      digest,
+    )
+
+    await expect(
+      faulted.complete({
+        attemptId: run.actionAttemptId,
+        evidenceJson: '{"source":"rollback"}',
+        outputJson: '{"ok":true}',
+        proof: run.proof(),
+        state: "confirmed",
+      }),
+    ).rejects.toThrow(/outcome was not committed/u)
+    expect(rawOutcome(database.database, run.actionAttemptId)).toBeUndefined()
+    expect(rawPayloads(database.database, run.actionAttemptId)).toEqual([])
+    await expect(attempts.get(run.actionAttemptId)).resolves.toMatchObject({ state: "accepted" })
+  })
+
+  it("recovers exact commit-response loss and exact or contradictory concurrent winners", async () => {
+    const lost = await fixture("row-safe-lost-response")
+    await acceptForwardEffect(lost)
+    const lostStore = new D1SagaAttemptStore(
+      new FaultDatabase(database, { batchCommitThenThrow: true }),
+      digest,
+    )
+    await expect(
+      lostStore.complete({
+        attemptId: lost.actionAttemptId,
+        evidenceJson: '{"source":"lost"}',
+        outputJson: '{"ok":true}',
+        proof: lost.proof(),
+        state: "confirmed",
+      }),
+    ).resolves.toMatchObject({ state: "confirmed" })
+    expect(rawPayloads(database.database, lost.actionAttemptId)).toHaveLength(2)
+
+    const exact = await fixture("row-safe-exact-race")
+    await acceptForwardEffect(exact)
+    const exactInput = {
+      attemptId: exact.actionAttemptId,
+      evidenceJson: '{"source":"race"}',
+      outputJson: '{"ok":true}',
+      proof: exact.proof(),
+      state: "confirmed" as const,
+    }
+    const exactRace = new D1SagaAttemptStore(
+      new FaultDatabase(database, {
+        batchBefore: async () => {
+          await attempts.complete(exactInput)
+        },
+      }),
+      digest,
+    )
+    await expect(exactRace.complete(exactInput)).resolves.toMatchObject({ state: "confirmed" })
+    expect(rawPayloads(database.database, exact.actionAttemptId)).toHaveLength(2)
+
+    const contradictory = await fixture("row-safe-contradictory-race")
+    await acceptForwardEffect(contradictory)
+    const contradictoryRace = new D1SagaAttemptStore(
+      new FaultDatabase(database, {
+        batchBefore: async () => {
+          await attempts.complete({
+            attemptId: contradictory.actionAttemptId,
+            evidenceJson: '{"winner":true}',
+            outputJson: '{"winner":true}',
+            proof: contradictory.proof(),
+            state: "confirmed",
+          })
+        },
+      }),
+      digest,
+    )
+    await expect(
+      contradictoryRace.complete({
+        attemptId: contradictory.actionAttemptId,
+        evidenceJson: '{"requested":true}',
+        outputJson: '{"requested":true}',
+        proof: contradictory.proof(),
+        state: "confirmed",
+      }),
+    ).rejects.toThrow(/committed saga outcome contradicts/u)
+    await expect(attempts.get(contradictory.actionAttemptId)).resolves.toMatchObject({
+      evidenceJson: '{"winner":true}',
+      outputJson: '{"winner":true}',
+    })
+  })
+
+  it("stays backward-readable until an explicit reader-barrier activation", async () => {
+    database.close()
+    database = new DatabaseAdapter(controlSchemaVersionThreeSql())
+    leases = new D1LeaseStore(database)
+    operations = new D1OperationStore(database, digest)
+    sagaStore = new D1SagaStore(database, digest)
+    attempts = new D1SagaAttemptStore(database, digest)
+    coordinator = new D1SagaCoordinatorStore(database, digest)
+
+    const legacy = await fixture("v3-inline-upgrade")
+    await acceptForwardEffect(legacy)
+    await attempts.complete({
+      attemptId: legacy.actionAttemptId,
+      evidenceJson: SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON,
+      outputJson: SAGA_OUTCOME_OUTPUT_REFERENCE_JSON,
+      proof: legacy.proof(),
+      state: "confirmed",
+    })
+    const legacyHeader = rawOutcome(database.database, legacy.actionAttemptId)
+    expect(legacyHeader).toMatchObject({
+      evidence_json: SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON,
+      output_json: SAGA_OUTCOME_OUTPUT_REFERENCE_JSON,
+    })
+
+    database.database.exec(controlSchemaSql())
+    attempts = new D1SagaAttemptStore(database, digest)
+    await expect(attempts.get(legacy.actionAttemptId)).resolves.toMatchObject({
+      evidenceJson: SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON,
+      outputJson: SAGA_OUTCOME_OUTPUT_REFERENCE_JSON,
+      state: "confirmed",
+    })
+    expect(rawPayloads(database.database, legacy.actionAttemptId)).toEqual([])
+
+    const boundaryEvidenceJson = JSON.stringify("e")
+    const boundaryOutputJson = JSON.stringify("o")
+    const boundaryInputBytes =
+      1024 * 1024 - Buffer.byteLength(boundaryEvidenceJson) - Buffer.byteLength(boundaryOutputJson)
+    const boundaryInputJson = JSON.stringify("x".repeat(boundaryInputBytes - 2))
+    expect(
+      Buffer.byteLength(boundaryInputJson) +
+        Buffer.byteLength(boundaryEvidenceJson) +
+        Buffer.byteLength(boundaryOutputJson),
+    ).toBe(1024 * 1024)
+    const boundary = await fixture("v4-inline-compatibility-boundary", boundaryInputJson)
+    await acceptForwardEffect(boundary)
+    await attempts.complete({
+      attemptId: boundary.actionAttemptId,
+      evidenceJson: boundaryEvidenceJson,
+      outputJson: boundaryOutputJson,
+      proof: boundary.proof(),
+      state: "confirmed",
+    })
+    await expect(
+      frozenVersionThreeGet(database.database, boundary.actionAttemptId),
+    ).resolves.toMatchObject({
+      evidenceJson: boundaryEvidenceJson,
+      inputJson: boundaryInputJson,
+      outputJson: boundaryOutputJson,
+      state: "confirmed",
+    })
+    const boundaryOverflow = await fixture(
+      "v4-inline-compatibility-overflow",
+      JSON.stringify("x".repeat(boundaryInputBytes - 1)),
+    )
+    await acceptForwardEffect(boundaryOverflow)
+    await expect(
+      attempts.complete({
+        attemptId: boundaryOverflow.actionAttemptId,
+        evidenceJson: boundaryEvidenceJson,
+        outputJson: boundaryOutputJson,
+        proof: boundaryOverflow.proof(),
+        state: "confirmed",
+      }),
+    ).rejects.toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_INLINE_PAYLOAD_TOO_LARGE")
+    expect(rawOutcome(database.database, boundaryOverflow.actionAttemptId)).toBeUndefined()
+
+    const mixed = await fixture("v4-old-worker-inline")
+    await acceptForwardEffect(mixed)
+    await attempts.complete({
+      attemptId: mixed.actionAttemptId,
+      evidenceJson: '{"worker":"v3"}',
+      outputJson: '{"ok":true}',
+      proof: mixed.proof(),
+      state: "confirmed",
+    })
+    expect(rawPayloads(database.database, mixed.actionAttemptId)).toEqual([])
+    await expect(
+      frozenVersionThreeGet(database.database, mixed.actionAttemptId),
+    ).resolves.toMatchObject({
+      evidenceJson: '{"worker":"v3"}',
+      outputJson: '{"ok":true}',
+      state: "confirmed",
+    })
+    const legacyWriter = new D1SagaAttemptStore(
+      new FaultDatabase(database, { schemaVersionRow: null }),
+      digest,
+    )
+
+    const mixedFailure = await fixture("v4-old-worker-inline-failure")
+    await acceptForwardEffect(mixedFailure)
+    await legacyWriter.complete({
+      attemptId: mixedFailure.actionAttemptId,
+      errorJson: '{"code":"failed"}',
+      evidenceJson: '{"worker":"v3"}',
+      proof: mixedFailure.proof(),
+      state: "failed",
+    })
+    expect(rawPayloads(database.database, mixedFailure.actionAttemptId)).toEqual([])
+    await expect(attempts.get(mixedFailure.actionAttemptId)).resolves.toMatchObject({
+      errorJson: '{"code":"failed"}',
+      evidenceJson: '{"worker":"v3"}',
+      state: "failed",
+    })
+
+    const oversized = await fixture("v4-old-worker-oversized-inline")
+    await acceptForwardEffect(oversized)
+    const large = JSON.stringify("x".repeat(600_000))
+    await expect(
+      legacyWriter.complete({
+        attemptId: oversized.actionAttemptId,
+        evidenceJson: large,
+        outputJson: large,
+        proof: oversized.proof(),
+        state: "confirmed",
+      }),
+    ).rejects.toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_INLINE_PAYLOAD_TOO_LARGE")
+    expect(rawOutcome(database.database, oversized.actionAttemptId)).toBeUndefined()
+    expect(rawPayloads(database.database, oversized.actionAttemptId)).toEqual([])
+    const preactivation = await fixture("v4-preactivation-sidecar-batch")
+    await acceptForwardEffect(preactivation)
+    const falselyActivated = new D1SagaAttemptStore(
+      new FaultDatabase(database, {
+        activationRow: {
+          activated_at_ms: 1,
+          protocol_version: 1,
+          reader_barrier_checksum: TEST_READER_BARRIER_CHECKSUM,
+        },
+      }),
+      digest,
+    )
+    await expect(
+      falselyActivated.complete({
+        attemptId: preactivation.actionAttemptId,
+        evidenceJson: '{"worker":"v4"}',
+        outputJson: '{"ok":true}',
+        proof: preactivation.proof(),
+        state: "confirmed",
+      }),
+    ).rejects.toThrow(/outcome was not committed/u)
+    expect(rawOutcome(database.database, preactivation.actionAttemptId)).toBeUndefined()
+    expect(rawPayloads(database.database, preactivation.actionAttemptId)).toEqual([])
+    activateRowSafeSagaOutcomes(database.database)
+    const activated = await fixture("v4-reader-barrier-activated")
+    await acceptForwardEffect(activated)
+    await attempts.complete({
+      attemptId: activated.actionAttemptId,
+      evidenceJson: '{"worker":"v4"}',
+      outputJson: '{"ok":true}',
+      proof: activated.proof(),
+      state: "confirmed",
+    })
+    expect(rawPayloads(database.database, activated.actionAttemptId)).toHaveLength(2)
+    await expect(
+      frozenVersionThreeGet(database.database, activated.actionAttemptId),
+    ).rejects.toThrow(/outcome checksums do not match/u)
+  })
+
+  it("never selects attempt input and outcome payload JSON in one row", async () => {
+    const run = await fixture("row-safe-query-shape")
+    await acceptForwardEffect(run)
+    await attempts.complete({
+      attemptId: run.actionAttemptId,
+      evidenceJson: '{"source":"shape"}',
+      outputJson: '{"ok":true}',
+      proof: run.proof(),
+      state: "confirmed",
+    })
+    const recording = new RecordingDatabase(database)
+    await new D1SagaAttemptStore(recording, digest).get(run.actionAttemptId)
+    const identityQuery = recording.preparedSql.find((sql) =>
+      sql.includes('FROM "nozzle_saga_action_attempts" AS "attempt"'),
+    ) as string
+    const outcomeQuery = recording.preparedSql.find((sql) =>
+      sql.includes('FROM "nozzle_saga_action_attempt_outcomes" AS "outcome"'),
+    ) as string
+    const payloadQuery = recording.preparedSql.find((sql) =>
+      sql.includes('FROM "nozzle_saga_action_attempt_outcome_payloads" AS "payload"'),
+    ) as string
+    expect(identityQuery).toContain('"attempt"."input_json"')
+    expect(identityQuery).not.toContain("outcome_payload")
+    expect(identityQuery).not.toContain('"outcome".')
+    expect(outcomeQuery).not.toContain('"attempt".')
+    expect(outcomeQuery).not.toContain("input_json")
+    expect(payloadQuery).not.toContain('"attempt".')
+    expect(payloadQuery).not.toContain("input_json")
+  })
+
+  it("captures schema, activation, and payload-query metadata before trusting them", async () => {
+    const run = await fixture("row-safe-query-metadata")
+    await acceptForwardEffect(run)
+    await attempts.complete({
+      attemptId: run.actionAttemptId,
+      evidenceJson: '{"source":"metadata"}',
+      outputJson: '{"ok":true}',
+      proof: run.proof(),
+      state: "confirmed",
+    })
+
+    await expect(
+      new D1SagaAttemptStore(
+        new FaultDatabase(database, { schemaVersionRow: new Proxy({ schema_version: 4 }, {}) }),
+        digest,
+      ).get(run.actionAttemptId),
+    ).rejects.toThrow(/could not be captured safely/u)
+    await expect(
+      new D1SagaAttemptStore(
+        new FaultDatabase(database, { schemaVersionRow: { extra: true, schema_version: 4 } }),
+        digest,
+      ).get(run.actionAttemptId),
+    ).rejects.toThrow(/publication is malformed/u)
+    const activation = {
+      activated_at_ms: 1,
+      protocol_version: 1,
+      reader_barrier_checksum: TEST_READER_BARRIER_CHECKSUM,
+    }
+    for (const candidate of [
+      new Proxy(activation, {}),
+      { ...activation, extra: true },
+      { ...activation, protocol_version: 2 },
+      { ...activation, reader_barrier_checksum: "invalid" },
+      { ...activation, activated_at_ms: -1 },
+    ]) {
+      await expect(
+        new D1SagaAttemptStore(
+          new FaultDatabase(database, { activationRow: candidate }),
+          digest,
+        ).get(run.actionAttemptId),
+      ).rejects.toThrow(/(?:captured safely|payload activation is malformed)/u)
+    }
+    await expect(
+      new D1SagaAttemptStore(
+        new FaultDatabase(database, {
+          payloadQueryResult: { meta: {}, results: {}, success: true },
+        }),
+        digest,
+      ).get(run.actionAttemptId),
+    ).rejects.toThrow(/query metadata is malformed/u)
+  })
 
   it("persists canonical accepted input and a confirmed append-only outcome", async () => {
     const run = await fixture("confirmed")
@@ -921,7 +1544,12 @@ describe("D1SagaAttemptStore", () => {
       operation_id: "another-operation",
     }
     corruptedCause.acceptance_checksum = await acceptanceForRow(corruptedCause)
-    corruptedCause.outcome_checksum = await outcomeForRow(corruptedCause)
+    const causePayloads = rawPayloads(database.database, run.actionAttemptId)
+    corruptedCause.outcome_checksum = await outcomeForRow({
+      ...corruptedCause,
+      evidence_json: causePayloads.find((row) => row.payload_kind === "evidence")?.payload_json,
+      error_json: causePayloads.find((row) => row.payload_kind === "error")?.payload_json,
+    })
     await expect(
       new D1SagaAttemptStore(
         new FaultDatabase(database, { attemptRow: corruptedCause }),
@@ -1171,7 +1799,12 @@ describe("D1SagaAttemptStore", () => {
       action_key: "different-observation-action",
     }
     weakRow.acceptance_checksum = await acceptanceForRow(weakRow)
-    weakRow.outcome_checksum = await outcomeForRow(weakRow)
+    const weakPayloads = rawPayloads(database.database, weakReceipt.attemptId)
+    weakRow.outcome_checksum = await outcomeForRow({
+      ...weakRow,
+      evidence_json: weakPayloads.find((row) => row.payload_kind === "evidence")?.payload_json,
+      output_json: weakPayloads.find((row) => row.payload_kind === "output")?.payload_json,
+    })
     database.database
       .prepare(
         `UPDATE "nozzle_saga_action_attempts"
@@ -1419,24 +2052,31 @@ describe("D1SagaAttemptStore", () => {
     const changedOutputChecksum = await framedChecksum("nozzle.saga-action-output.v1", [
       changedOutputJson,
     ])
+    const forwardPayloads = rawPayloads(database.database, forward.attemptId)
     const changedForwardRow: Record<string, unknown> = {
       ...rawAttempt(database.database, forward.attemptId),
       output_checksum: changedOutputChecksum,
-      output_json: changedOutputJson,
     }
-    changedForwardRow.outcome_checksum = await outcomeForRow(changedForwardRow)
+    changedForwardRow.outcome_checksum = await outcomeForRow({
+      ...changedForwardRow,
+      evidence_json: forwardPayloads.find((row) => row.payload_kind === "evidence")?.payload_json,
+      output_json: changedOutputJson,
+    })
+    database.database.exec('DROP TRIGGER "nozzle_control_saga_outcome_payload_update";')
+    database.database
+      .prepare(
+        `UPDATE "nozzle_saga_action_attempt_outcome_payloads"
+         SET "payload_checksum" = ?, "payload_json" = ?
+         WHERE "attempt_id" = ? AND "payload_kind" = 'output'`,
+      )
+      .run(changedOutputChecksum, changedOutputJson, forward.attemptId)
     database.database
       .prepare(
         `UPDATE "nozzle_saga_action_attempt_outcomes"
-         SET "output_checksum" = ?, "output_json" = ?, "outcome_checksum" = ?
+         SET "output_checksum" = ?, "outcome_checksum" = ?
          WHERE "attempt_id" = ?`,
       )
-      .run(
-        changedOutputChecksum,
-        changedOutputJson,
-        changedForwardRow.outcome_checksum as string,
-        forward.attemptId,
-      )
+      .run(changedOutputChecksum, changedForwardRow.outcome_checksum as string, forward.attemptId)
     await expect(
       attempts.validateProjectionReceipt({
         attemptId: compensationAttemptId,
@@ -1713,8 +2353,7 @@ describe("D1SagaAttemptStore", () => {
       [{ input_json: "{" }, /action input is not valid JSON/u],
       [{ input_json: ` ${acceptedRow.input_json as string}` }, /action input is not canonical/u],
       [{ input_json: JSON.stringify("x".repeat(1024 * 1024)) }, /one MiB/u],
-      [{ input_checksum: "wrong" }, /acceptance checksums do not match/u],
-      [{ evidence_checksum: "partial" }, /partial outcome/u],
+      [{ input_checksum: "0".repeat(64) }, /acceptance checksums do not match/u],
     ] as const) {
       const faulted = new D1SagaAttemptStore(
         new FaultDatabase(database, { attemptRow: { ...acceptedRow, ...change } }),
@@ -1731,17 +2370,30 @@ describe("D1SagaAttemptStore", () => {
       state: "confirmed",
     })
     const completedRow = rawAttempt(database.database, run.actionAttemptId)
+    const malformedPublication = new D1SagaAttemptStore(
+      new FaultDatabase(database, { schemaVersionRow: [] }),
+      digest,
+    )
+    await expect(malformedPublication.get(run.actionAttemptId)).rejects.toThrow(
+      /schema publication is malformed/u,
+    )
     for (const [change, message] of [
-      [{ state: "other" }, /state is unsupported/u],
+      [{ state: "other" }, /outcome identity is malformed/u],
       [{ completed_at_ms: null }, /terminal saga attempt is incomplete/u],
-      [{ evidence_json: null }, /action evidence is malformed/u],
-      [{ evidence_json: "{" }, /action evidence is not valid JSON/u],
-      [{ evidence_json: ` ${completedRow.evidence_json as string}` }, /evidence is not canonical/u],
+      [{ evidence_json: null }, /payload references are malformed/u],
+      [{ evidence_json: "{" }, /payload references are malformed/u],
+      [
+        { evidence_json: ` ${completedRow.evidence_json as string}` },
+        /payload references are malformed/u,
+      ],
       [{ output_checksum: null }, /value checksum is missing/u],
-      [{ output_json: null }, /action output is malformed/u],
-      [{ output_json: "{" }, /action output is not valid JSON/u],
-      [{ output_json: ` ${completedRow.output_json as string}` }, /output is not canonical/u],
-      [{ outcome_checksum: "wrong" }, /outcome checksums do not match/u],
+      [{ output_json: null }, /payload references are malformed/u],
+      [{ output_json: "{" }, /payload references are malformed/u],
+      [
+        { output_json: ` ${completedRow.output_json as string}` },
+        /payload references are malformed/u,
+      ],
+      [{ outcome_checksum: "0".repeat(64) }, /outcome checksums do not match/u],
     ] as const) {
       const faulted = new D1SagaAttemptStore(
         new FaultDatabase(database, { attemptRow: { ...completedRow, ...change } }),
@@ -1762,8 +2414,9 @@ describe("D1SagaAttemptStore", () => {
       sagaId: accepted.sagaId,
       sagaStepId: "a",
     })
-    const acceptedRow = rawAttempt(database.database, accepted.actionAttemptId)
-    const loadedAccepted = await loadSagaAttemptRecordRow(acceptedRow, digest)
+    const acceptedRow = rawIdentity(database.database, accepted.actionAttemptId)
+    const loadedIdentity = await loadSagaAttemptIdentityRow(acceptedRow, digest)
+    const loadedAccepted = acceptedSagaAttemptRecord(loadedIdentity)
     expect(loadedAccepted).toMatchObject({
       attemptId: accepted.actionAttemptId,
       protocolVersion: 2,
@@ -1781,8 +2434,8 @@ describe("D1SagaAttemptStore", () => {
       },
     })
     await expect(
-      loadSagaAttemptRecordRow(switching, digest, accepted.actionAttemptId),
-    ).resolves.toMatchObject({ state: "accepted" })
+      loadSagaAttemptIdentityRow(switching, digest, accepted.actionAttemptId),
+    ).resolves.toMatchObject({ attemptId: accepted.actionAttemptId })
     expect(inputReads).toBe(1)
 
     const mutable = { ...acceptedRow }
@@ -1793,24 +2446,24 @@ describe("D1SagaAttemptStore", () => {
       return digest(input)
     }
     await expect(
-      loadSagaAttemptRecordRow(mutable, mutatingDigest, accepted.actionAttemptId),
+      loadSagaAttemptIdentityRow(mutable, mutatingDigest, accepted.actionAttemptId),
     ).resolves.toMatchObject({ inputJson: acceptedRow.input_json })
     expect(digestCalls).toBeGreaterThan(0)
 
     const missing = { ...acceptedRow }
-    delete missing.state
+    delete missing.phase
     for (const [candidate, message] of [
       [missing, /row fields are malformed/u],
       [{ ...acceptedRow, unchecked: true }, /row fields are malformed/u],
       [[], /row fields are malformed/u],
       [new Proxy(acceptedRow, {}), /could not be captured safely/u],
     ] as const) {
-      await expect(loadSagaAttemptRecordRow(candidate, digest)).rejects.toThrow(message)
+      await expect(loadSagaAttemptIdentityRow(candidate, digest)).rejects.toThrow(message)
     }
-    await expect(loadSagaAttemptRecordRow(acceptedRow, null as never)).rejects.toMatchObject({
+    await expect(loadSagaAttemptIdentityRow(acceptedRow, null as never)).rejects.toMatchObject({
       code: "ConfigurationError",
     })
-    await expect(loadSagaAttemptRecordRow(acceptedRow, () => "bad")).rejects.toThrow(
+    await expect(loadSagaAttemptIdentityRow(acceptedRow, () => "bad")).rejects.toThrow(
       /lowercase SHA-256/u,
     )
 
@@ -1831,16 +2484,73 @@ describe("D1SagaAttemptStore", () => {
       proof: confirmed.proof(),
       state: "confirmed",
     })
-    const confirmedRow = rawAttempt(database.database, confirmed.actionAttemptId)
-    await expect(loadSagaAttemptRecordRow(confirmedRow, digest)).resolves.toMatchObject({
-      state: "confirmed",
-    })
+    const confirmedIdentity = await loadSagaAttemptIdentityRow(
+      rawIdentity(database.database, confirmed.actionAttemptId),
+      digest,
+    )
+    const confirmedRow = rawOutcome(database.database, confirmed.actionAttemptId) as Record<
+      string,
+      unknown
+    >
+    const confirmedPayloads = rawPayloads(database.database, confirmed.actionAttemptId)
     await expect(
-      loadSagaAttemptRecordRow(
+      loadSagaAttemptOutcomeRow(confirmedRow, confirmedPayloads, confirmedIdentity, digest),
+    ).resolves.toMatchObject({ state: "confirmed" })
+    await expect(
+      loadSagaAttemptOutcomeRow(confirmedRow, confirmedPayloads, confirmedIdentity, null as never),
+    ).rejects.toMatchObject({ code: "ConfigurationError" })
+    await expect(
+      loadSagaAttemptOutcomeRow(
         { ...confirmedRow, error_checksum: "unexpected", error_json: "{}" },
+        confirmedPayloads,
+        confirmedIdentity,
         digest,
       ),
     ).rejects.toThrow(/value columns are contradictory/u)
+    const sparsePayloads = new Array<Record<string, unknown>>(2)
+    sparsePayloads[0] = confirmedPayloads[0] as Record<string, unknown>
+    await expect(
+      loadSagaAttemptOutcomeRow(confirmedRow, sparsePayloads, confirmedIdentity, digest),
+    ).rejects.toThrow(/payload row fields are malformed/u)
+    const evidencePayload = confirmedPayloads.find(
+      (row) => row.payload_kind === "evidence",
+    ) as Record<string, unknown>
+    const outputPayload = confirmedPayloads.find((row) => row.payload_kind === "output") as Record<
+      string,
+      unknown
+    >
+    for (const [payloadRows, message] of [
+      [[evidencePayload], /payload references are malformed/u],
+      [
+        [evidencePayload, outputPayload, { ...outputPayload, payload_kind: "error" }],
+        /payload references are malformed/u,
+      ],
+      [
+        [evidencePayload, { ...outputPayload, payload_kind: "error" }],
+        /payload identity is malformed/u,
+      ],
+      [
+        [evidencePayload, { ...outputPayload, payload_checksum: "0".repeat(64) }],
+        /payload set is incomplete or contradictory/u,
+      ],
+      [
+        [evidencePayload, { ...outputPayload, payload_json: ` ${outputPayload.payload_json}` }],
+        /payload is not canonical/u,
+      ],
+      [
+        [evidencePayload, { ...outputPayload, unchecked: true }],
+        /payload row fields are malformed/u,
+      ],
+      [
+        [evidencePayload, { ...outputPayload, attempt_id: "different" }],
+        /payload identity is malformed/u,
+      ],
+      [new Proxy(confirmedPayloads, {}), /could not be captured safely/u],
+    ] as const) {
+      await expect(
+        loadSagaAttemptOutcomeRow(confirmedRow, payloadRows, confirmedIdentity, digest),
+      ).rejects.toThrow(message)
+    }
 
     const failed = await fixture("codec-failed")
     await attempts.accept({
@@ -1859,20 +2569,64 @@ describe("D1SagaAttemptStore", () => {
       proof: failed.proof(),
       state: "failed",
     })
-    const failedRow = rawAttempt(database.database, failed.actionAttemptId)
+    const failedIdentity = await loadSagaAttemptIdentityRow(
+      rawIdentity(database.database, failed.actionAttemptId),
+      digest,
+    )
+    const failedRow = rawOutcome(database.database, failed.actionAttemptId) as Record<
+      string,
+      unknown
+    >
+    const failedPayloads = rawPayloads(database.database, failed.actionAttemptId)
+    const failedEvidence = failedPayloads.find((row) => row.payload_kind === "evidence") as Record<
+      string,
+      unknown
+    >
+    const failedError = failedPayloads.find((row) => row.payload_kind === "error") as Record<
+      string,
+      unknown
+    >
+    await expect(
+      loadSagaAttemptOutcomeRow(
+        {
+          ...failedRow,
+          error_json: failedError.payload_json,
+          evidence_json: failedEvidence.payload_json,
+        },
+        [],
+        failedIdentity,
+        digest,
+      ),
+    ).resolves.toMatchObject({ state: "failed" })
     for (const state of ["failed", "not_applied", "unknown"] as const) {
       const candidate: Record<string, unknown> = { ...failedRow, state }
-      candidate.outcome_checksum = await outcomeForRow(candidate)
-      await expect(loadSagaAttemptRecordRow(candidate, digest)).resolves.toMatchObject({ state })
+      candidate.outcome_checksum = await outcomeForRow({
+        ...failedIdentity,
+        ...candidate,
+        acceptance_checksum: failedIdentity.acceptanceChecksum,
+        evidence_json: failedEvidence.payload_json,
+        error_json: failedError.payload_json,
+      })
+      await expect(
+        loadSagaAttemptOutcomeRow(candidate, failedPayloads, failedIdentity, digest),
+      ).resolves.toMatchObject({ state })
     }
     const incompatible: Record<string, unknown> = { ...failedRow, state: "indeterminate" }
-    incompatible.outcome_checksum = await outcomeForRow(incompatible)
-    await expect(loadSagaAttemptRecordRow(incompatible, digest)).rejects.toThrow(
-      /incompatible outcome/u,
-    )
+    incompatible.outcome_checksum = await outcomeForRow({
+      ...failedIdentity,
+      ...incompatible,
+      acceptance_checksum: failedIdentity.acceptanceChecksum,
+      evidence_json: failedEvidence.payload_json,
+      error_json: failedError.payload_json,
+    })
     await expect(
-      loadSagaAttemptRecordRow(
+      loadSagaAttemptOutcomeRow(incompatible, failedPayloads, failedIdentity, digest),
+    ).rejects.toThrow(/incompatible outcome/u)
+    await expect(
+      loadSagaAttemptOutcomeRow(
         { ...failedRow, output_checksum: "unexpected", output_json: "{}" },
+        failedPayloads,
+        failedIdentity,
         digest,
       ),
     ).rejects.toThrow(/value columns are contradictory/u)
@@ -1954,7 +2708,7 @@ describe("D1SagaAttemptStore", () => {
         proof: run.proof(),
         state: "confirmed",
       }),
-    ).rejects.toThrow(/outcome was not committed/u)
+    ).rejects.toThrow(/malformed saga-receipt batch metadata/u)
 
     const acceptedBefore = rawAttempt(database.database, run.actionAttemptId)
     await attempts.complete({
@@ -1981,6 +2735,6 @@ describe("D1SagaAttemptStore", () => {
         proof: run.proof(),
         state: "confirmed",
       }),
-    ).rejects.toThrow(/committed saga outcome contradicts/u)
+    ).rejects.toThrow(/duplicate saga outcome contradicts/u)
   })
 })

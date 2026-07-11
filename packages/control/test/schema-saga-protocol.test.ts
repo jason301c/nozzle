@@ -780,7 +780,12 @@ describe("control schema saga protocol guards", () => {
              ORDER BY "schema_version"`,
           )
           .all(),
-      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }, { schema_version: 3 }])
+      ).toEqual([
+        { schema_version: 1 },
+        { schema_version: 2 },
+        { schema_version: 3 },
+        { schema_version: 4 },
+      ])
     } finally {
       database.close()
     }

@@ -51,6 +51,13 @@ const digest: DigestFunction = async (input) => {
 
 beforeAll(async () => {
   for (const statement of CONTROL_SCHEMA_STATEMENTS) await env.DB.prepare(statement).run()
+  await env.DB.prepare(
+    `INSERT INTO "nozzle_saga_outcome_payload_activations"
+     ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
+     VALUES (1, ?1, 1)`,
+  )
+    .bind("7".repeat(64))
+    .run()
 })
 
 describe("real workerd D1 saga projection", () => {
@@ -100,6 +107,7 @@ describe("real workerd D1 saga projection", () => {
       { schema_version: 1 },
       { schema_version: 2 },
       { schema_version: 3 },
+      { schema_version: 4 },
     ])
     expect(replacementGuards.results).toEqual([
       { name: "nozzle_control_saga_attempt_insert_v2" },
@@ -169,6 +177,7 @@ describe("real workerd D1 saga projection", () => {
       { schema_version: 1 },
       { schema_version: 2 },
       { schema_version: 3 },
+      { schema_version: 4 },
     ])
     expect(replacementGuards.results).toEqual([
       { name: "nozzle_control_irreversible_authorization_body_fence_v3" },
@@ -792,6 +801,42 @@ describe("real workerd D1 saga projection", () => {
       state: "confirmed",
     })
     if (outcome.state !== "confirmed") throw new Error("Expected an applied observation outcome.")
+    expect(
+      await env.DB.prepare(
+        `SELECT "evidence_json", "output_json", "error_json"
+         FROM "nozzle_saga_action_attempt_outcomes"
+         WHERE "attempt_id" = ?1`,
+      )
+        .bind(observationAttemptId)
+        .first(),
+    ).toEqual({
+      error_json: null,
+      evidence_json: '{"kind":"evidence","storage":"nozzle.saga-outcome-payload.v1"}',
+      output_json: '{"kind":"output","storage":"nozzle.saga-outcome-payload.v1"}',
+    })
+    expect(
+      (
+        await env.DB.prepare(
+          `SELECT "payload_kind", "payload_checksum", "payload_json"
+           FROM "nozzle_saga_action_attempt_outcome_payloads"
+           WHERE "attempt_id" = ?1
+           ORDER BY "payload_kind"`,
+        )
+          .bind(observationAttemptId)
+          .all()
+      ).results,
+    ).toEqual([
+      {
+        payload_checksum: outcome.evidenceChecksum,
+        payload_json: '{"source":"workerd-observer"}',
+        payload_kind: "evidence",
+      },
+      {
+        payload_checksum: outcome.outputChecksum,
+        payload_json: '{"written":true}',
+        payload_kind: "output",
+      },
+    ])
     const settled = await coordinator.settleObservationFromReceipt({
       actorChecksum: "workerd-coordinator-actor",
       attemptId: observationAttemptId,

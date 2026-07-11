@@ -9,11 +9,14 @@ import {
   CONTROL_SCHEMA_VERSION,
   CONTROL_SCHEMA_VERSION_ONE_ARTIFACT_SHA256,
   CONTROL_SCHEMA_VERSION_ONE_STATEMENTS,
+  CONTROL_SCHEMA_VERSION_THREE_ARTIFACT_SHA256,
+  CONTROL_SCHEMA_VERSION_THREE_STATEMENTS,
   CONTROL_SCHEMA_VERSION_TWO_ARTIFACT_SHA256,
   CONTROL_SCHEMA_VERSION_TWO_STATEMENTS,
   CONTROL_TABLE_NAMES,
   controlSchemaSql,
   controlSchemaVersionOneSql,
+  controlSchemaVersionThreeSql,
   controlSchemaVersionTwoSql,
 } from "../src/schema.js"
 
@@ -76,6 +79,9 @@ const schemaInstallBoundaries = CONTROL_SCHEMA_STATEMENTS.flatMap((statement, in
     statement.includes("irreversible_authorization") ||
     statement.includes("irreversible_saga_attempt_v3") ||
     statement.includes("irreversible_provider_attempt_v3") ||
+    statement.includes("saga_outcome_payload_activation") ||
+    statement.includes("saga_outcome_payload") ||
+    statement.includes("saga_outcome_inline_bytes_v4") ||
     statement.includes('DROP TRIGGER IF EXISTS "nozzle_control_saga_attempt_insert"') ||
     statement.includes('DROP TRIGGER IF EXISTS "nozzle_control_saga_outcome_insert"') ||
     index === CONTROL_SCHEMA_STATEMENTS.length - 1
@@ -105,10 +111,21 @@ describe("control D1 schema", () => {
     expect(sql).not.toContain("nozzle_irreversible_authorization_receipts")
   })
 
+  it("keeps the complete historical version-three install artifact checksum-locked", () => {
+    const sql = controlSchemaVersionThreeSql()
+    expect(Object.isFrozen(CONTROL_SCHEMA_VERSION_THREE_STATEMENTS)).toBe(true)
+    expect(CONTROL_SCHEMA_VERSION_THREE_STATEMENTS).toHaveLength(165)
+    expect(createHash("sha256").update(sql).digest("hex")).toBe(
+      CONTROL_SCHEMA_VERSION_THREE_ARTIFACT_SHA256,
+    )
+    expect(sql).toContain("VALUES (3, CAST(unixepoch('subsec') * 1000 AS INTEGER))")
+    expect(sql).not.toContain("nozzle_saga_action_attempt_outcome_payloads")
+  })
+
   it("emits one deterministic install artifact with every required ledger table", () => {
     const sql = controlSchemaSql()
     expect(sql).toBe(`${CONTROL_SCHEMA_STATEMENTS.join("\n\n")}\n`)
-    expect(CONTROL_SCHEMA_VERSION).toBe(3)
+    expect(CONTROL_SCHEMA_VERSION).toBe(4)
     expect(Object.isFrozen(CONTROL_SCHEMA_STATEMENTS)).toBe(true)
     expect(Object.isFrozen(CONTROL_TABLE_NAMES)).toBe(true)
     expect(sql).not.toContain("fictional-secret")
@@ -142,7 +159,12 @@ describe("control D1 schema", () => {
              ORDER BY "schema_version"`,
           )
           .all(),
-      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }, { schema_version: 3 }])
+      ).toEqual([
+        { schema_version: 1 },
+        { schema_version: 2 },
+        { schema_version: 3 },
+        { schema_version: 4 },
+      ])
       expect(() =>
         database.prepare(`UPDATE "nozzle_control_meta" SET "installed_at_ms" = 0`).run(),
       ).toThrow("NOZZLE_CONTROL_INSTALL_IDENTITY_IMMUTABLE")
@@ -193,6 +215,7 @@ describe("control D1 schema", () => {
         },
         expect.objectContaining({ schema_version: 2 }),
         expect.objectContaining({ schema_version: 3 }),
+        expect.objectContaining({ schema_version: 4 }),
       ])
       expect(
         database
@@ -206,6 +229,8 @@ describe("control D1 schema", () => {
         { name: "nozzle_control_saga_attempt_insert_v2" },
         { name: "nozzle_control_saga_insert" },
         { name: "nozzle_control_saga_outcome_insert_v2" },
+        { name: "nozzle_control_saga_outcome_payload_activation_insert_v4" },
+        { name: "nozzle_control_saga_outcome_payload_insert_v4" },
         { name: "nozzle_control_saga_protocol_action_insert_v2" },
         { name: "nozzle_control_saga_protocol_binding_insert_v2" },
         { name: "nozzle_control_saga_protocol_compensation_insert_v2" },
@@ -235,7 +260,12 @@ describe("control D1 schema", () => {
              ORDER BY "schema_version"`,
           )
           .all(),
-      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }, { schema_version: 3 }])
+      ).toEqual([
+        { schema_version: 1 },
+        { schema_version: 2 },
+        { schema_version: 3 },
+        { schema_version: 4 },
+      ])
       expect(
         database
           .prepare(
@@ -265,7 +295,12 @@ describe("control D1 schema", () => {
              ORDER BY "schema_version"`,
           )
           .all(),
-      ).toEqual([{ schema_version: 1 }, { schema_version: 2 }, { schema_version: 3 }])
+      ).toEqual([
+        { schema_version: 1 },
+        { schema_version: 2 },
+        { schema_version: 3 },
+        { schema_version: 4 },
+      ])
     } finally {
       database.close()
     }
@@ -317,7 +352,12 @@ describe("control D1 schema", () => {
                ORDER BY "schema_version"`,
             )
             .all(),
-        ).toEqual([{ schema_version: 1 }, { schema_version: 2 }, { schema_version: 3 }])
+        ).toEqual([
+          { schema_version: 1 },
+          { schema_version: 2 },
+          { schema_version: 3 },
+          { schema_version: 4 },
+        ])
         expect(
           installer
             .prepare(
@@ -356,7 +396,7 @@ describe("control D1 schema", () => {
         "published_at_ms" INTEGER NOT NULL CHECK ("published_at_ms" >= 0)
       );
       INSERT INTO "nozzle_control_schema_versions"
-      VALUES (1, 1234), (2, 2345), (3, 3456), (4, 4567);
+      VALUES (1, 1234), (2, 2345), (3, 3456), (4, 4567), (5, 5678);
       CREATE TABLE "nozzle_saga_action_attempts" ("attempt_id" TEXT);
       CREATE TRIGGER "nozzle_control_saga_attempt_insert_v2"
       BEFORE INSERT ON "nozzle_saga_action_attempts" BEGIN SELECT 3; END;`)
@@ -404,7 +444,9 @@ describe("control D1 schema", () => {
   ] as const)("refuses to publish with a corrupt %s trigger", (triggerName, tableName) => {
     const database = new DatabaseSync(":memory:")
     try {
-      for (const statement of CONTROL_SCHEMA_STATEMENTS.slice(0, -1)) database.exec(statement)
+      for (const statement of CONTROL_SCHEMA_VERSION_TWO_STATEMENTS.slice(0, -1)) {
+        database.exec(statement)
+      }
       database.exec(`DROP TRIGGER "${triggerName}";`)
       database.exec(
         `CREATE TRIGGER "${triggerName}" BEFORE INSERT ON "${tableName}"
@@ -457,7 +499,9 @@ describe("control D1 schema", () => {
   ] as const)("refuses version-three publication with a corrupt %s trigger", (triggerName, tableName) => {
     const database = new DatabaseSync(":memory:")
     try {
-      for (const statement of CONTROL_SCHEMA_STATEMENTS.slice(0, -1)) database.exec(statement)
+      for (const statement of CONTROL_SCHEMA_VERSION_THREE_STATEMENTS.slice(0, -1)) {
+        database.exec(statement)
+      }
       database.exec(`DROP TRIGGER "${triggerName}";`)
       database.exec(
         `CREATE TRIGGER "${triggerName}" BEFORE INSERT ON "${tableName}"
@@ -500,6 +544,258 @@ describe("control D1 schema", () => {
     }
   })
 
+  it.each([
+    [
+      "nozzle_control_saga_outcome_payload_activation_insert_v4",
+      "nozzle_saga_outcome_payload_activations",
+    ],
+    [
+      "nozzle_control_saga_outcome_payload_activation_update",
+      "nozzle_saga_outcome_payload_activations",
+    ],
+    [
+      "nozzle_control_saga_outcome_payload_activation_delete",
+      "nozzle_saga_outcome_payload_activations",
+    ],
+    ["nozzle_control_saga_outcome_inline_bytes_v4", "nozzle_saga_action_attempt_outcomes"],
+    [
+      "nozzle_control_saga_outcome_payload_insert_v4",
+      "nozzle_saga_action_attempt_outcome_payloads",
+    ],
+    ["nozzle_control_saga_outcome_payload_update", "nozzle_saga_action_attempt_outcome_payloads"],
+    ["nozzle_control_saga_outcome_payload_delete", "nozzle_saga_action_attempt_outcome_payloads"],
+  ] as const)("refuses version-four publication with a corrupt %s trigger", (name, table) => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      for (const statement of CONTROL_SCHEMA_STATEMENTS.slice(0, -1)) database.exec(statement)
+      database.exec(`DROP TRIGGER "${name}";`)
+      database.exec(`CREATE TRIGGER "${name}" BEFORE INSERT ON "${table}"
+        BEGIN SELECT 4; END;`)
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+             WHERE "schema_version" = 4`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("refuses version-four publication with a corrupt outcome-payload table", () => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      database.exec(controlSchemaVersionThreeSql())
+      database.exec(`CREATE TABLE "nozzle_saga_action_attempt_outcome_payloads" (
+        "attempt_id" TEXT PRIMARY KEY NOT NULL
+      );`)
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+             WHERE "schema_version" = 4`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("refuses version-four publication with a corrupt payload-activation table", () => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      database.exec(controlSchemaVersionThreeSql())
+      database.exec(`CREATE TABLE "nozzle_saga_outcome_payload_activations" (
+        "protocol_version" INTEGER PRIMARY KEY NOT NULL
+      );`)
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+             WHERE "schema_version" = 4`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("never publishes version four over a prepublication payload activation", () => {
+    const database = new DatabaseSync(":memory:")
+    const tableIndex = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+      statement.startsWith('CREATE TABLE IF NOT EXISTS "nozzle_saga_outcome_payload_activations"'),
+    )
+    try {
+      database.exec(controlSchemaVersionThreeSql())
+      for (const statement of CONTROL_SCHEMA_STATEMENTS.slice(
+        CONTROL_SCHEMA_VERSION_THREE_STATEMENTS.length,
+        tableIndex + 1,
+      )) {
+        database.exec(statement)
+      }
+      database
+        .prepare(
+          `INSERT INTO "nozzle_saga_outcome_payload_activations"
+           ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
+           VALUES (1, ?, 1)`,
+        )
+        .run("7".repeat(64))
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+             WHERE "schema_version" = 4`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("leaves payload activation explicit, immutable, and persistent", () => {
+    withDatabase((database) => {
+      expect(
+        database
+          .prepare(`SELECT count(*) AS "count" FROM "nozzle_saga_outcome_payload_activations"`)
+          .get(),
+      ).toEqual({ count: 0 })
+      database
+        .prepare(
+          `INSERT INTO "nozzle_saga_outcome_payload_activations"
+           ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
+           VALUES (1, ?, 1)`,
+        )
+        .run("7".repeat(64))
+      expect(() =>
+        database
+          .prepare(`UPDATE "nozzle_saga_outcome_payload_activations" SET "activated_at_ms" = 2`)
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_ACTIVATION_IMMUTABLE")
+      expect(() =>
+        database.prepare(`DELETE FROM "nozzle_saga_outcome_payload_activations"`).run(),
+      ).toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_ACTIVATION_PERSISTENT")
+    })
+  })
+
+  it("never publishes version four over a prepublication companion payload", () => {
+    const database = new DatabaseSync(":memory:")
+    const tableIndex = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+      statement.startsWith(
+        'CREATE TABLE IF NOT EXISTS "nozzle_saga_action_attempt_outcome_payloads"',
+      ),
+    )
+    try {
+      database.exec(controlSchemaVersionThreeSql())
+      for (const statement of CONTROL_SCHEMA_STATEMENTS.slice(
+        CONTROL_SCHEMA_VERSION_THREE_STATEMENTS.length,
+        tableIndex + 1,
+      )) {
+        database.exec(statement)
+      }
+      database.exec("PRAGMA foreign_keys = OFF;")
+      database
+        .prepare(
+          `INSERT INTO "nozzle_saga_action_attempt_outcome_payloads"
+           ("attempt_id", "payload_kind", "payload_checksum", "payload_json")
+           VALUES ('interrupted', 'evidence', ?, '{}')`,
+        )
+        .run("0".repeat(64))
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+             WHERE "schema_version" = 4`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("caps companion JSON by UTF-8 bytes at exactly one MiB", () => {
+    const database = new DatabaseSync(":memory:")
+    const tableStatement = CONTROL_SCHEMA_STATEMENTS.find((statement) =>
+      statement.startsWith(
+        'CREATE TABLE IF NOT EXISTS "nozzle_saga_action_attempt_outcome_payloads"',
+      ),
+    ) as string
+    try {
+      database.exec(controlSchemaVersionThreeSql())
+      database.exec(tableStatement)
+      database.exec("PRAGMA foreign_keys = OFF;")
+      const exact = JSON.stringify(`${"é".repeat(524_287)}`)
+      const over = JSON.stringify(`${"é".repeat(524_287)}a`)
+      expect(Buffer.byteLength(exact)).toBe(1024 * 1024)
+      expect(Buffer.byteLength(over)).toBe(1024 * 1024 + 1)
+      const insert = database.prepare(
+        `INSERT INTO "nozzle_saga_action_attempt_outcome_payloads"
+         ("attempt_id", "payload_kind", "payload_checksum", "payload_json")
+         VALUES (?, 'evidence', ?, ?)`,
+      )
+      expect(() => insert.run("exact", "0".repeat(64), exact)).not.toThrow()
+      expect(() => insert.run("over", "1".repeat(64), over)).toThrow("CHECK constraint failed")
+      expect(() => insert.run("short", "2".repeat(63), "{}")).toThrow("CHECK constraint failed")
+      expect(() => insert.run("uppercase", "A".repeat(64), "{}")).toThrow("CHECK constraint failed")
+    } finally {
+      database.close()
+    }
+  })
+
+  it("installs every row-safe outcome guard before publishing version four", () => {
+    const publication = CONTROL_SCHEMA_STATEMENTS.length - 1
+    const activationTable = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+      statement.startsWith('CREATE TABLE IF NOT EXISTS "nozzle_saga_outcome_payload_activations"'),
+    )
+    const table = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+      statement.startsWith(
+        'CREATE TABLE IF NOT EXISTS "nozzle_saga_action_attempt_outcome_payloads"',
+      ),
+    )
+    const guards = [
+      "nozzle_control_saga_outcome_payload_activation_insert_v4",
+      "nozzle_control_saga_outcome_payload_activation_update",
+      "nozzle_control_saga_outcome_payload_activation_delete",
+      "nozzle_control_saga_outcome_inline_bytes_v4",
+      "nozzle_control_saga_outcome_payload_insert_v4",
+      "nozzle_control_saga_outcome_payload_update",
+      "nozzle_control_saga_outcome_payload_delete",
+    ].map((name) =>
+      CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+        statement.includes(`CREATE TRIGGER IF NOT EXISTS "${name}"`),
+      ),
+    )
+    expect(activationTable).toBeGreaterThanOrEqual(CONTROL_SCHEMA_VERSION_THREE_STATEMENTS.length)
+    expect(table).toBeGreaterThan(activationTable)
+    expect(guards.every((index) => index > activationTable && index < publication)).toBe(true)
+    expect(CONTROL_SCHEMA_STATEMENTS.at(-3)).toContain(
+      'SELECT 1 FROM "nozzle_saga_outcome_payload_activations"',
+    )
+    expect(CONTROL_SCHEMA_STATEMENTS.at(-2)).toContain(
+      'SELECT 1 FROM "nozzle_saga_action_attempt_outcome_payloads"',
+    )
+    expect(CONTROL_SCHEMA_STATEMENTS.at(-1)).toBe(
+      `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (4, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`,
+    )
+  })
+
   it("installs every authorization guard and backfill before publishing version three", () => {
     const mapperIndex = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
       statement.includes("nozzle_control_irreversible_authorization_receipt_classify_v3"),
@@ -526,7 +822,7 @@ describe("control D1 schema", () => {
     expect(guardIndices.every((index) => index >= 0)).toBe(true)
     expect(mapperIndex).toBeGreaterThan(Math.max(...guardIndices))
     expect(backfillIndex).toBeGreaterThan(mapperIndex)
-    expect(CONTROL_SCHEMA_STATEMENTS.at(-1)).toBe(
+    expect(CONTROL_SCHEMA_VERSION_THREE_STATEMENTS.at(-1)).toBe(
       `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
 VALUES (3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
 ON CONFLICT ("schema_version") DO NOTHING;`,
@@ -1101,14 +1397,16 @@ ON CONFLICT ("schema_version") DO NOTHING;`,
       expect(() =>
         database
           .prepare(
-            `UPDATE "nozzle_leases" SET "holder_id" = 'holder-b', "acquisition_id" = 'acquisition-b'`,
+            `UPDATE "nozzle_leases"
+             SET "holder_id" = 'holder-b', "acquisition_id" = 'acquisition-b'`,
           )
           .run(),
       ).toThrow("NOZZLE_CONTROL_LEASE_NOT_FENCED")
       expect(() =>
         database
           .prepare(
-            `UPDATE "nozzle_leases" SET "holder_id" = 'holder-b', "acquisition_id" = 'acquisition-b',
+            `UPDATE "nozzle_leases"
+             SET "holder_id" = 'holder-b', "acquisition_id" = 'acquisition-b',
              "fencing_token" = 4`,
           )
           .run(),
@@ -1127,7 +1425,8 @@ ON CONFLICT ("schema_version") DO NOTHING;`,
       expect(() =>
         database
           .prepare(
-            `UPDATE "nozzle_leases" SET "holder_id" = 'holder-b', "acquisition_id" = 'acquisition-b',
+            `UPDATE "nozzle_leases"
+             SET "holder_id" = 'holder-b', "acquisition_id" = 'acquisition-b',
              "fencing_token" = 4, "expires_at_ms" = 200`,
           )
           .run(),
