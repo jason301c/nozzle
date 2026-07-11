@@ -16,7 +16,7 @@
     "test:run": "vitest run",
     "test:safety": "vitest run --config vitest.safety.config.ts --coverage",
     "test:workers": "vitest run --config vitest.workers.config.ts",
-    "typecheck": "tsc -b && tsc -p tsconfig.test.json && tsc -p tsconfig.workers-test.json"
+    "typecheck": "tsc -b tsconfig.json tsconfig.test.json tsconfig.workers-test.json"
   },
   "license": "UNLICENSED",
   "engines": {
