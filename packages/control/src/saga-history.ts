@@ -497,7 +497,7 @@ function attemptSummaryRow(value: unknown): AttemptSummaryRow | null {
   return row
 }
 
-function validatedAnchor(value: unknown): SagaHistoryAnchor {
+export function loadSagaHistoryAnchor(value: unknown): SagaHistoryAnchor {
   const anchor = captured<SagaHistoryAnchor>(value, HISTORY_ANCHOR_KEYS, "Saga-history anchor")
   if (
     anchor.schemaVersion !== 1 ||
@@ -794,7 +794,7 @@ export class D1SagaHistoryReader {
   }
 
   async assertAnchorCurrent(input: SagaHistoryAnchor): Promise<void> {
-    const anchor = validatedAnchor(input)
+    const anchor = loadSagaHistoryAnchor(input)
     const identity = await this.#identity(anchor.operationId, anchor.sagaId)
     const transitions = await this.#transitionSummary(anchor.environmentId, anchor.operationId)
     const effects = await this.#effectSummary(anchor.sagaId, identity)
@@ -836,7 +836,7 @@ export class D1SagaHistoryReader {
     inputAnchor: SagaHistoryAnchor,
     afterSequenceInput = 0,
   ): Promise<SagaHistoryPage<SagaHistoryAuditRow, number>> {
-    const anchor = validatedAnchor(inputAnchor)
+    const anchor = loadSagaHistoryAnchor(inputAnchor)
     if (!safeInteger(afterSequenceInput, 0) || afterSequenceInput > anchor.auditHeadSequence) {
       return configuration("Saga-history audit cursor is malformed.")
     }
@@ -875,7 +875,7 @@ export class D1SagaHistoryReader {
     inputAnchor: SagaHistoryAnchor,
     inputCursor?: SagaHistoryTransitionCursor,
   ): Promise<SagaHistoryPage<SagaHistoryTransitionRow, SagaHistoryTransitionCursor>> {
-    const anchor = validatedAnchor(inputAnchor)
+    const anchor = loadSagaHistoryAnchor(inputAnchor)
     const cursor =
       inputCursor === undefined
         ? Object.freeze({ auditSequence: 0, transitionId: "" })
@@ -1006,7 +1006,7 @@ export class D1SagaHistoryReader {
     inputAnchor: SagaHistoryAnchor,
     afterStateVersionInput = -1,
   ): Promise<SagaHistoryPage<SagaHistoryEffectRow, number>> {
-    const anchor = validatedAnchor(inputAnchor)
+    const anchor = loadSagaHistoryAnchor(inputAnchor)
     if (
       !safeInteger(afterStateVersionInput, -1) ||
       afterStateVersionInput > anchor.sagaStateVersion
@@ -1069,7 +1069,7 @@ export class D1SagaHistoryReader {
     inputAnchor: SagaHistoryAnchor,
     inputCursor?: SagaHistoryAttemptCursor,
   ): Promise<SagaHistoryPage<SagaAttemptIdentityRow, SagaHistoryAttemptCursor>> {
-    const anchor = validatedAnchor(inputAnchor)
+    const anchor = loadSagaHistoryAnchor(inputAnchor)
     if (anchor.sagaAttemptCount === 0) {
       if (inputCursor !== undefined) attemptCursor(inputCursor)
       return emptyPage()

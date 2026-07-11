@@ -11,8 +11,10 @@ describe("@nozzle/control public API", () => {
     for (const internal of [
       "acceptedSagaAttemptRecord",
       "D1SagaHistoryReader",
+      "loadSagaHistoryAnchor",
       "loadSagaAttemptIdentityRow",
       "loadSagaAttemptOutcomeRow",
+      "SagaHistoryAuditFolder",
       "SAGA_ATTEMPT_IDENTITY_ROW_SELECT",
       "SAGA_ATTEMPT_OUTCOME_ROW_SELECT",
       "SAGA_ATTEMPT_PAYLOAD_ROW_SELECT",

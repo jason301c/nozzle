@@ -1,6 +1,8 @@
 import { env } from "cloudflare:test"
+import { appendAuditEvent, type DigestFunction } from "@nozzle/core"
 import { beforeAll, describe, expect, it } from "vitest"
 import { D1SagaHistoryReader } from "../src/saga-history.js"
+import { SagaHistoryAuditFolder } from "../src/saga-history-fold.js"
 
 declare global {
   namespace Cloudflare {
@@ -14,6 +16,11 @@ async function run(sql: string, ...values: unknown[]): Promise<void> {
   await env.DB.prepare(sql)
     .bind(...values)
     .run()
+}
+
+const digest: DigestFunction = async (input) => {
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", input.slice().buffer))
+  return Array.from(hash, (byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
 beforeAll(async () => {
@@ -154,6 +161,83 @@ describe("real workerd D1 saga history paging", () => {
       complete: true,
       nextCursor: null,
       rows: [],
+    })
+  })
+
+  it("folds a checksum-verified audit chain in the workerd runtime", async () => {
+    const created = await appendAuditEvent(
+      undefined,
+      {
+        actorChecksum: "actor-checksum",
+        environmentId: "fold-environment",
+        eventType: "operation.created",
+        fencingToken: null,
+        idempotencyKey: "fold-operation:created",
+        operationId: "fold-operation",
+        payloadChecksum: "fold-input",
+        serverTimeMs: 1,
+        stepId: null,
+      },
+      digest,
+    )
+    const transitioned = await appendAuditEvent(
+      created,
+      {
+        actorChecksum: "actor-checksum",
+        environmentId: "fold-environment",
+        eventType: "saga.initialized",
+        fencingToken: 1,
+        idempotencyKey: "fold-transition",
+        operationId: "fold-operation",
+        payloadChecksum: "fold-evidence",
+        serverTimeMs: 2,
+        stepId: "saga:init",
+      },
+      digest,
+    )
+    const folder = new SagaHistoryAuditFolder(
+      {
+        auditHeadEventHash: transitioned.eventHash,
+        auditHeadSequence: 2,
+        environmentId: "fold-environment",
+        operationId: "fold-operation",
+        operationInputChecksum: "fold-input",
+        operationPlanChecksum: "fold-plan",
+        operationStatus: "running",
+        operationTransitionCount: 1,
+        operationTransitionLastAuditSequence: 2,
+        operationTransitionLastId: "fold-transition",
+        operationUpdatedAtMs: 2,
+        sagaAttemptCount: 0,
+        sagaAttemptLastAcceptedAtMs: null,
+        sagaAttemptLastId: null,
+        sagaDescriptorChecksum: "fold-descriptor",
+        sagaEffectCount: 1,
+        sagaId: "fold-saga",
+        sagaInputChecksum: "fold-saga-input",
+        sagaLastEffectId: "fold-effect",
+        sagaRecordChecksum: "fold-record",
+        sagaStateVersion: 0,
+        sagaStatus: "failed",
+        sagaUpdatedAtMs: 2,
+        schemaVersion: 1,
+      },
+      digest,
+    )
+    await folder.append({
+      complete: true,
+      nextCursor: null,
+      rows: [created, transitioned].map((event) => ({
+        event_hash: event.eventHash,
+        event_json: JSON.stringify(event),
+        sequence: event.sequence,
+      })),
+    })
+    expect(folder.proof()).toMatchObject({
+      auditEventCount: 2,
+      operationCreationEventHash: created.eventHash,
+      operationTransitionCount: 1,
+      operationTransitionFoldChecksum: expect.stringMatching(/^[0-9a-f]{64}$/u),
     })
   })
 })
