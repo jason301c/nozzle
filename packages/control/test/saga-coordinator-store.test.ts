@@ -6,9 +6,7 @@ import {
   type IrreversibleAuthorization,
   leaseProof,
   type OperationPlan,
-  type OperationStepPlanInput,
   operationStatus,
-  sagaActionIdempotencyKey,
   sealIrreversibleAuthorization,
   sealOperationPlan,
   sealSagaDescriptor,
@@ -27,12 +25,15 @@ import {
   operationStepRecordJson,
   operationTransitionIdentity,
 } from "../src/operation-store.js"
-import { D1SagaAttemptStore, sagaActionInputChecksum } from "../src/saga-attempt-store.js"
+import { D1SagaAttemptStore } from "../src/saga-attempt-store.js"
 import {
   D1SagaCoordinatorStore,
   type InitializeSagaInput,
   type RequestCoordinatedSagaTerminationInput,
 } from "../src/saga-coordinator-store.js"
+import { sealSagaInvocationInput } from "../src/saga-input.js"
+import { sealSagaOperationPlan } from "../src/saga-plan.js"
+import { type SagaHandlerRegistration, sealSagaHandlerRegistry } from "../src/saga-registry.js"
 import {
   D1SagaStore,
   SAGA_INIT_OPERATION_STEP_ID,
@@ -157,10 +158,12 @@ class FixedStatement implements ControlStatement {
 
 class OperationPlanViewStatement implements ControlStatement {
   #statement: ControlStatement
+  readonly #inputJson: string | undefined
   readonly #plan: OperationPlan
 
-  constructor(statement: ControlStatement, plan: OperationPlan) {
+  constructor(statement: ControlStatement, plan: OperationPlan, inputJson?: string) {
     this.#statement = statement
+    this.#inputJson = inputJson
     this.#plan = plan
   }
 
@@ -178,6 +181,9 @@ class OperationPlanViewStatement implements ControlStatement {
     if (row === null) return null
     return {
       ...row,
+      ...(this.#inputJson === undefined
+        ? {}
+        : { input_checksum: this.#plan.inputChecksum, input_json: this.#inputJson }),
       operation_type: this.#plan.operationType,
       plan_checksum: this.#plan.planChecksum,
       plan_json: JSON.stringify(this.#plan),
@@ -189,12 +195,51 @@ class OperationPlanViewStatement implements ControlStatement {
   }
 }
 
-class OperationPlanViewDatabase implements TransactionalControlDatabase {
-  readonly #base: DatabaseAdapter
+class OperationPlanStepsViewStatement implements ControlStatement {
+  #statement: ControlStatement
   readonly #plan: OperationPlan
 
-  constructor(base: DatabaseAdapter, plan: OperationPlan) {
+  constructor(statement: ControlStatement, plan: OperationPlan) {
+    this.#statement = statement
+    this.#plan = plan
+  }
+
+  bind(...values: readonly ControlBindingValue[]): ControlStatement {
+    this.#statement = this.#statement.bind(...values)
+    return this
+  }
+
+  async all<T>(): Promise<ControlQueryResult<T>> {
+    const result = await this.#statement.all<Record<string, unknown>>()
+    const steps = new Map(this.#plan.steps.map((step) => [step.stepId, step]))
+    return {
+      ...result,
+      results: result.results
+        .filter((row) => typeof row.step_id === "string" && steps.has(row.step_id))
+        .map((row) => ({
+          ...row,
+          plan_json: JSON.stringify(steps.get(row.step_id as string)),
+        })) as T[],
+    }
+  }
+
+  async first<T>(): Promise<T | null> {
+    return this.#statement.first<T>()
+  }
+
+  async run(): Promise<ControlRunResult> {
+    return this.#statement.run()
+  }
+}
+
+class OperationPlanViewDatabase implements TransactionalControlDatabase {
+  readonly #base: DatabaseAdapter
+  readonly #inputJson: string | undefined
+  readonly #plan: OperationPlan
+
+  constructor(base: DatabaseAdapter, plan: OperationPlan, inputJson?: string) {
     this.#base = base
+    this.#inputJson = inputJson
     this.#plan = plan
   }
 
@@ -204,9 +249,13 @@ class OperationPlanViewDatabase implements TransactionalControlDatabase {
 
   prepare(sql: string): ControlStatement {
     const statement = this.#base.prepare(sql)
-    return sql.includes('FROM "nozzle_operations" WHERE "operation_id" = ?1')
-      ? new OperationPlanViewStatement(statement, this.#plan)
-      : statement
+    if (sql.includes('FROM "nozzle_operations" WHERE "operation_id" = ?1')) {
+      return new OperationPlanViewStatement(statement, this.#plan, this.#inputJson)
+    }
+    if (sql.includes('FROM "nozzle_operation_steps" WHERE "operation_id" = ?1')) {
+      return new OperationPlanStepsViewStatement(statement, this.#plan)
+    }
+    return statement
   }
 }
 
@@ -1019,6 +1068,8 @@ interface Fixture {
   readonly actionInputJson: string
   readonly attempts: D1SagaAttemptStore
   readonly base: DatabaseAdapter
+  readonly canonicalInvocationInputJson: string
+  readonly canonicalPlan: OperationPlan
   readonly coordinator: D1SagaCoordinatorStore
   readonly initialize: InitializeSagaInput
   readonly leases: D1LeaseStore
@@ -1035,6 +1086,48 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
+function handlerRegistrations(
+  descriptor: InitializeSagaInput["descriptor"],
+): SagaHandlerRegistration[] {
+  const registrations: SagaHandlerRegistration[] = []
+  for (const step of descriptor.steps) {
+    registrations.push(
+      {
+        handler: () => ({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" }),
+        kind: "effect",
+        reference: step.forwardAction,
+      },
+      {
+        handler: () => ({ evidenceJson: "{}", outputJson: "{}", state: "applied" }),
+        kind: "observation",
+        reference: step.forwardObservation,
+      },
+    )
+    if (step.compensationAction !== null) {
+      registrations.push({
+        handler: () => ({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" }),
+        kind: "effect",
+        reference: step.compensationAction,
+      })
+    }
+    if (step.compensationObservation !== null) {
+      registrations.push({
+        handler: () => ({ evidenceJson: "{}", outputJson: "{}", state: "applied" }),
+        kind: "observation",
+        reference: step.compensationObservation,
+      })
+    }
+  }
+  return registrations
+}
+
+interface FixtureProvenanceOptions {
+  readonly legacyOperationInput?: boolean
+  readonly operationInputJson?: string
+  readonly planVariant?: "extra_step" | "mismatched_action"
+  readonly secondStep?: boolean
+}
+
 async function fixture(
   suffix: string,
   fault?: BatchFault,
@@ -1043,6 +1136,7 @@ async function fixture(
   omitTerminationPlan = false,
   irreversibleAction = false,
   operationType?: string,
+  provenance: FixtureProvenanceOptions = {},
 ): Promise<Fixture> {
   const base = new DatabaseAdapter()
   databases.push(base)
@@ -1061,7 +1155,6 @@ async function fixture(
   const sagaId = `coordinator-saga-${suffix}`
   const leaseKey = `saga:${sagaId}`
   const forwardStepId = sagaActionOperationStepId("a", "forward")
-  const compensationStepId = sagaActionOperationStepId("a", "compensation")
   const descriptor = await sealSagaDescriptor(
     {
       descriptorId: `coordinator-descriptor-${suffix}`,
@@ -1101,95 +1194,135 @@ async function fixture(
           stepId: "a",
           timeoutMs: 1_000,
         },
+        ...(provenance.secondStep
+          ? [
+              {
+                authorizationPolicyChecksum: null,
+                baseRetryDelayMs: 0,
+                compensationAction: {
+                  actionId: "b.compensate",
+                  artifactChecksum: "13".repeat(32),
+                  version: 1,
+                },
+                compensationObservation: {
+                  actionId: "b.observe-compensation",
+                  artifactChecksum: "14".repeat(32),
+                  version: 1,
+                },
+                forwardAction: {
+                  actionId: "b.forward",
+                  artifactChecksum: "15".repeat(32),
+                  version: 1,
+                },
+                forwardObservation: {
+                  actionId: "b.observe-forward",
+                  artifactChecksum: "16".repeat(32),
+                  version: 1,
+                },
+                inputSchemaChecksum: "17".repeat(32),
+                irreversible: false,
+                maxAttempts: 3,
+                maxRetryDelayMs: 100,
+                outputSchemaChecksum: "18".repeat(32),
+                stepId: "b",
+                timeoutMs: 1_000,
+              },
+            ]
+          : []),
       ],
       version: 1,
     },
     digest,
   )
   const actionInputJson = '{"value":1}'
-  const actionInputChecksum = await sagaActionInputChecksum(actionInputJson, digest)
-  const capabilitySnapshotJson = '{"runtime":"coordinator-v1"}'
-  const operationInputJson = JSON.stringify({ sagaId })
-  const plan = await sealOperationPlan(
+  const invocation = await sealSagaInvocationInput(
     {
-      capabilitySnapshotChecksum: await digest(new TextEncoder().encode(capabilitySnapshotJson)),
-      idempotencyKey: `${operationId}:key`,
-      inputChecksum: await digest(new TextEncoder().encode(operationInputJson)),
-      operationId,
-      operationType: operationType ?? `saga:${descriptor.descriptorId}@1`,
-      steps: (
-        [
-          {
-            checkpoint: "reversible",
-            idempotencyKey: `${operationId}:init:key`,
-            inputChecksum: `${operationId}:init:input`,
-            leaseKey,
-            postconditionChecksum: `${operationId}:init:postcondition`,
-            preconditionChecksum: `${operationId}:init:precondition`,
-            recoveryInstructions: "Create the saga projection through the coupled coordinator.",
-            retryClassification: "idempotent",
-            stepId: SAGA_INIT_OPERATION_STEP_ID,
-          },
-          {
-            checkpoint: "reversible",
-            completionRole: "settlement",
-            idempotencyKey: `${operationId}:settle:key`,
-            inputChecksum: `${operationId}:settle:input`,
-            leaseKey,
-            postconditionChecksum: `${operationId}:settle:postcondition`,
-            preconditionChecksum: `${operationId}:settle:precondition`,
-            recoveryInstructions: "Settle only from the terminal saga projection.",
-            retryClassification: "never",
-            stepId: SAGA_SETTLE_OPERATION_STEP_ID,
-          },
-          {
-            activation: "conditional",
-            checkpoint: "reversible",
-            idempotencyKey: `${operationId}:termination:key`,
-            inputChecksum: `${operationId}:termination:input`,
-            leaseKey,
-            postconditionChecksum: `${operationId}:termination:postcondition`,
-            preconditionChecksum: `${operationId}:termination:precondition`,
-            recoveryInstructions: "Materialize termination under the saga lease.",
-            retryClassification: "idempotent",
-            stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
-          },
-          {
-            activation: "conditional",
-            checkpoint: irreversibleAction ? "irreversible" : "reversible",
-            effectProtocol: "saga_receipt",
-            idempotencyKey: sagaActionIdempotencyKey(sagaId, "a", "forward"),
-            inputChecksum: actionInputChecksum,
-            leaseKey,
-            postconditionChecksum: `${operationId}:forward:postcondition`,
-            preconditionChecksum: `${operationId}:forward:precondition`,
-            recoveryInstructions: "Recover the exact forward action receipt.",
-            retryClassification: "reconcile_first",
-            stepId: forwardStepId,
-          },
-          {
-            activation: "conditional",
-            checkpoint: "reversible",
-            effectProtocol: "saga_receipt",
-            idempotencyKey: sagaActionIdempotencyKey(sagaId, "a", "compensation"),
-            inputChecksum: `${operationId}:compensation:input`,
-            leaseKey,
-            postconditionChecksum: `${operationId}:compensation:postcondition`,
-            preconditionChecksum: `${operationId}:compensation:precondition`,
-            recoveryInstructions: "Recover the exact compensation receipt.",
-            retryClassification: "reconcile_first",
-            stepId: compensationStepId,
-          },
-        ] as const satisfies readonly OperationStepPlanInput[]
-      ).filter(
-        (step) =>
-          (!omitActionPlan || step.stepId !== forwardStepId) &&
-          (!omitTerminationPlan || step.stepId !== SAGA_TERMINATION_OPERATION_STEP_ID) &&
-          (!irreversibleAction || step.stepId !== compensationStepId),
-      ),
+      descriptor,
+      inputJson: JSON.stringify({ operationId }),
+      sagaId,
+      stepInputJsons: {
+        a: actionInputJson,
+        ...(provenance.secondStep ? { b: '{"value":2}' } : {}),
+      },
     },
     digest,
   )
+  const registry = await sealSagaHandlerRegistry(handlerRegistrations(descriptor), digest)
+  const capabilitySnapshotJson = JSON.stringify({ sagaHandlerManifest: registry.manifest })
+  const capabilitySnapshotChecksum = await digest(new TextEncoder().encode(capabilitySnapshotJson))
+  const canonicalPlan = await sealSagaOperationPlan(
+    {
+      capabilitySnapshotChecksum,
+      descriptor,
+      inputChecksum: invocation.inputChecksum,
+      leaseKey,
+      operationId,
+      operationIdempotencyKey: `${operationId}:key`,
+      registry,
+      sagaId,
+      stepInputChecksums: invocation.stepInputChecksums,
+    },
+    digest,
+  )
+  const operationInputJson = provenance.legacyOperationInput
+    ? JSON.stringify({ sagaId })
+    : (provenance.operationInputJson ?? invocation.operationInputJson)
+  const operationInputChecksum = await digest(new TextEncoder().encode(operationInputJson))
+  const persistedBasePlan =
+    operationInputChecksum === invocation.inputChecksum
+      ? canonicalPlan
+      : await sealSagaOperationPlan(
+          {
+            capabilitySnapshotChecksum,
+            descriptor,
+            inputChecksum: operationInputChecksum,
+            leaseKey,
+            operationId,
+            operationIdempotencyKey: `${operationId}:key`,
+            registry,
+            sagaId,
+            stepInputChecksums: invocation.stepInputChecksums,
+          },
+          digest,
+        )
+  const planSteps = persistedBasePlan.steps
+    .filter(
+      (step) =>
+        (!omitActionPlan || step.stepId !== forwardStepId) &&
+        (!omitTerminationPlan || step.stepId !== SAGA_TERMINATION_OPERATION_STEP_ID),
+    )
+    .map((step) =>
+      provenance.planVariant === "mismatched_action" && step.stepId === forwardStepId
+        ? { ...step, postconditionChecksum: `${step.postconditionChecksum}:mismatched` }
+        : step,
+    )
+  if (provenance.planVariant === "extra_step") {
+    const init = persistedBasePlan.steps.find((step) => step.stepId === SAGA_INIT_OPERATION_STEP_ID)
+    if (init === undefined) throw new Error("Coordinator fixture canonical init plan is missing.")
+    planSteps.push({
+      ...init,
+      activation: "conditional",
+      idempotencyKey: `${operationId}:unexpected:key`,
+      stepId: "saga:unexpected",
+    })
+  }
+  const plan =
+    omitActionPlan ||
+    omitTerminationPlan ||
+    operationType !== undefined ||
+    provenance.planVariant !== undefined
+      ? await sealOperationPlan(
+          {
+            capabilitySnapshotChecksum: persistedBasePlan.capabilitySnapshotChecksum,
+            idempotencyKey: persistedBasePlan.idempotencyKey,
+            inputChecksum: persistedBasePlan.inputChecksum,
+            operationId: persistedBasePlan.operationId,
+            operationType: operationType ?? persistedBasePlan.operationType,
+            steps: planSteps,
+          },
+          digest,
+        )
+      : persistedBasePlan
   await operations.create({
     actorChecksum: "coordinator-test-actor",
     capabilitySnapshotJson,
@@ -1208,11 +1341,13 @@ async function fixture(
   if (!acquired.acquired) throw new Error("Coordinator fixture lease acquisition failed.")
   const proof = leaseProof(acquired.record)
   const initAttemptId = `${sagaId}:init:1`
+  const initializationPlan = plan.steps.find((step) => step.stepId === SAGA_INIT_OPERATION_STEP_ID)
+  if (initializationPlan === undefined) throw new Error("Coordinator fixture init plan is missing.")
   await operations.beginStep({
     actorChecksum: "coordinator-test-actor",
     attemptId: initAttemptId,
-    idempotencyKey: `${operationId}:init:key`,
-    observedPreconditionChecksum: `${operationId}:init:precondition`,
+    idempotencyKey: initializationPlan.idempotencyKey,
+    observedPreconditionChecksum: initializationPlan.preconditionChecksum,
     operationId,
     proof,
     stepId: SAGA_INIT_OPERATION_STEP_ID,
@@ -1221,6 +1356,8 @@ async function fixture(
     actionInputJson,
     attempts,
     base,
+    canonicalInvocationInputJson: invocation.operationInputJson,
+    canonicalPlan,
     coordinator,
     initialize: {
       actorChecksum: "coordinator-test-actor",
@@ -1229,13 +1366,13 @@ async function fixture(
       descriptor,
       evidenceChecksum: `${sagaId}:init:evidence`,
       idempotencyKey: `${sagaId}:key`,
-      inputChecksum: `${sagaId}:input`,
-      observedPostconditionChecksum: `${operationId}:init:postcondition`,
+      inputChecksum: invocation.inputChecksum,
+      observedPostconditionChecksum: initializationPlan.postconditionChecksum,
       operationId,
       proof,
       resultChecksum: `${sagaId}:init:result`,
       sagaId,
-      stepInputChecksums: { a: actionInputChecksum },
+      stepInputChecksums: invocation.stepInputChecksums,
     },
     leases,
     operationId,
@@ -1245,6 +1382,12 @@ async function fixture(
     sagaId,
     sagas,
   }
+}
+
+function planStep(run: Fixture, stepId: string): OperationPlan["steps"][number] {
+  const step = run.plan.steps.find((candidate) => candidate.stepId === stepId)
+  if (step === undefined) throw new Error(`Coordinator fixture plan step ${stepId} is missing.`)
+  return step
 }
 
 async function terminalReceipt(
@@ -1717,7 +1860,8 @@ describe("D1SagaCoordinatorStore", () => {
       run.operations.completeStep({
         actorChecksum: "coordinator-test-actor",
         attemptId,
-        observedPostconditionChecksum: `${run.operationId}:forward:postcondition`,
+        observedPostconditionChecksum: planStep(run, sagaActionOperationStepId("a", "forward"))
+          .postconditionChecksum,
         operationId: run.operationId,
         proof: run.proof,
         resultChecksum: receipt.outcomeChecksum,
@@ -1741,8 +1885,9 @@ describe("D1SagaCoordinatorStore", () => {
           run.operations.beginStep({
             actorChecksum: "generic-authority-actor",
             attemptId: `${run.sagaId}:a:forward:generic`,
-            idempotencyKey: sagaActionIdempotencyKey(run.sagaId, "a", "forward"),
-            observedPreconditionChecksum: `${run.operationId}:forward:precondition`,
+            idempotencyKey: planStep(run, sagaActionOperationStepId("a", "forward")).idempotencyKey,
+            observedPreconditionChecksum: planStep(run, sagaActionOperationStepId("a", "forward"))
+              .preconditionChecksum,
             operationId: run.operationId,
             proof: run.proof,
             stepId: sagaActionOperationStepId("a", "forward"),
@@ -1754,8 +1899,9 @@ describe("D1SagaCoordinatorStore", () => {
           run.operations.beginStep({
             actorChecksum: "generic-authority-actor",
             attemptId: `${run.sagaId}:termination:generic`,
-            idempotencyKey: `${run.operationId}:termination:key`,
-            observedPreconditionChecksum: `${run.operationId}:termination:precondition`,
+            idempotencyKey: planStep(run, SAGA_TERMINATION_OPERATION_STEP_ID).idempotencyKey,
+            observedPreconditionChecksum: planStep(run, SAGA_TERMINATION_OPERATION_STEP_ID)
+              .preconditionChecksum,
             operationId: run.operationId,
             proof: run.proof,
             stepId: SAGA_TERMINATION_OPERATION_STEP_ID,
@@ -1767,8 +1913,9 @@ describe("D1SagaCoordinatorStore", () => {
           run.operations.beginStep({
             actorChecksum: "generic-authority-actor",
             attemptId: `${run.sagaId}:settle:generic`,
-            idempotencyKey: `${run.operationId}:settle:key`,
-            observedPreconditionChecksum: `${run.operationId}:settle:precondition`,
+            idempotencyKey: planStep(run, SAGA_SETTLE_OPERATION_STEP_ID).idempotencyKey,
+            observedPreconditionChecksum: planStep(run, SAGA_SETTLE_OPERATION_STEP_ID)
+              .preconditionChecksum,
             operationId: run.operationId,
             proof: run.proof,
             stepId: SAGA_SETTLE_OPERATION_STEP_ID,
@@ -1852,8 +1999,9 @@ describe("D1SagaCoordinatorStore", () => {
       run.operations.beginStep({
         actorChecksum: "generic-authority-actor",
         attemptId: run.initialize.attemptId,
-        idempotencyKey: `${run.operationId}:init:key`,
-        observedPreconditionChecksum: `${run.operationId}:init:precondition`,
+        idempotencyKey: planStep(run, SAGA_INIT_OPERATION_STEP_ID).idempotencyKey,
+        observedPreconditionChecksum: planStep(run, SAGA_INIT_OPERATION_STEP_ID)
+          .preconditionChecksum,
         operationId: run.operationId,
         proof: run.proof,
         get stepId() {
@@ -1870,8 +2018,9 @@ describe("D1SagaCoordinatorStore", () => {
       run.operations.beginStep({
         actorChecksum: "generic-authority-actor",
         attemptId: run.initialize.attemptId,
-        idempotencyKey: `${run.operationId}:init:key`,
-        observedPreconditionChecksum: `${run.operationId}:init:precondition`,
+        idempotencyKey: planStep(run, SAGA_INIT_OPERATION_STEP_ID).idempotencyKey,
+        observedPreconditionChecksum: planStep(run, SAGA_INIT_OPERATION_STEP_ID)
+          .preconditionChecksum,
         operationId: run.operationId,
         proof: new Proxy(run.proof, {}),
         stepId: SAGA_INIT_OPERATION_STEP_ID,
@@ -3035,7 +3184,8 @@ describe("D1SagaCoordinatorStore", () => {
         actorChecksum: "coordinator-test-actor",
         evidenceChecksum: observed.observationReceipt.outcomeChecksum,
         observationAttemptId: observed.observationAttemptId,
-        observedPostconditionChecksum: `${run.operationId}:forward:postcondition`,
+        observedPostconditionChecksum: planStep(run, sagaActionOperationStepId("a", "forward"))
+          .postconditionChecksum,
         operationId: run.operationId,
         outcome: "applied",
         proof: observed.observationProof,
@@ -3428,13 +3578,40 @@ describe("D1SagaCoordinatorStore", () => {
     expect(digestCalled).toBe(false)
   })
 
-  it("rejects an operation plan without the canonical termination step", async () => {
+  it("rejects fresh initialization when the canonical termination step is missing", async () => {
     const run = await fixture("termination-plan-missing", undefined, undefined, false, true)
-    await run.coordinator.initializeSaga(run.initialize)
+    const before = allControlRows(run.base.database)
 
-    await expect(run.coordinator.requestTermination(terminationInput(run))).rejects.toThrow(
+    await expect(run.coordinator.initializeSaga(run.initialize)).rejects.toThrow(
+      /contradicts the canonical saga plan/u,
+    )
+    expect(allControlRows(run.base.database)).toEqual(before)
+  })
+
+  it("rejects a legacy initialized operation that has no canonical termination step", async () => {
+    const run = await fixture("legacy-termination-plan-missing")
+    await run.coordinator.initializeSaga(run.initialize)
+    const plan = await sealOperationPlan(
+      {
+        capabilitySnapshotChecksum: run.plan.capabilitySnapshotChecksum,
+        idempotencyKey: run.plan.idempotencyKey,
+        inputChecksum: run.plan.inputChecksum,
+        operationId: run.plan.operationId,
+        operationType: run.plan.operationType,
+        steps: run.plan.steps.filter((step) => step.stepId !== SAGA_TERMINATION_OPERATION_STEP_ID),
+      },
+      digest,
+    )
+    const coordinator = new D1SagaCoordinatorStore(
+      new OperationPlanViewDatabase(run.base, plan),
+      digest,
+    )
+    const before = allControlRows(run.base.database)
+
+    await expect(coordinator.requestTermination(terminationInput(run))).rejects.toThrow(
       /lacks its canonical sealed operation step/u,
     )
+    expect(allControlRows(run.base.database)).toEqual(before)
   })
 
   it("rejects a termination effect without a predecessor or request time", async () => {
@@ -3620,6 +3797,207 @@ describe("D1SagaCoordinatorStore", () => {
       disposition: "in_progress",
     })
     expect(count(run.base.database, "nozzle_operation_effects")).toBe(2)
+  })
+
+  it("rejects caller provenance that contradicts the persisted saga invocation without writes", async () => {
+    const run = await fixture("initialization-caller-provenance")
+    const originalStepChecksum = run.initialize.stepInputChecksums.a as string
+    const cases: readonly (readonly [string, InitializeSagaInput])[] = [
+      ["saga ID", { ...run.initialize, sagaId: `${run.sagaId}:other` }],
+      ["input checksum", { ...run.initialize, inputChecksum: "ff".repeat(32) }],
+      ["step checksum", { ...run.initialize, stepInputChecksums: { a: "ee".repeat(32) } }],
+      ["missing step", { ...run.initialize, stepInputChecksums: {} }],
+      [
+        "extra step",
+        {
+          ...run.initialize,
+          stepInputChecksums: { a: originalStepChecksum, unexpected: "dd".repeat(32) },
+        },
+      ],
+      [
+        "malformed step map",
+        { ...run.initialize, stepInputChecksums: [] as unknown as Record<string, string> },
+      ],
+    ]
+
+    for (const [label, initialization] of cases) {
+      const before = allControlRows(run.base.database)
+      await expect(run.coordinator.initializeSaga(initialization), label).rejects.toThrow(
+        /contradicts the persisted invocation/u,
+      )
+      expect(allControlRows(run.base.database), label).toEqual(before)
+    }
+  })
+
+  it.each([
+    ["malformed", "[]"],
+    ["missing fields", "{}"],
+    ["unexpected fields", '{"unexpected":true}'],
+  ] as const)("rejects a %s persisted saga invocation without writes", async (label, inputJson) => {
+    const run = await fixture(
+      `initialization-persisted-${label.replaceAll(" ", "-")}`,
+      undefined,
+      undefined,
+      false,
+      false,
+      false,
+      undefined,
+      { operationInputJson: inputJson },
+    )
+    const before = allControlRows(run.base.database)
+
+    await expect(run.coordinator.initializeSaga(run.initialize)).rejects.toThrow(
+      /persisted saga invocation envelope is malformed/iu,
+    )
+    expect(allControlRows(run.base.database)).toEqual(before)
+  })
+
+  it.each([
+    "extra_step",
+    "mismatched_action",
+  ] as const)("rejects the %s saga-plan variant before initialization writes", async (planVariant) => {
+    const run = await fixture(
+      `initialization-plan-${planVariant}`,
+      undefined,
+      undefined,
+      false,
+      false,
+      false,
+      undefined,
+      { planVariant },
+    )
+    const before = allControlRows(run.base.database)
+
+    await expect(run.coordinator.initializeSaga(run.initialize)).rejects.toThrow(
+      /contradicts the canonical saga plan/u,
+    )
+    expect(allControlRows(run.base.database)).toEqual(before)
+  })
+
+  it("rejects a legacy initialized operation that has no matching action step", async () => {
+    const run = await fixture("legacy-action-plan-missing")
+    await run.coordinator.initializeSaga(run.initialize)
+    const operationStepId = sagaActionOperationStepId("a", "forward")
+    const plan = await sealOperationPlan(
+      {
+        capabilitySnapshotChecksum: run.plan.capabilitySnapshotChecksum,
+        idempotencyKey: run.plan.idempotencyKey,
+        inputChecksum: run.plan.inputChecksum,
+        operationId: run.plan.operationId,
+        operationType: run.plan.operationType,
+        steps: run.plan.steps.filter((step) => step.stepId !== operationStepId),
+      },
+      digest,
+    )
+    const coordinator = new D1SagaCoordinatorStore(
+      new OperationPlanViewDatabase(run.base, plan),
+      digest,
+    )
+    const before = allControlRows(run.base.database)
+
+    await expect(coordinator.beginAction(actionInput(run))).rejects.toThrow(
+      /action lacks an operation step/u,
+    )
+    expect(allControlRows(run.base.database)).toEqual(before)
+  })
+
+  it("compares step provenance in descriptor order without depending on record insertion order", async () => {
+    const run = await fixture(
+      "initialization-reordered-step-map",
+      undefined,
+      undefined,
+      false,
+      false,
+      false,
+      undefined,
+      { secondStep: true },
+    )
+    const reordered = Object.freeze({
+      b: run.initialize.stepInputChecksums.b as string,
+      a: run.initialize.stepInputChecksums.a as string,
+    })
+
+    await expect(
+      run.coordinator.initializeSaga({ ...run.initialize, stepInputChecksums: reordered }),
+    ).resolves.toMatchObject({ sagaId: run.sagaId, status: "planned" })
+  })
+
+  it("captures switching initialization fields, proof, and step checksums exactly once", async () => {
+    const run = await fixture("initialization-snapshot-accessors")
+    let sagaIdReads = 0
+    let proofReads = 0
+    let stepChecksumReads = 0
+    const initialization = {
+      ...run.initialize,
+      get proof() {
+        proofReads += 1
+        return proofReads === 1
+          ? run.proof
+          : { ...run.proof, fencingToken: run.proof.fencingToken + 1 }
+      },
+      get sagaId() {
+        sagaIdReads += 1
+        return sagaIdReads === 1 ? run.sagaId : `${run.sagaId}:switched`
+      },
+      get stepInputChecksums() {
+        stepChecksumReads += 1
+        return stepChecksumReads === 1 ? run.initialize.stepInputChecksums : { a: "ff".repeat(32) }
+      },
+    }
+
+    await expect(run.coordinator.initializeSaga(initialization)).resolves.toMatchObject({
+      sagaId: run.sagaId,
+      status: "planned",
+    })
+    expect({ proofReads, sagaIdReads, stepChecksumReads }).toEqual({
+      proofReads: 1,
+      sagaIdReads: 1,
+      stepChecksumReads: 1,
+    })
+  })
+
+  it("isolates initialization proof and step checksums from mutation during async verification", async () => {
+    const run = await fixture("initialization-snapshot-mutation")
+    const proof = { ...run.proof }
+    const stepInputChecksums = { ...run.initialize.stepInputChecksums }
+    const initialization = { ...run.initialize, proof, stepInputChecksums }
+    let mutated = false
+    const mutatingDigest: DigestFunction = async (bytes) => {
+      if (!mutated) {
+        mutated = true
+        initialization.sagaId = `${run.sagaId}:mutated`
+        proof.fencingToken += 1
+        stepInputChecksums.a = "ff".repeat(32)
+      }
+      return digest(bytes)
+    }
+    const coordinator = new D1SagaCoordinatorStore(run.base, mutatingDigest)
+
+    await expect(coordinator.initializeSaga(initialization)).resolves.toMatchObject({
+      sagaId: run.sagaId,
+      status: "planned",
+    })
+    expect(mutated).toBe(true)
+  })
+
+  it.each([
+    "proof",
+    "step checksums",
+  ] as const)("rejects a proxied initialization %s before writes", async (field) => {
+    const run = await fixture(`initialization-proxy-${field.replaceAll(" ", "-")}`)
+    const initialization: InitializeSagaInput =
+      field === "proof"
+        ? { ...run.initialize, proof: new Proxy(run.proof, {}) }
+        : {
+            ...run.initialize,
+            stepInputChecksums: new Proxy(run.initialize.stepInputChecksums, {}),
+          }
+    const before = allControlRows(run.base.database)
+
+    await expect(run.coordinator.initializeSaga(initialization)).rejects.toThrow(
+      /could not be captured safely/u,
+    )
+    expect(allControlRows(run.base.database)).toEqual(before)
   })
 
   it("atomically retains one exact irreversible authorization across begin and replay", async () => {
@@ -3867,20 +4245,16 @@ describe("D1SagaCoordinatorStore", () => {
       false,
       false,
       "saga",
+      { legacyOperationInput: true, planVariant: "mismatched_action" },
     )
-    const writerPlan = await sealOperationPlan(
-      {
-        capabilitySnapshotChecksum: run.plan.capabilitySnapshotChecksum,
-        idempotencyKey: run.plan.idempotencyKey,
-        inputChecksum: run.plan.inputChecksum,
-        operationId: run.plan.operationId,
-        operationType: `saga:${run.initialize.descriptor.descriptorId}@1`,
-        steps: run.plan.steps,
-      },
-      digest,
-    )
+    const legacyOperation = await run.operations.get(run.operationId)
+    expect(legacyOperation).toMatchObject({
+      inputJson: JSON.stringify({ sagaId: run.sagaId }),
+      operation: { plan: { operationType: "saga" } },
+    })
+    expect(legacyOperation?.operation.plan.planChecksum).not.toBe(run.canonicalPlan.planChecksum)
     const legacyWriter = new D1SagaCoordinatorStore(
-      new OperationPlanViewDatabase(run.base, writerPlan),
+      new OperationPlanViewDatabase(run.base, run.canonicalPlan, run.canonicalInvocationInputJson),
       digest,
     )
     const initialized = await legacyWriter.initializeSaga(run.initialize)
@@ -4101,10 +4475,11 @@ describe("D1SagaCoordinatorStore", () => {
     ).rejects.toThrow(/action does not exist/u)
 
     const missingPlan = await fixture("missing-plan", undefined, undefined, true)
-    await missingPlan.coordinator.initializeSaga(missingPlan.initialize)
-    await expect(missingPlan.coordinator.beginAction(actionInput(missingPlan))).rejects.toThrow(
-      /lacks an operation step/u,
+    const beforeMissingPlan = allControlRows(missingPlan.base.database)
+    await expect(missingPlan.coordinator.initializeSaga(missingPlan.initialize)).rejects.toThrow(
+      /contradicts the canonical saga plan/u,
     )
+    expect(allControlRows(missingPlan.base.database)).toEqual(beforeMissingPlan)
 
     const wrongOperation = await fixture("wrong-saga-operation")
     await wrongOperation.coordinator.initializeSaga(wrongOperation.initialize)
@@ -4135,12 +4510,13 @@ describe("D1SagaCoordinatorStore", () => {
     const operation = await divergent.operations.get(divergent.operationId)
     if (operation === undefined) throw new Error("Divergence fixture operation is missing.")
     const authorized = await divergent.leases.authorizeAt(divergent.proof)
+    const actionPlan = planStep(divergent, sagaActionOperationStepId("a", "forward"))
     const decision = beginOperationStep(operation.operation, {
       attemptId,
-      idempotencyKey: sagaActionIdempotencyKey(divergent.sagaId, "a", "forward"),
+      idempotencyKey: actionPlan.idempotencyKey,
       lease: authorized.record,
       leaseProof: divergent.proof,
-      observedPreconditionChecksum: `${divergent.operationId}:forward:precondition`,
+      observedPreconditionChecksum: actionPlan.preconditionChecksum,
       serverTimeMs: authorized.serverTimeMs,
       stepId: sagaActionOperationStepId("a", "forward"),
     })

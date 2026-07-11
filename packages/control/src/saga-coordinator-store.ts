@@ -49,6 +49,8 @@ import {
   operationTransitionIdentity,
 } from "./operation-store.js"
 import { D1SagaAttemptStore, type SagaAttemptRecord } from "./saga-attempt-store.js"
+import { loadSagaInvocationInput, type SagaInvocationInput } from "./saga-input.js"
+import { verifySagaOperationPlan } from "./saga-plan.js"
 import {
   D1SagaStore,
   SAGA_INIT_OPERATION_STEP_ID,
@@ -166,6 +168,8 @@ export interface InitializeSagaInput {
   readonly stepInputChecksums: Readonly<Record<string, string>>
 }
 
+type InitializeSagaInputSnapshot = Readonly<InitializeSagaInput>
+
 interface CoordinatedSagaActionIdentityInput {
   readonly actorChecksum: string
   readonly attemptId: string
@@ -240,6 +244,74 @@ function boundedText(value: unknown, label: string): string {
     return configuration(`${label} exceeds the durable coordinator identity limit.`)
   }
   return value
+}
+
+function snapshotInitializeSagaInput(input: InitializeSagaInput): InitializeSagaInputSnapshot {
+  try {
+    const actorChecksum = input.actorChecksum
+    const attemptId = input.attemptId
+    const deadlineAtMs = input.deadlineAtMs
+    const descriptor = input.descriptor
+    const evidenceChecksum = input.evidenceChecksum
+    const idempotencyKey = input.idempotencyKey
+    const inputChecksum = input.inputChecksum
+    const observedPostconditionChecksum = input.observedPostconditionChecksum
+    const operationId = input.operationId
+    const sourceProof = input.proof
+    const proof = structuredClone(sourceProof)
+    if (typeof proof === "object" && proof !== null) Object.freeze(proof)
+    const resultChecksum = input.resultChecksum
+    const sagaId = input.sagaId
+    const sourceStepInputChecksums = input.stepInputChecksums
+    const stepInputChecksums = structuredClone(sourceStepInputChecksums)
+    if (typeof stepInputChecksums === "object" && stepInputChecksums !== null) {
+      Object.freeze(stepInputChecksums)
+    }
+    return Object.freeze({
+      actorChecksum,
+      attemptId,
+      deadlineAtMs,
+      descriptor,
+      evidenceChecksum,
+      idempotencyKey,
+      inputChecksum,
+      observedPostconditionChecksum,
+      operationId,
+      proof,
+      resultChecksum,
+      sagaId,
+      stepInputChecksums,
+    })
+  } catch {
+    return configuration("Saga initialization input could not be captured safely.")
+  }
+}
+
+function invocationMatchesInitialization(
+  invocation: SagaInvocationInput,
+  initialization: InitializeSagaInputSnapshot,
+): boolean {
+  if (
+    invocation.sagaId !== initialization.sagaId ||
+    invocation.inputChecksum !== initialization.inputChecksum ||
+    typeof initialization.stepInputChecksums !== "object" ||
+    initialization.stepInputChecksums === null ||
+    Array.isArray(initialization.stepInputChecksums)
+  ) {
+    return false
+  }
+  const descriptorStepIds = initialization.descriptor.steps.map((step) => step.stepId)
+  const suppliedStepIds = Object.keys(initialization.stepInputChecksums).sort()
+  const expectedStepIds = [...descriptorStepIds].sort()
+  if (
+    suppliedStepIds.length !== expectedStepIds.length ||
+    suppliedStepIds.some((stepId, index) => stepId !== expectedStepIds[index])
+  ) {
+    return false
+  }
+  return descriptorStepIds.every(
+    (stepId) => initialization.stepInputChecksums[stepId] === invocation.stepInputChecksums[stepId],
+  )
 }
 
 function terminationPlanStep(operation: OperationRecord): OperationStepPlan {
@@ -1951,31 +2023,41 @@ export class D1SagaCoordinatorStore {
   }
 
   async initializeSaga(input: InitializeSagaInput): Promise<SagaRecord> {
-    boundedText(input.actorChecksum, "Saga coordinator actor checksum")
-    boundedText(input.attemptId, "Saga initialization attempt ID")
-    boundedText(input.evidenceChecksum, "Saga initialization evidence checksum")
+    const initialization = snapshotInitializeSagaInput(input)
+    boundedText(initialization.actorChecksum, "Saga coordinator actor checksum")
+    boundedText(initialization.attemptId, "Saga initialization attempt ID")
+    boundedText(initialization.evidenceChecksum, "Saga initialization evidence checksum")
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
-      const beforeOperation = await this.#operation(input.operationId)
-      const authorized = await this.#leases.authorizeAt(input.proof)
-      const existing = await this.#saga(input.sagaId, input.operationId)
-      const replay = await this.#initializedProjection(input)
+      const beforeOperation = await this.#operation(initialization.operationId)
+      const authorized = await this.#leases.authorizeAt(initialization.proof)
+      const existing = await this.#saga(initialization.sagaId, initialization.operationId)
+      const replay = await this.#initializedProjection(initialization)
       if (replay !== undefined) return replay
       if (!beforeOperation.operation.plan.operationType.startsWith("saga:")) {
         return intervention("A new saga must use the reserved saga operation type.")
       }
+      const invocation = await loadSagaInvocationInput(
+        beforeOperation.inputJson,
+        initialization.descriptor,
+        this.#digest,
+      )
+      if (!invocationMatchesInitialization(invocation, initialization)) {
+        return intervention("Saga initialization contradicts the persisted invocation.")
+      }
       const fresh = createSagaRecord({
-        deadlineAtMs: input.deadlineAtMs,
-        descriptor: input.descriptor,
-        idempotencyKey: input.idempotencyKey,
-        inputChecksum: input.inputChecksum,
-        sagaId: input.sagaId,
+        deadlineAtMs: initialization.deadlineAtMs,
+        descriptor: initialization.descriptor,
+        idempotencyKey: initialization.idempotencyKey,
+        inputChecksum: invocation.inputChecksum,
+        sagaId: invocation.sagaId,
         serverTimeMs: authorized.serverTimeMs,
-        stepInputChecksums: input.stepInputChecksums,
+        stepInputChecksums: invocation.stepInputChecksums,
       })
+      await verifySagaOperationPlan(beforeOperation.operation.plan, fresh, this.#digest)
       const afterOperation = recordStepSuccess(beforeOperation.operation, {
-        attemptId: input.attemptId,
-        observedPostconditionChecksum: input.observedPostconditionChecksum,
-        resultChecksum: input.resultChecksum,
+        attemptId: initialization.attemptId,
+        observedPostconditionChecksum: initialization.observedPostconditionChecksum,
+        resultChecksum: initialization.resultChecksum,
         stepId: SAGA_INIT_OPERATION_STEP_ID,
       })
       if (existing !== undefined) {
@@ -1983,23 +2065,23 @@ export class D1SagaCoordinatorStore {
       }
       if (
         beforeOperation.operation.steps[SAGA_INIT_OPERATION_STEP_ID]?.fencingToken !==
-        input.proof.fencingToken
+        initialization.proof.fencingToken
       ) {
         return resume("Saga initialization was fenced by a newer lease owner.")
       }
       const transitionId = operationTransitionIdentity("succeeded", [
-        input.operationId,
+        initialization.operationId,
         SAGA_INIT_OPERATION_STEP_ID,
-        input.attemptId,
+        initialization.attemptId,
       ])
       const effectId = await this.#identity("saga-effect", [
         transitionId,
-        input.sagaId,
+        initialization.sagaId,
         "create",
         "0",
       ])
       const committed = await this.#commit({
-        actorChecksum: input.actorChecksum,
+        actorChecksum: initialization.actorChecksum,
         afterOperation,
         afterSaga: fresh,
         auditEventType: "saga.initialized",
@@ -2007,8 +2089,8 @@ export class D1SagaCoordinatorStore {
         beforeSaga: undefined,
         effectId,
         effectKind: "create",
-        evidenceChecksum: input.evidenceChecksum,
-        proof: input.proof,
+        evidenceChecksum: initialization.evidenceChecksum,
+        proof: initialization.proof,
         stepId: SAGA_INIT_OPERATION_STEP_ID,
         transitionId,
       })
