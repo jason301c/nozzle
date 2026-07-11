@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -b",
-    "check": "pnpm lint && pnpm typecheck && pnpm test:coverage && pnpm test:workers",
+    "check": "pnpm run \"/^(lint|typecheck|test:coverage|test:workers)$/\"",
     "cf:whoami": "wrangler whoami",
     "format": "biome format --write .",
     "format:check": "biome format .",
