@@ -11,6 +11,7 @@ describe("@nozzle/control public API", () => {
     for (const internal of [
       "acceptedSagaAttemptRecord",
       "D1SagaHistoryReader",
+      "D1SagaTerminalStore",
       "finalizeSagaHistoryProof",
       "loadSagaTerminalCapability",
       "loadSagaHistoryAnchor",

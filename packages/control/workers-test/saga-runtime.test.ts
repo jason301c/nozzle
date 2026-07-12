@@ -39,6 +39,7 @@ import {
   sagaActionOperationStepId,
 } from "../src/saga-store.js"
 import { loadSagaTerminalCapability, mintSagaTerminalCapability } from "../src/saga-terminal.js"
+import { D1SagaTerminalStore } from "../src/saga-terminal-store.js"
 import {
   CONTROL_SCHEMA_STATEMENTS,
   CONTROL_SCHEMA_VERSION_ONE_STATEMENTS,
@@ -620,6 +621,16 @@ describe("real workerd D1 saga projection", () => {
       },
       settlementOutcome: "succeeded",
     })
+    const settled = await new D1SagaTerminalStore(env.DB, digest).persistTerminalTail({
+      actorChecksum: "workerd-irreversible-terminal-actor",
+      capability,
+      proof,
+    })
+    expect(settled.steps["saga:settle"]?.state).toBe("succeeded")
+    const settledProof = await reconcileStoredSagaHistory(operationId, sagaId)
+    expect(
+      loadSagaTerminalCapability(mintSagaTerminalCapability(settledProof)).branchDecisions,
+    ).toEqual([])
   })
 
   it("atomically couples an observed unknown action across both real D1 ledgers", async () => {
@@ -1217,6 +1228,16 @@ describe("real workerd D1 saga projection", () => {
       ],
       settlementOutcome: "succeeded",
     })
+    const settled = await new D1SagaTerminalStore(env.DB, digest).persistTerminalTail({
+      actorChecksum: "workerd-history-terminal-actor",
+      capability,
+      proof,
+    })
+    expect(settled.steps["saga:settle"]?.state).toBe("succeeded")
+    const settledProof = await reconcileStoredSagaHistory(operationId, sagaId)
+    expect(
+      loadSagaTerminalCapability(mintSagaTerminalCapability(settledProof)).branchDecisions,
+    ).toEqual([])
   })
 
   it("atomically advances a saga only through exact fenced operation transitions", async () => {
