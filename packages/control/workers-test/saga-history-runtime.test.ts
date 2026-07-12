@@ -2,19 +2,27 @@ import { env } from "cloudflare:test"
 import {
   appendAuditEvent,
   beginOperationStep,
+  beginSagaAction,
   createOperationRecord,
+  createSagaRecord,
   type DigestFunction,
   decideLeaseAcquisition,
   leaseProof,
   type OperationStepRecord,
   operationStatus,
+  recordSagaActionSuccess,
   recordStepSuccess,
   sealOperationPlan,
+  sealSagaDescriptor,
 } from "@nozzle/core"
 import { beforeAll, describe, expect, it } from "vitest"
 import { operationStepRecordJson, operationTransitionIdentity } from "../src/operation-store.js"
-import { D1SagaHistoryReader } from "../src/saga-history.js"
-import { SagaHistoryAuditFolder, SagaHistoryTransitionFolder } from "../src/saga-history-fold.js"
+import { D1SagaHistoryReader, type SagaHistoryEffectRow } from "../src/saga-history.js"
+import {
+  SagaHistoryAuditFolder,
+  SagaHistoryEffectFolder,
+  SagaHistoryTransitionFolder,
+} from "../src/saga-history-fold.js"
 
 declare global {
   namespace Cloudflare {
@@ -33,6 +41,34 @@ async function run(sql: string, ...values: unknown[]): Promise<void> {
 const digest: DigestFunction = async (input) => {
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", input.slice().buffer))
   return Array.from(hash, (byte) => byte.toString(16).padStart(2, "0")).join("")
+}
+
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue)
+  if (typeof value !== "object" || value === null) return value
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, canonicalValue((value as Record<string, unknown>)[key])]),
+  )
+}
+
+function domainFrame(domain: string, values: readonly string[]): Uint8Array {
+  const parts = [domain, ...values].map((value) => new TextEncoder().encode(value))
+  const output = new Uint8Array(parts.reduce((total, part) => total + 4 + part.byteLength, 0))
+  const view = new DataView(output.buffer)
+  let offset = 0
+  for (const part of parts) {
+    view.setUint32(offset, part.byteLength, false)
+    offset += 4
+    output.set(part, offset)
+    offset += part.byteLength
+  }
+  return output
+}
+
+async function domainChecksum(domain: string, values: readonly string[]): Promise<string> {
+  return digest(domainFrame(domain, values))
 }
 
 beforeAll(async () => {
@@ -402,6 +438,245 @@ describe("real workerd D1 saga history paging", () => {
       operation: succeeded,
       operationStatus: "succeeded",
       transitionCount: 2,
+    })
+    await expect(reader.assertAnchorCurrent(anchor)).resolves.toBeUndefined()
+  })
+
+  it("semantically folds canonical saga effects paged from real workerd D1", async () => {
+    const operationId = "runtime-effect-operation"
+    const sagaId = "runtime-effect-saga"
+    const environmentId = "runtime-effect-environment"
+    const stepId = "write"
+    const operationStepId = `saga:forward:${stepId}`
+    const leaseKey = `saga:${sagaId}`
+    const descriptor = await sealSagaDescriptor(
+      {
+        descriptorId: "runtime-effect-descriptor",
+        steps: [
+          {
+            authorizationPolicyChecksum: null,
+            baseRetryDelayMs: 1,
+            compensationAction: {
+              actionId: "runtime-compensate",
+              artifactChecksum: "a".repeat(64),
+              version: 1,
+            },
+            compensationObservation: {
+              actionId: "runtime-observe-compensation",
+              artifactChecksum: "b".repeat(64),
+              version: 1,
+            },
+            forwardAction: {
+              actionId: "runtime-write",
+              artifactChecksum: "c".repeat(64),
+              version: 1,
+            },
+            forwardObservation: {
+              actionId: "runtime-observe-write",
+              artifactChecksum: "d".repeat(64),
+              version: 1,
+            },
+            inputSchemaChecksum: "e".repeat(64),
+            irreversible: false,
+            maxAttempts: 1,
+            maxRetryDelayMs: 1,
+            outputSchemaChecksum: "f".repeat(64),
+            stepId,
+            timeoutMs: 100,
+          },
+        ],
+        version: 1,
+      },
+      digest,
+    )
+    const initial = createSagaRecord({
+      deadlineAtMs: 100,
+      descriptor,
+      idempotencyKey: "runtime-effect-key",
+      inputChecksum: "1".repeat(64),
+      sagaId,
+      serverTimeMs: 0,
+      stepInputChecksums: { [stepId]: "2".repeat(64) },
+    })
+    const decision = beginSagaAction(initial, {
+      attemptId: "runtime-effect-attempt",
+      idempotencyKey: initial.steps[stepId]?.forward.idempotencyKey as string,
+      phase: "forward",
+      serverTimeMs: 2,
+      stepId,
+    })
+    if (decision.disposition !== "execute") throw new Error("Runtime effect did not begin")
+    const running = decision.saga
+    const succeeded = recordSagaActionSuccess(running, {
+      attemptId: "runtime-effect-attempt",
+      phase: "forward",
+      resultChecksum: "runtime-effect-output",
+      serverTimeMs: 3,
+      stepId,
+    })
+    const createTransition = operationTransitionIdentity("succeeded", [
+      operationId,
+      "saga:init",
+      "runtime-effect-init-attempt",
+    ])
+    const beginTransition = operationTransitionIdentity("accepted", [
+      operationId,
+      operationStepId,
+      "runtime-effect-attempt",
+    ])
+    const successTransition = operationTransitionIdentity("succeeded", [
+      operationId,
+      operationStepId,
+      "runtime-effect-attempt",
+    ])
+    const beginEvidence = await domainChecksum("nozzle.saga-coordinator-id.v1", [
+      "begin-evidence",
+      beginTransition,
+      sagaId,
+      stepId,
+      "forward",
+      "runtime-effect-attempt",
+    ])
+    const effectInputs = [
+      {
+        effectKind: "create",
+        evidenceChecksum: "runtime-effect-create-evidence",
+        record: initial,
+        stepId: "saga:init",
+        transitionId: createTransition,
+      },
+      {
+        effectKind: "action:forward:begin",
+        evidenceChecksum: beginEvidence,
+        record: running,
+        stepId: operationStepId,
+        transitionId: beginTransition,
+      },
+      {
+        effectKind: "action:forward:success",
+        evidenceChecksum: "runtime-effect-outcome",
+        record: succeeded,
+        stepId: operationStepId,
+        transitionId: successTransition,
+      },
+    ] as const
+    const effectRows: SagaHistoryEffectRow[] = []
+    for (const input of effectInputs) {
+      const json = JSON.stringify(canonicalValue(input.record))
+      const recordChecksum = await domainChecksum("nozzle.saga-record.v1", [json])
+      const effectChecksum = await domainChecksum("nozzle.saga-coordinator-id.v1", [
+        "saga-effect",
+        input.transitionId,
+        sagaId,
+        input.effectKind,
+        input.record.stateVersion.toString(10),
+      ])
+      effectRows.push({
+        acquisition_id: "runtime-effect-acquisition",
+        created_at_ms: input.record.stateVersion + 1,
+        effect_id: `saga-effect:${effectChecksum}`,
+        effect_kind: input.effectKind,
+        evidence_checksum: input.evidenceChecksum,
+        fencing_token: 1,
+        from_state_version: input.record.stateVersion === 0 ? null : input.record.stateVersion - 1,
+        holder_id: "runtime-effect-holder",
+        lease_key: leaseKey,
+        operation_id: operationId,
+        record_checksum: recordChecksum,
+        record_json: json,
+        resource_id: sagaId,
+        resource_kind: "saga",
+        step_id: input.stepId,
+        to_state_version: input.record.stateVersion,
+        transition_id: input.transitionId,
+      })
+    }
+
+    await run(
+      `INSERT INTO "nozzle_operations" VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      operationId,
+      environmentId,
+      "runtime-effect-operation-input",
+      "runtime-effect-operation-plan",
+      "{}",
+      "succeeded",
+      3,
+    )
+    const finalEffect = effectRows[2] as SagaHistoryEffectRow
+    await run(
+      `INSERT INTO "nozzle_sagas" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      sagaId,
+      operationId,
+      descriptor.descriptorChecksum,
+      succeeded.inputChecksum,
+      succeeded.stateVersion,
+      succeeded.status,
+      finalEffect.effect_id,
+      finalEffect.record_checksum,
+      3,
+    )
+    await run(
+      `INSERT INTO "nozzle_audit_log" VALUES (?, ?, ?, ?)`,
+      environmentId,
+      1,
+      "runtime-effect-audit",
+      '{"sequence":1}',
+    )
+    await run(
+      `INSERT INTO "nozzle_operation_transitions" VALUES
+       (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      createTransition,
+      operationId,
+      "saga:init",
+      '{"state":"running"}',
+      '{"state":"succeeded"}',
+      "running",
+      "succeeded",
+      "runtime-effect-audit",
+      1,
+      leaseKey,
+      "runtime-effect-holder",
+      "runtime-effect-acquisition",
+      1,
+    )
+    for (const row of effectRows) {
+      await run(
+        `INSERT INTO "nozzle_operation_effects" VALUES
+         (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        row.effect_id,
+        row.transition_id,
+        row.operation_id,
+        row.step_id,
+        row.resource_kind,
+        row.resource_id,
+        row.effect_kind,
+        row.from_state_version,
+        row.to_state_version,
+        row.evidence_checksum,
+        row.record_checksum,
+        row.record_json,
+        row.lease_key,
+        row.holder_id,
+        row.acquisition_id,
+        row.fencing_token,
+        row.created_at_ms,
+      )
+    }
+
+    const reader = new D1SagaHistoryReader(env.DB)
+    const anchor = await reader.captureAnchor(operationId, sagaId)
+    const folder = new SagaHistoryEffectFolder(anchor, digest)
+    const first = await reader.effectPage(anchor)
+    expect(first).toMatchObject({ complete: false, nextCursor: 1 })
+    await folder.append(first)
+    const last = await reader.effectPage(anchor, first.nextCursor as number)
+    expect(last).toMatchObject({ complete: true, nextCursor: null })
+    await folder.append(last)
+    expect(folder.proof()).toMatchObject({
+      effectCount: 3,
+      saga: succeeded,
+      sagaStateVersion: 2,
+      sagaStatus: "succeeded",
     })
     await expect(reader.assertAnchorCurrent(anchor)).resolves.toBeUndefined()
   })

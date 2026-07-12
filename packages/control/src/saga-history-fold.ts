@@ -1,14 +1,19 @@
 import {
   type AuditEvent,
   beginOperationStep,
+  beginSagaAction,
   type CounterDeltas,
   createOperationRecord,
+  createSagaRecord,
   type DigestFunction,
   loadAuditEvent,
   loadOperationRecord,
+  loadSagaRecord,
   markOperationStepNotRequired,
+  markRunningSagaActionUnknown,
   markRunningStepNotDispatchedAfterCrash,
   markRunningStepUnknownAfterCrash,
+  markSagaActionNotDispatched,
   NozzleError,
   type OperationPlan,
   type OperationRecord,
@@ -16,10 +21,17 @@ import {
   type OperationStepRecord,
   operationStatus,
   recordAtomicStepOutcome,
+  recordSagaActionFailure,
+  recordSagaActionSuccess,
+  recordSagaObservation,
   recordSagaStepTerminalClassification,
   recordStepFailure,
   recordStepReconciliation,
   recordStepSuccess,
+  requestSagaTermination,
+  type SagaActionPhase,
+  type SagaActionRecord,
+  type SagaRecord,
 } from "@nozzle/core"
 import { operationStepRecordJson, operationTransitionIdentity } from "./operation-store.js"
 import {
@@ -27,12 +39,21 @@ import {
   SAGA_HISTORY_PAGE_ROW_LIMIT,
   type SagaHistoryAnchor,
   type SagaHistoryAuditRow,
+  type SagaHistoryEffectRow,
   type SagaHistoryPage,
   type SagaHistoryTransitionCursor,
   type SagaHistoryTransitionRow,
 } from "./saga-history.js"
+import {
+  SAGA_INIT_OPERATION_STEP_ID,
+  SAGA_TERMINATION_OPERATION_STEP_ID,
+  sagaActionOperationStepId,
+} from "./saga-store.js"
 
 const AUDIT_TRANSITION_FOLD_DOMAIN = "nozzle.saga-history.audit-transition-fold.v1"
+const EFFECT_FOLD_DOMAIN = "nozzle.saga-history.effect-fold.v1"
+const SAGA_COORDINATOR_ID_DOMAIN = "nozzle.saga-coordinator-id.v1"
+const SAGA_RECORD_DOMAIN = "nozzle.saga-record.v1"
 const EMPTY_FOLD_CHECKSUM = "0".repeat(64)
 const CHECKSUM = /^[0-9a-f]{64}$/u
 const UTF8_ENCODER = new TextEncoder()
@@ -86,6 +107,26 @@ const TRANSITION_ROW_KEYS = [
   "transition_id",
 ] as const satisfies readonly (keyof SagaHistoryTransitionRow)[]
 
+const EFFECT_ROW_KEYS = [
+  "acquisition_id",
+  "created_at_ms",
+  "effect_id",
+  "effect_kind",
+  "evidence_checksum",
+  "fencing_token",
+  "from_state_version",
+  "holder_id",
+  "lease_key",
+  "operation_id",
+  "record_checksum",
+  "record_json",
+  "resource_id",
+  "resource_kind",
+  "step_id",
+  "to_state_version",
+  "transition_id",
+] as const satisfies readonly (keyof SagaHistoryEffectRow)[]
+
 export interface SagaHistoryAuditProof {
   readonly auditEventCount: number
   readonly auditHeadEventHash: string
@@ -126,6 +167,21 @@ export interface SagaHistoryTransitionProof {
   readonly transitionLastId: string
 }
 
+export interface SagaHistoryEffectProof {
+  readonly effectCount: number
+  readonly effectFoldChecksum: string
+  readonly effectLastId: string
+  readonly operationId: string
+  readonly saga: SagaRecord
+  readonly sagaDescriptorChecksum: string
+  readonly sagaId: string
+  readonly sagaInputChecksum: string
+  readonly sagaRecordChecksum: string
+  readonly sagaStateVersion: number
+  readonly sagaStatus: SagaRecord["status"]
+  readonly schemaVersion: 1
+}
+
 interface SagaHistoryAuditFoldState {
   creationEventHash: string | null
   nextSequence: number
@@ -140,6 +196,20 @@ interface SagaHistoryTransitionFoldState {
   cursor: SagaHistoryTransitionCursor
   operation: OperationRecord
   transitionCount: number
+}
+
+interface SagaHistoryEffectFoldState {
+  acquisitionId: string | null
+  createdAtMs: number | null
+  effectCount: number
+  effectFoldChecksum: string
+  effectLastId: string | null
+  fencingToken: number | null
+  holderId: string | null
+  leaseKey: string | null
+  recordChecksum: string | null
+  saga: SagaRecord | undefined
+  stateVersion: number
 }
 
 function configuration(message: string): never {
@@ -316,6 +386,50 @@ function capturedTransitionPage(
   })
 }
 
+function capturedEffectPage(value: unknown): SagaHistoryPage<SagaHistoryEffectRow, number> {
+  let snapshot: unknown
+  try {
+    snapshot = structuredClone(value)
+  } catch {
+    return intervention("Saga effect fold page could not be captured safely.")
+  }
+  if (
+    !exactRecord<SagaHistoryPage<SagaHistoryEffectRow, number>>(snapshot, [
+      "complete",
+      "nextCursor",
+      "rows",
+    ])
+  ) {
+    return intervention("Saga effect fold page fields are malformed.")
+  }
+  if (typeof snapshot.complete !== "boolean" || !denseArray(snapshot.rows)) {
+    return intervention("Saga effect fold page metadata is malformed.")
+  }
+  if (
+    snapshot.rows.length === 0 ||
+    snapshot.rows.length > SAGA_HISTORY_PAGE_ROW_LIMIT ||
+    !snapshot.rows.every((row) => exactRecord<SagaHistoryEffectRow>(row, EFFECT_ROW_KEYS))
+  ) {
+    return intervention("Saga effect fold page row envelope is malformed.")
+  }
+  const last = snapshot.rows.at(-1) as SagaHistoryEffectRow
+  if (snapshot.complete) {
+    if (snapshot.nextCursor !== null) {
+      return intervention("A complete saga effect fold page retained a cursor.")
+    }
+  } else if (
+    snapshot.rows.length !== SAGA_HISTORY_PAGE_ROW_LIMIT ||
+    snapshot.nextCursor !== last.to_state_version
+  ) {
+    return intervention("An incomplete saga effect fold page has contradictory pagination.")
+  }
+  return Object.freeze({
+    complete: snapshot.complete,
+    nextCursor: snapshot.nextCursor,
+    rows: Object.freeze(snapshot.rows.map((row) => Object.freeze(row))),
+  })
+}
+
 function sqliteBinaryTextCompare(left: string, right: string): number {
   const leftBytes = UTF8_ENCODER.encode(left)
   const rightBytes = UTF8_ENCODER.encode(right)
@@ -347,10 +461,8 @@ function parsedJson(value: string, label: string): unknown {
   }
 }
 
-function frame(parts: readonly string[]): Uint8Array {
-  const encoded = [AUDIT_TRANSITION_FOLD_DOMAIN, ...parts].map((part) =>
-    new TextEncoder().encode(part),
-  )
+function domainFrame(domain: string, parts: readonly string[]): Uint8Array {
+  const encoded = [domain, ...parts].map((part) => new TextEncoder().encode(part))
   const length = encoded.reduce((total, part) => total + 4 + part.byteLength, 0)
   const output = new Uint8Array(length)
   const view = new DataView(output.buffer)
@@ -364,18 +476,28 @@ function frame(parts: readonly string[]): Uint8Array {
   return output
 }
 
+async function checkedFoldDigest(
+  digest: DigestFunction,
+  domain: string,
+  parts: readonly string[],
+): Promise<string> {
+  const checksum = await digest(domainFrame(domain, parts).slice())
+  if (typeof checksum !== "string" || !CHECKSUM.test(checksum)) {
+    return configuration("Saga history fold digest must return a lowercase SHA-256 checksum.")
+  }
+  return checksum
+}
+
 async function foldChecksum(
   digest: DigestFunction,
   previous: string,
   event: AuditEvent,
 ): Promise<string> {
-  const checksum = await digest(
-    frame([previous, event.sequence.toString(10), event.eventHash]).slice(),
-  )
-  if (typeof checksum !== "string" || !CHECKSUM.test(checksum)) {
-    return configuration("Saga audit fold digest must return a lowercase SHA-256 checksum.")
-  }
-  return checksum
+  return checkedFoldDigest(digest, AUDIT_TRANSITION_FOLD_DOMAIN, [
+    previous,
+    event.sequence.toString(10),
+    event.eventHash,
+  ])
 }
 
 function parsedAuditEvent(row: SagaHistoryAuditRow): unknown {
@@ -1207,6 +1329,398 @@ function verifyDirectAuditPayload(
   }
 }
 
+type ParsedSagaEffectKind =
+  | { readonly kind: "create" }
+  | { readonly cause: "cancellation" | "timeout"; readonly kind: "termination" }
+  | {
+      readonly action:
+        | "begin"
+        | "failure:definitely_not_applied_retryable"
+        | "failure:definitely_not_applied_terminal"
+        | "failure:unknown"
+        | "observation:applied"
+        | "observation:indeterminate"
+        | "observation:not_applied"
+        | "recovery:not-dispatched"
+        | "recovery:unknown"
+        | "success"
+      readonly kind: "action"
+      readonly phase: SagaActionPhase
+    }
+
+interface ReplayedSagaEffect {
+  readonly decisionTimeMs: number
+  readonly saga: SagaRecord
+}
+
+function parsedSagaEffectKind(value: string): ParsedSagaEffectKind {
+  if (value === "create") return Object.freeze({ kind: "create" })
+  if (value === "termination:cancellation") {
+    return Object.freeze({ cause: "cancellation", kind: "termination" })
+  }
+  if (value === "termination:timeout") {
+    return Object.freeze({ cause: "timeout", kind: "termination" })
+  }
+  const match =
+    /^action:(forward|compensation):(begin|success|failure:(?:unknown|definitely_not_applied_retryable|definitely_not_applied_terminal)|recovery:(?:unknown|not-dispatched)|observation:(?:applied|not_applied|indeterminate))$/u.exec(
+      value,
+    )
+  if (match === null) return intervention("Saga effect history has an unknown semantic kind.")
+  return Object.freeze({
+    action: match[2] as Extract<ParsedSagaEffectKind, { kind: "action" }>["action"],
+    kind: "action",
+    phase: match[1] as SagaActionPhase,
+  })
+}
+
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue)
+  if (typeof value !== "object" || value === null) return value
+  const output: Record<string, unknown> = {}
+  for (const key of Object.keys(value).sort()) {
+    output[key] = canonicalValue((value as Record<string, unknown>)[key])
+  }
+  return output
+}
+
+function sagaRecordJson(record: SagaRecord): string {
+  return JSON.stringify(canonicalValue(record))
+}
+
+function effectAction(
+  record: SagaRecord,
+  stepId: string,
+  phase: SagaActionPhase,
+): SagaActionRecord {
+  const action = record.steps[stepId]?.[phase]
+  if (action === undefined) return intervention("Saga effect history names an unknown action.")
+  return action
+}
+
+function requiredActionText(value: string | undefined, label: string): string {
+  if (!persistedText(value)) return intervention(`Saga effect history lacks ${label}.`)
+  return value
+}
+
+function effectActionStepId(row: SagaHistoryEffectRow, phase: SagaActionPhase): string {
+  const prefix = `saga:${phase}:`
+  if (!row.step_id.startsWith(prefix) || row.step_id.length === prefix.length) {
+    return intervention("Saga effect history contradicts its canonical action step.")
+  }
+  const sagaStepId = row.step_id.slice(prefix.length)
+  sagaActionOperationStepId(sagaStepId, phase)
+  return sagaStepId
+}
+
+function retryDecisionTime(
+  before: SagaRecord,
+  after: SagaRecord,
+  stepId: string,
+  phase: SagaActionPhase,
+): number {
+  const action = effectAction(after, stepId, phase)
+  if (action.state === "retryable_failed") {
+    const descriptor = before.descriptor.steps.find(
+      (step) => step.stepId === stepId,
+    ) as SagaRecord["descriptor"]["steps"][number]
+    let delay = descriptor.baseRetryDelayMs
+    for (
+      let attempt = 1;
+      attempt < action.attempts && delay < descriptor.maxRetryDelayMs;
+      attempt += 1
+    ) {
+      delay = Math.min(descriptor.maxRetryDelayMs, delay * 2)
+    }
+    const serverTimeMs = action.nextAttemptAtMs - delay
+    if (!safeInteger(serverTimeMs, 0)) {
+      return intervention("Saga effect retry time cannot be reconstructed.")
+    }
+    return serverTimeMs
+  }
+  if (before.terminationCause === null && after.terminationCause !== null) {
+    return after.terminationRequestedAtMs as number
+  }
+  return 0
+}
+
+function beginDecisionTime(record: SagaRecord, stepId: string, phase: SagaActionPhase): number {
+  return effectAction(record, stepId, phase).nextAttemptAtMs
+}
+
+function verifyTransitionSuffix(row: SagaHistoryEffectRow, kind: string): string {
+  const prefix = `${operationTransitionIdentity(kind, [row.operation_id, row.step_id])}:`
+  if (!row.transition_id.startsWith(prefix)) {
+    return intervention("Saga effect history has a contradictory transition identity.")
+  }
+  const framedSuffix = row.transition_id.slice(prefix.length)
+  const separator = framedSuffix.indexOf(":")
+  const lengthText = framedSuffix.slice(0, separator)
+  const suffix = framedSuffix.slice(separator + 1)
+  if (
+    separator < 1 ||
+    !/^[1-9][0-9]*$/u.test(lengthText) ||
+    Number(lengthText) !== suffix.length ||
+    !persistedText(suffix)
+  ) {
+    return intervention("Saga effect history has a malformed transition identity suffix.")
+  }
+  return suffix
+}
+
+function verifyEffectTransition(
+  row: SagaHistoryEffectRow,
+  kind: ParsedSagaEffectKind,
+  after: SagaRecord,
+): void {
+  if (kind.kind === "create" || kind.kind === "termination") {
+    verifyTransitionSuffix(row, "succeeded")
+    return
+  }
+  const sagaStepId = effectActionStepId(row, kind.phase)
+  const action = effectAction(after, sagaStepId, kind.phase)
+  if (kind.action === "recovery:unknown" || kind.action === "recovery:not-dispatched") {
+    verifyTransitionSuffix(row, "crash-recovered")
+    return
+  }
+  if (kind.action.startsWith("observation:")) {
+    verifyTransitionSuffix(row, "reconciled")
+    return
+  }
+  const attemptId = requiredActionText(action.lastAttemptId, "its action attempt identity")
+  const transitionKind =
+    kind.action === "begin"
+      ? "accepted"
+      : kind.action === "success" || kind.action === "failure:definitely_not_applied_terminal"
+        ? "succeeded"
+        : "failed"
+  if (
+    row.transition_id !==
+    operationTransitionIdentity(transitionKind, [row.operation_id, row.step_id, attemptId])
+  ) {
+    intervention("Saga effect history has a contradictory exact transition identity.")
+  }
+}
+
+function initialSagaRecord(after: SagaRecord): SagaRecord {
+  const stepInputChecksums = Object.freeze(
+    Object.fromEntries(
+      after.descriptor.steps.map((step) => [
+        step.stepId,
+        after.steps[step.stepId]?.inputChecksum as string,
+      ]),
+    ),
+  )
+  return createSagaRecord({
+    deadlineAtMs: after.deadlineAtMs,
+    descriptor: after.descriptor,
+    idempotencyKey: after.idempotencyKey,
+    inputChecksum: after.inputChecksum,
+    sagaId: after.sagaId,
+    serverTimeMs: 0,
+    stepInputChecksums,
+  })
+}
+
+function replaySagaEffect(
+  before: SagaRecord | undefined,
+  after: SagaRecord,
+  row: SagaHistoryEffectRow,
+  kind: ParsedSagaEffectKind,
+): ReplayedSagaEffect {
+  if (kind.kind === "create") {
+    if (
+      before !== undefined ||
+      row.step_id !== SAGA_INIT_OPERATION_STEP_ID ||
+      row.from_state_version !== null ||
+      row.to_state_version !== 0
+    ) {
+      return intervention("Saga creation effect is not the unique version-zero effect.")
+    }
+    return Object.freeze({ decisionTimeMs: 0, saga: initialSagaRecord(after) })
+  }
+  if (before === undefined) {
+    return intervention("Saga effect history starts without its creation effect.")
+  }
+  if (kind.kind === "termination") {
+    if (
+      row.step_id !== SAGA_TERMINATION_OPERATION_STEP_ID ||
+      after.terminationCause !== kind.cause ||
+      !safeInteger(after.terminationRequestedAtMs, 0) ||
+      (kind.cause === "timeout" && after.terminationRequestedAtMs < before.deadlineAtMs)
+    ) {
+      return intervention("Saga termination effect contradicts its durable cause or time.")
+    }
+    return Object.freeze({
+      decisionTimeMs: after.terminationRequestedAtMs,
+      saga: requestSagaTermination(before, {
+        cause: kind.cause,
+        serverTimeMs: after.terminationRequestedAtMs,
+      }),
+    })
+  }
+
+  const sagaStepId = effectActionStepId(row, kind.phase)
+  const beforeAction = effectAction(before, sagaStepId, kind.phase)
+  const afterAction = effectAction(after, sagaStepId, kind.phase)
+  if (kind.action === "begin") {
+    const decisionTimeMs = beginDecisionTime(before, sagaStepId, kind.phase)
+    const decision = beginSagaAction(before, {
+      attemptId: requiredActionText(afterAction.lastAttemptId, "its begun attempt identity"),
+      idempotencyKey: beforeAction.idempotencyKey,
+      phase: kind.phase,
+      serverTimeMs: decisionTimeMs,
+      stepId: sagaStepId,
+    })
+    if (decision.disposition !== "execute") {
+      return intervention("Saga action begin does not replay as an executable serial action.")
+    }
+    return Object.freeze({ decisionTimeMs, saga: decision.saga })
+  }
+  if (kind.action === "success") {
+    return Object.freeze({
+      decisionTimeMs: 0,
+      saga: recordSagaActionSuccess(before, {
+        attemptId: requiredActionText(beforeAction.activeAttemptId, "its active attempt identity"),
+        phase: kind.phase,
+        resultChecksum: requiredActionText(afterAction.resultChecksum, "its action result"),
+        serverTimeMs: 0,
+        stepId: sagaStepId,
+      }),
+    })
+  }
+  if (kind.action.startsWith("failure:")) {
+    const outcome =
+      kind.action === "failure:unknown"
+        ? "unknown"
+        : kind.action === "failure:definitely_not_applied_retryable"
+          ? "definitely_not_applied_retryable"
+          : "definitely_not_applied_terminal"
+    const decisionTimeMs = retryDecisionTime(before, after, sagaStepId, kind.phase)
+    return Object.freeze({
+      decisionTimeMs,
+      saga: recordSagaActionFailure(before, {
+        attemptId: requiredActionText(beforeAction.activeAttemptId, "its active attempt identity"),
+        errorChecksum: requiredActionText(afterAction.errorChecksum, "its action error"),
+        outcome,
+        phase: kind.phase,
+        serverTimeMs: decisionTimeMs,
+        stepId: sagaStepId,
+      }),
+    })
+  }
+  if (kind.action === "recovery:unknown") {
+    return Object.freeze({
+      decisionTimeMs: 0,
+      saga: markRunningSagaActionUnknown(before, {
+        attemptId: requiredActionText(
+          beforeAction.activeAttemptId,
+          "its recovered attempt identity",
+        ),
+        errorChecksum: row.evidence_checksum,
+        phase: kind.phase,
+        stepId: sagaStepId,
+      }),
+    })
+  }
+  if (kind.action === "recovery:not-dispatched") {
+    const decisionTimeMs = retryDecisionTime(before, after, sagaStepId, kind.phase)
+    return Object.freeze({
+      decisionTimeMs,
+      saga: markSagaActionNotDispatched(before, {
+        attemptId: requiredActionText(
+          beforeAction.activeAttemptId,
+          "its recovered attempt identity",
+        ),
+        errorChecksum: row.evidence_checksum,
+        phase: kind.phase,
+        serverTimeMs: decisionTimeMs,
+        stepId: sagaStepId,
+      }),
+    })
+  }
+  const outcome =
+    kind.action === "observation:applied"
+      ? "applied"
+      : kind.action === "observation:not_applied"
+        ? "not_applied"
+        : "indeterminate"
+  const decisionTimeMs = retryDecisionTime(before, after, sagaStepId, kind.phase)
+  return Object.freeze({
+    decisionTimeMs,
+    saga: recordSagaObservation(before, {
+      evidenceChecksum: row.evidence_checksum,
+      outcome,
+      phase: kind.phase,
+      ...(outcome === "applied"
+        ? { resultChecksum: requiredActionText(afterAction.resultChecksum, "its observed result") }
+        : {}),
+      serverTimeMs: decisionTimeMs,
+      stepId: sagaStepId,
+    }),
+  })
+}
+
+async function expectedSagaEffectId(
+  row: SagaHistoryEffectRow,
+  digest: DigestFunction,
+): Promise<string> {
+  const checksum = await checkedFoldDigest(digest, SAGA_COORDINATOR_ID_DOMAIN, [
+    "saga-effect",
+    row.transition_id,
+    row.resource_id,
+    row.effect_kind,
+    row.to_state_version.toString(10),
+  ])
+  return `saga-effect:${checksum}`
+}
+
+async function verifyBeginEvidence(
+  row: SagaHistoryEffectRow,
+  kind: ParsedSagaEffectKind,
+  after: SagaRecord,
+  digest: DigestFunction,
+): Promise<void> {
+  if (kind.kind !== "action" || kind.action !== "begin") return
+  const sagaStepId = effectActionStepId(row, kind.phase)
+  const attemptId = requiredActionText(
+    effectAction(after, sagaStepId, kind.phase).lastAttemptId,
+    "its begun action attempt",
+  )
+  const expected = await checkedFoldDigest(digest, SAGA_COORDINATOR_ID_DOMAIN, [
+    "begin-evidence",
+    row.transition_id,
+    row.resource_id,
+    sagaStepId,
+    kind.phase,
+    attemptId,
+  ])
+  if (row.evidence_checksum !== expected) {
+    intervention("Saga action begin effect has contradictory deterministic evidence.")
+  }
+}
+
+async function nextEffectFoldChecksum(
+  digest: DigestFunction,
+  previous: string,
+  row: SagaHistoryEffectRow,
+): Promise<string> {
+  return checkedFoldDigest(digest, EFFECT_FOLD_DOMAIN, [
+    previous,
+    row.effect_id,
+    row.transition_id,
+    row.effect_kind,
+    row.from_state_version === null ? "null" : row.from_state_version.toString(10),
+    row.to_state_version.toString(10),
+    row.evidence_checksum,
+    row.record_checksum,
+    row.lease_key,
+    row.holder_id,
+    row.acquisition_id,
+    row.fencing_token.toString(10),
+    row.created_at_ms.toString(10),
+  ])
+}
+
 /**
  * Incrementally verifies the pinned environment audit chain and reduces this operation's
  * transition-linked events to a constant-size ordered checksum. It is intentionally internal
@@ -1566,6 +2080,191 @@ export class SagaHistoryTransitionFolder {
       transitionCount: this.#state.transitionCount,
       transitionLastAuditSequence: this.#state.cursor.auditSequence,
       transitionLastId: this.#state.cursor.transitionId,
+    })
+  }
+}
+
+/**
+ * Reconstructs the exact saga projection from its dense operation-effect chain. The fold verifies
+ * canonical records, checksums, deterministic identities, lease progression, and every pure saga
+ * state transition. It remains read-only and does not reconcile the operation or attempt streams.
+ */
+export class SagaHistoryEffectFolder {
+  readonly #anchor: SagaHistoryAnchor
+  readonly #digest: DigestFunction
+  #appending = false
+  #complete = false
+  #state: SagaHistoryEffectFoldState = {
+    acquisitionId: null,
+    createdAtMs: null,
+    effectCount: 0,
+    effectFoldChecksum: EMPTY_FOLD_CHECKSUM,
+    effectLastId: null,
+    fencingToken: null,
+    holderId: null,
+    leaseKey: null,
+    recordChecksum: null,
+    saga: undefined,
+    stateVersion: -1,
+  }
+
+  constructor(inputAnchor: SagaHistoryAnchor, digest: DigestFunction) {
+    if (typeof digest !== "function") configuration("A saga effect fold digest is required.")
+    this.#anchor = loadSagaHistoryAnchor(inputAnchor)
+    this.#digest = digest
+  }
+
+  async #foldRow(row: SagaHistoryEffectRow, state: SagaHistoryEffectFoldState): Promise<void> {
+    const expectedVersion = state.stateVersion + 1
+    if (
+      row.operation_id !== this.#anchor.operationId ||
+      row.resource_kind !== "saga" ||
+      row.resource_id !== this.#anchor.sagaId ||
+      row.to_state_version !== expectedVersion ||
+      row.to_state_version > this.#anchor.sagaStateVersion ||
+      row.from_state_version !== (expectedVersion === 0 ? null : state.stateVersion) ||
+      state.effectCount >= this.#anchor.sagaEffectCount ||
+      ![
+        row.effect_id,
+        row.transition_id,
+        row.step_id,
+        row.effect_kind,
+        row.evidence_checksum,
+        row.record_checksum,
+        row.lease_key,
+        row.holder_id,
+        row.acquisition_id,
+        row.record_json,
+      ].every(persistedText) ||
+      !safeInteger(row.fencing_token, 1) ||
+      !safeInteger(row.created_at_ms, 0) ||
+      (state.createdAtMs !== null && row.created_at_ms < state.createdAtMs) ||
+      (state.leaseKey !== null && row.lease_key !== state.leaseKey) ||
+      (state.fencingToken !== null && row.fencing_token < state.fencingToken) ||
+      (state.fencingToken === row.fencing_token &&
+        (state.holderId !== row.holder_id || state.acquisitionId !== row.acquisition_id))
+    ) {
+      return intervention("Saga effect fold history is malformed, unordered, or unfenced.")
+    }
+
+    const kind = parsedSagaEffectKind(row.effect_kind)
+    if (
+      kind.kind === "action" &&
+      kind.action.startsWith("recovery:") &&
+      state.fencingToken !== null &&
+      row.fencing_token <= state.fencingToken
+    ) {
+      return intervention("Saga recovery effect lacks a strictly newer lease fence.")
+    }
+    const after = await loadSagaRecord(
+      parsedJson(row.record_json, "Saga effect successor record"),
+      this.#digest,
+    )
+    if (
+      sagaRecordJson(after) !== row.record_json ||
+      after.sagaId !== this.#anchor.sagaId ||
+      after.inputChecksum !== this.#anchor.sagaInputChecksum ||
+      after.descriptor.descriptorChecksum !== this.#anchor.sagaDescriptorChecksum ||
+      after.stateVersion !== row.to_state_version
+    ) {
+      return intervention("Saga effect successor record is noncanonical or contradictory.")
+    }
+    const recordChecksum = await checkedFoldDigest(this.#digest, SAGA_RECORD_DOMAIN, [
+      row.record_json,
+    ])
+    if (row.record_checksum !== recordChecksum) {
+      return intervention("Saga effect successor record checksum is contradictory.")
+    }
+    if (row.effect_id !== (await expectedSagaEffectId(row, this.#digest))) {
+      return intervention("Saga effect history has a contradictory deterministic identity.")
+    }
+    verifyEffectTransition(row, kind, after)
+    await verifyBeginEvidence(row, kind, after, this.#digest)
+
+    let replayed: ReplayedSagaEffect
+    try {
+      replayed = replaySagaEffect(state.saga, after, row, kind)
+    } catch {
+      return intervention("Saga effect history violates its exact core state transition.")
+    }
+    if (
+      sagaRecordJson(replayed.saga) !== row.record_json ||
+      replayed.decisionTimeMs > row.created_at_ms
+    ) {
+      return intervention("Saga effect history violates its exact core state transition.")
+    }
+
+    state.acquisitionId = row.acquisition_id
+    state.createdAtMs = row.created_at_ms
+    state.effectCount += 1
+    state.effectFoldChecksum = await nextEffectFoldChecksum(
+      this.#digest,
+      state.effectFoldChecksum,
+      row,
+    )
+    state.effectLastId = row.effect_id
+    state.fencingToken = row.fencing_token
+    state.holderId = row.holder_id
+    state.leaseKey = row.lease_key
+    state.recordChecksum = recordChecksum
+    state.saga = after
+    state.stateVersion = row.to_state_version
+  }
+
+  async append(inputPage: SagaHistoryPage<SagaHistoryEffectRow, number>): Promise<void> {
+    if (this.#complete) configuration("Saga effect history is already completely folded.")
+    if (this.#appending) configuration("A saga effect history page is already being folded.")
+    this.#appending = true
+    try {
+      const page = capturedEffectPage(inputPage)
+      const state: SagaHistoryEffectFoldState = { ...this.#state }
+      for (const row of page.rows) await this.#foldRow(row, state)
+      const atHead =
+        state.stateVersion === this.#anchor.sagaStateVersion &&
+        state.effectLastId === this.#anchor.sagaLastEffectId
+      if (!page.complete) {
+        if (atHead || state.effectCount >= this.#anchor.sagaEffectCount) {
+          return intervention("Saga effect fold page failed to close at its anchor.")
+        }
+      } else if (
+        !atHead ||
+        state.effectCount !== this.#anchor.sagaEffectCount ||
+        state.recordChecksum !== this.#anchor.sagaRecordChecksum ||
+        state.saga === undefined ||
+        state.saga.status !== this.#anchor.sagaStatus
+      ) {
+        return intervention("Saga effect fold does not reconcile with its terminal anchor.")
+      } else {
+        this.#complete = true
+      }
+      this.#state = state
+    } finally {
+      this.#appending = false
+    }
+  }
+
+  proof(): SagaHistoryEffectProof {
+    if (
+      !this.#complete ||
+      this.#state.effectLastId === null ||
+      this.#state.recordChecksum === null ||
+      this.#state.saga === undefined
+    ) {
+      return resume("Saga effect history requires more verified pages.")
+    }
+    return Object.freeze({
+      effectCount: this.#state.effectCount,
+      effectFoldChecksum: this.#state.effectFoldChecksum,
+      effectLastId: this.#state.effectLastId,
+      operationId: this.#anchor.operationId,
+      saga: this.#state.saga,
+      sagaDescriptorChecksum: this.#anchor.sagaDescriptorChecksum,
+      sagaId: this.#anchor.sagaId,
+      sagaInputChecksum: this.#anchor.sagaInputChecksum,
+      sagaRecordChecksum: this.#state.recordChecksum,
+      sagaStateVersion: this.#state.stateVersion,
+      sagaStatus: this.#state.saga.status,
+      schemaVersion: 1,
     })
   }
 }
