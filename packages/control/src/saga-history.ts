@@ -6,8 +6,16 @@ import {
 } from "@nozzle/core"
 import type { TransactionalControlDatabase } from "./database.js"
 import {
+  acceptedSagaAttemptRecord,
+  loadSagaAttemptIdentityRow,
+  loadSagaAttemptOutcomeRow,
   SAGA_ATTEMPT_IDENTITY_ROW_SELECT,
+  SAGA_ATTEMPT_OUTCOME_ROW_SELECT,
+  SAGA_ATTEMPT_PAYLOAD_ROW_SELECT,
   type SagaAttemptIdentityRow,
+  type SagaAttemptOutcomeRow,
+  type SagaAttemptPayloadRow,
+  type SagaAttemptRecord,
 } from "./saga-attempt-codec.js"
 
 export const SAGA_HISTORY_PAGE_ROW_LIMIT = 2
@@ -274,6 +282,13 @@ const ATTEMPT_IDENTITY_ROW_KEYS = [
   "saga_id",
   "saga_step_id",
 ] as const satisfies readonly (keyof SagaAttemptIdentityRow)[]
+
+const ATTEMPT_PAYLOAD_ROW_KEYS = [
+  "attempt_id",
+  "payload_checksum",
+  "payload_json",
+  "payload_kind",
+] as const satisfies readonly (keyof SagaAttemptPayloadRow)[]
 
 function configuration(message: string): never {
   throw new NozzleError("ConfigurationError", message)
@@ -1217,5 +1232,53 @@ export class D1SagaHistoryReader {
     return page(rows, (row) =>
       Object.freeze({ acceptedAtMs: row.accepted_at_ms, attemptId: row.attempt_id }),
     )
+  }
+
+  async attemptRecord(
+    inputAnchor: SagaHistoryAnchor,
+    inputIdentityRow: SagaAttemptIdentityRow,
+    digest: DigestFunction,
+  ): Promise<SagaAttemptRecord> {
+    const anchor = loadSagaHistoryAnchor(inputAnchor)
+    const identity = await loadSagaAttemptIdentityRow(inputIdentityRow, digest)
+    if (
+      anchor.sagaAttemptCount === 0 ||
+      identity.sagaId !== anchor.sagaId ||
+      identity.operationId !== anchor.operationId ||
+      identity.acceptedAtMs > (anchor.sagaAttemptLastAcceptedAtMs as number) ||
+      (identity.acceptedAtMs === anchor.sagaAttemptLastAcceptedAtMs &&
+        sqliteBinaryTextCompare(identity.attemptId, anchor.sagaAttemptLastId as string) > 0)
+    ) {
+      return intervention("Saga-attempt record lies outside its terminal-history anchor.")
+    }
+    const outcome = await this.#database
+      .prepare(
+        `SELECT ${SAGA_ATTEMPT_OUTCOME_ROW_SELECT}
+         FROM "nozzle_saga_action_attempt_outcomes" AS "outcome"
+         WHERE "outcome"."attempt_id" = ?1`,
+      )
+      .bind(identity.attemptId)
+      .first<SagaAttemptOutcomeRow>()
+    const payloadResult = await this.#database
+      .prepare(
+        `SELECT ${SAGA_ATTEMPT_PAYLOAD_ROW_SELECT}
+         FROM "nozzle_saga_action_attempt_outcome_payloads" AS "payload"
+         WHERE "payload"."attempt_id" = ?1
+         ORDER BY "payload"."payload_kind" LIMIT 4`,
+      )
+      .bind(identity.attemptId)
+      .all<SagaAttemptPayloadRow>()
+    const payloads = capturedRows<SagaAttemptPayloadRow>(
+      payloadResult,
+      ATTEMPT_PAYLOAD_ROW_KEYS,
+      "Saga-attempt payload history",
+    )
+    if (outcome === null) {
+      if (payloads.length !== 0) {
+        return intervention("An accepted saga attempt has orphaned terminal payloads.")
+      }
+      return acceptedSagaAttemptRecord(identity)
+    }
+    return loadSagaAttemptOutcomeRow(outcome, payloads, identity, digest)
   }
 }

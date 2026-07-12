@@ -35,9 +35,17 @@ import {
 } from "@nozzle/core"
 import { operationStepRecordJson, operationTransitionIdentity } from "./operation-store.js"
 import {
+  loadSagaAttemptIdentityRow,
+  type SagaAttemptIdentity,
+  type SagaAttemptIdentityRow,
+  type SagaAttemptRecord,
+} from "./saga-attempt-codec.js"
+import {
+  D1SagaHistoryReader,
   loadSagaHistoryAnchor,
   SAGA_HISTORY_PAGE_ROW_LIMIT,
   type SagaHistoryAnchor,
+  type SagaHistoryAttemptCursor,
   type SagaHistoryAuditRow,
   type SagaHistoryEffectRow,
   type SagaHistoryPage,
@@ -52,6 +60,7 @@ import {
 
 const AUDIT_TRANSITION_FOLD_DOMAIN = "nozzle.saga-history.audit-transition-fold.v1"
 const EFFECT_FOLD_DOMAIN = "nozzle.saga-history.effect-fold.v1"
+const ATTEMPT_FOLD_DOMAIN = "nozzle.saga-history.attempt-fold.v1"
 const SAGA_COORDINATOR_ID_DOMAIN = "nozzle.saga-coordinator-id.v1"
 const SAGA_RECORD_DOMAIN = "nozzle.saga-record.v1"
 const EMPTY_FOLD_CHECKSUM = "0".repeat(64)
@@ -127,6 +136,29 @@ const EFFECT_ROW_KEYS = [
   "transition_id",
 ] as const satisfies readonly (keyof SagaHistoryEffectRow)[]
 
+const ATTEMPT_ROW_KEYS = [
+  "acceptance_checksum",
+  "accepted_at_ms",
+  "acquisition_id",
+  "action_key",
+  "attempt_id",
+  "causal_attempt_id",
+  "fencing_token",
+  "holder_id",
+  "idempotency_key",
+  "input_checksum",
+  "input_json",
+  "lease_key",
+  "operation_id",
+  "operation_step_id",
+  "phase",
+  "protocol_classified_at_ms",
+  "protocol_version",
+  "purpose",
+  "saga_id",
+  "saga_step_id",
+] as const satisfies readonly (keyof SagaAttemptIdentityRow)[]
+
 export interface SagaHistoryAuditProof {
   readonly auditEventCount: number
   readonly auditHeadEventHash: string
@@ -182,6 +214,41 @@ export interface SagaHistoryEffectProof {
   readonly schemaVersion: 1
 }
 
+export interface SagaHistoryAttemptSummary {
+  readonly acceptanceChecksum: string
+  readonly acceptedAtMs: number
+  readonly acquisitionId: string
+  readonly actionKey: string
+  readonly attemptId: string
+  readonly causalAttemptId: string | null
+  readonly completedAtMs: number | null
+  readonly evidenceChecksum: string | null
+  readonly fencingToken: number
+  readonly holderId: string
+  readonly idempotencyKey: string
+  readonly inputChecksum: string
+  readonly leaseKey: string
+  readonly operationStepId: string
+  readonly outcomeChecksum: string | null
+  readonly phase: SagaActionPhase
+  readonly protocolVersion: 1 | 2
+  readonly purpose: "effect" | "observation"
+  readonly sagaStepId: string
+  readonly state: SagaAttemptRecord["state"]
+  readonly valueChecksum: string | null
+}
+
+export interface SagaHistoryAttemptProof {
+  readonly attemptCount: number
+  readonly attemptFoldChecksum: string
+  readonly attemptLastAcceptedAtMs: number | null
+  readonly attemptLastId: string | null
+  readonly attempts: readonly SagaHistoryAttemptSummary[]
+  readonly operationId: string
+  readonly sagaId: string
+  readonly schemaVersion: 1
+}
+
 interface SagaHistoryAuditFoldState {
   creationEventHash: string | null
   nextSequence: number
@@ -210,6 +277,17 @@ interface SagaHistoryEffectFoldState {
   recordChecksum: string | null
   saga: SagaRecord | undefined
   stateVersion: number
+}
+
+interface SagaHistoryAttemptFoldState {
+  attemptFoldChecksum: string
+  attempts: Map<string, SagaHistoryAttemptSummary>
+  bindings: Map<string, { readonly actionKey: string; readonly idempotencyKey: string }>
+  cursor: SagaHistoryAttemptCursor
+  fences: Map<number, { readonly acquisitionId: string; readonly holderId: string }>
+  leaseKey: string | null
+  maximumFencingToken: number
+  summaries: SagaHistoryAttemptSummary[]
 }
 
 function configuration(message: string): never {
@@ -426,6 +504,54 @@ function capturedEffectPage(value: unknown): SagaHistoryPage<SagaHistoryEffectRo
   return Object.freeze({
     complete: snapshot.complete,
     nextCursor: snapshot.nextCursor,
+    rows: Object.freeze(snapshot.rows.map((row) => Object.freeze(row))),
+  })
+}
+
+function capturedAttemptPage(
+  value: unknown,
+): SagaHistoryPage<SagaAttemptIdentityRow, SagaHistoryAttemptCursor> {
+  let snapshot: unknown
+  try {
+    snapshot = structuredClone(value)
+  } catch {
+    return intervention("Saga-attempt fold page could not be captured safely.")
+  }
+  if (
+    !exactRecord<SagaHistoryPage<SagaAttemptIdentityRow, SagaHistoryAttemptCursor>>(snapshot, [
+      "complete",
+      "nextCursor",
+      "rows",
+    ]) ||
+    typeof snapshot.complete !== "boolean" ||
+    !denseArray(snapshot.rows) ||
+    snapshot.rows.length > SAGA_HISTORY_PAGE_ROW_LIMIT ||
+    !snapshot.rows.every((row) => exactRecord<SagaAttemptIdentityRow>(row, ATTEMPT_ROW_KEYS))
+  ) {
+    return intervention("Saga-attempt fold page fields or rows are malformed.")
+  }
+  if (snapshot.rows.length === 0) {
+    if (!snapshot.complete || snapshot.nextCursor !== null) {
+      return intervention("An empty saga-attempt fold page has contradictory pagination.")
+    }
+    return Object.freeze({ complete: true, nextCursor: null, rows: Object.freeze([]) })
+  }
+  const last = snapshot.rows.at(-1) as SagaAttemptIdentityRow
+  if (snapshot.complete) {
+    if (snapshot.nextCursor !== null) {
+      return intervention("A complete saga-attempt fold page retained a cursor.")
+    }
+  } else if (
+    snapshot.rows.length !== SAGA_HISTORY_PAGE_ROW_LIMIT ||
+    !exactRecord<SagaHistoryAttemptCursor>(snapshot.nextCursor, ["acceptedAtMs", "attemptId"]) ||
+    snapshot.nextCursor.acceptedAtMs !== last.accepted_at_ms ||
+    snapshot.nextCursor.attemptId !== last.attempt_id
+  ) {
+    return intervention("An incomplete saga-attempt fold page has contradictory pagination.")
+  }
+  return Object.freeze({
+    complete: snapshot.complete,
+    nextCursor: snapshot.nextCursor === null ? null : Object.freeze({ ...snapshot.nextCursor }),
     rows: Object.freeze(snapshot.rows.map((row) => Object.freeze(row))),
   })
 }
@@ -1721,6 +1847,131 @@ async function nextEffectFoldChecksum(
   ])
 }
 
+function attemptIdentityJson(identity: SagaAttemptIdentity): string {
+  return JSON.stringify([
+    identity.acceptanceChecksum,
+    identity.acceptedAtMs,
+    identity.acquisitionId,
+    identity.actionKey,
+    identity.attemptId,
+    identity.causalAttemptId,
+    identity.fencingToken,
+    identity.holderId,
+    identity.idempotencyKey,
+    identity.inputChecksum,
+    identity.inputJson,
+    identity.leaseKey,
+    identity.operationId,
+    identity.operationStepId,
+    identity.phase,
+    identity.protocolVersion,
+    identity.purpose,
+    identity.sagaId,
+    identity.sagaStepId,
+  ])
+}
+
+function attemptSummary(record: SagaAttemptRecord): SagaHistoryAttemptSummary {
+  const terminal = record.state !== "accepted"
+  return Object.freeze({
+    acceptanceChecksum: record.acceptanceChecksum,
+    acceptedAtMs: record.acceptedAtMs,
+    acquisitionId: record.acquisitionId,
+    actionKey: record.actionKey,
+    attemptId: record.attemptId,
+    causalAttemptId: record.causalAttemptId,
+    completedAtMs: terminal ? record.completedAtMs : null,
+    evidenceChecksum: terminal ? record.evidenceChecksum : null,
+    fencingToken: record.fencingToken,
+    holderId: record.holderId,
+    idempotencyKey: record.idempotencyKey,
+    inputChecksum: record.inputChecksum,
+    leaseKey: record.leaseKey,
+    operationStepId: record.operationStepId,
+    outcomeChecksum: terminal ? record.outcomeChecksum : null,
+    phase: record.phase,
+    protocolVersion: record.protocolVersion,
+    purpose: record.purpose,
+    sagaStepId: record.sagaStepId,
+    state: record.state,
+    valueChecksum: terminal
+      ? record.state === "confirmed"
+        ? record.outputChecksum
+        : record.errorChecksum
+      : null,
+  })
+}
+
+function verifyAttemptCausality(attempts: ReadonlyMap<string, SagaHistoryAttemptSummary>): void {
+  for (const attempt of attempts.values()) {
+    if (attempt.purpose === "observation") {
+      const cause = attempts.get(attempt.causalAttemptId as string)
+      if (
+        cause === undefined ||
+        cause.acceptedAtMs > attempt.acceptedAtMs ||
+        cause.sagaStepId !== attempt.sagaStepId ||
+        cause.operationStepId !== attempt.operationStepId ||
+        cause.phase !== attempt.phase ||
+        cause.purpose !== "effect" ||
+        (cause.state !== "accepted" && cause.state !== "unknown") ||
+        (cause.completedAtMs !== null && cause.completedAtMs > attempt.acceptedAtMs) ||
+        attempt.fencingToken <= cause.fencingToken ||
+        attempt.idempotencyKey !== `${cause.idempotencyKey}:observation`
+      ) {
+        intervention("Saga observation attempt lacks its exact causal effect receipt.")
+      }
+      continue
+    }
+    if (attempt.phase === "compensation") {
+      const cause = attempts.get(attempt.causalAttemptId as string)
+      if (
+        cause === undefined ||
+        cause.acceptedAtMs > attempt.acceptedAtMs ||
+        cause.sagaStepId !== attempt.sagaStepId ||
+        cause.operationStepId !== `saga:forward:${attempt.sagaStepId}` ||
+        cause.phase !== "forward" ||
+        cause.purpose !== "effect" ||
+        cause.state !== "confirmed" ||
+        (cause.completedAtMs as number) > attempt.acceptedAtMs ||
+        cause.valueChecksum === null
+      ) {
+        intervention("Saga compensation attempt lacks its confirmed forward cause.")
+      }
+    }
+  }
+}
+
+async function nextAttemptFoldChecksum(
+  digest: DigestFunction,
+  previous: string,
+  attempt: SagaHistoryAttemptSummary,
+): Promise<string> {
+  return checkedFoldDigest(digest, ATTEMPT_FOLD_DOMAIN, [
+    previous,
+    attempt.attemptId,
+    attempt.causalAttemptId ?? "",
+    attempt.acceptanceChecksum,
+    attempt.acceptedAtMs.toString(10),
+    attempt.completedAtMs === null ? "" : attempt.completedAtMs.toString(10),
+    attempt.operationStepId,
+    attempt.sagaStepId,
+    attempt.phase,
+    attempt.purpose,
+    attempt.actionKey,
+    attempt.idempotencyKey,
+    attempt.inputChecksum,
+    attempt.leaseKey,
+    attempt.holderId,
+    attempt.acquisitionId,
+    attempt.fencingToken.toString(10),
+    attempt.protocolVersion.toString(10),
+    attempt.state,
+    attempt.evidenceChecksum ?? "",
+    attempt.valueChecksum ?? "",
+    attempt.outcomeChecksum ?? "",
+  ])
+}
+
 /**
  * Incrementally verifies the pinned environment audit chain and reduces this operation's
  * transition-linked events to a constant-size ordered checksum. It is intentionally internal
@@ -2264,6 +2515,170 @@ export class SagaHistoryEffectFolder {
       sagaRecordChecksum: this.#state.recordChecksum,
       sagaStateVersion: this.#state.stateVersion,
       sagaStatus: this.#state.saga.status,
+      schemaVersion: 1,
+    })
+  }
+}
+
+/**
+ * Verifies paged saga-attempt identities and point-loaded inline or companion-row outcomes while
+ * retaining only bounded semantic summaries. Causal receipts are reconciled after the full page
+ * stream because D1's millisecond keyset can order same-time cause and dependent IDs either way.
+ */
+export class SagaHistoryAttemptFolder {
+  readonly #anchor: SagaHistoryAnchor
+  readonly #digest: DigestFunction
+  readonly #reader: D1SagaHistoryReader
+  #appending = false
+  #complete = false
+  #state: SagaHistoryAttemptFoldState = {
+    attemptFoldChecksum: EMPTY_FOLD_CHECKSUM,
+    attempts: new Map(),
+    bindings: new Map(),
+    cursor: Object.freeze({ acceptedAtMs: -1, attemptId: "" }),
+    fences: new Map(),
+    leaseKey: null,
+    maximumFencingToken: 0,
+    summaries: [],
+  }
+
+  constructor(inputAnchor: SagaHistoryAnchor, reader: D1SagaHistoryReader, digest: DigestFunction) {
+    if (!(reader instanceof D1SagaHistoryReader)) {
+      configuration("A saga-attempt history reader is required.")
+    }
+    if (typeof digest !== "function") configuration("A saga-attempt fold digest is required.")
+    this.#anchor = loadSagaHistoryAnchor(inputAnchor)
+    this.#reader = reader
+    this.#digest = digest
+  }
+
+  async #foldRow(row: SagaAttemptIdentityRow, state: SagaHistoryAttemptFoldState): Promise<void> {
+    const lastAcceptedAtMs = this.#anchor.sagaAttemptLastAcceptedAtMs
+    const lastAttemptId = this.#anchor.sagaAttemptLastId
+    if (
+      this.#anchor.sagaAttemptCount === 0 ||
+      !safeInteger(row.accepted_at_ms, 0) ||
+      !persistedText(row.attempt_id) ||
+      !pairAfter(
+        row.accepted_at_ms,
+        row.attempt_id,
+        state.cursor.acceptedAtMs,
+        state.cursor.attemptId,
+      ) ||
+      row.accepted_at_ms > (lastAcceptedAtMs as number) ||
+      (row.accepted_at_ms === lastAcceptedAtMs &&
+        sqliteBinaryTextCompare(row.attempt_id, lastAttemptId as string) > 0) ||
+      state.summaries.length >= this.#anchor.sagaAttemptCount
+    ) {
+      return intervention("Saga-attempt fold history is malformed or unordered.")
+    }
+    const identity = await loadSagaAttemptIdentityRow(row, this.#digest)
+    const record = await this.#reader.attemptRecord(this.#anchor, row, this.#digest)
+    if (
+      attemptIdentityJson(record) !== attemptIdentityJson(identity) ||
+      identity.sagaId !== this.#anchor.sagaId ||
+      identity.operationId !== this.#anchor.operationId ||
+      identity.operationStepId !== `saga:${identity.phase}:${identity.sagaStepId}` ||
+      (state.leaseKey !== null && identity.leaseKey !== state.leaseKey) ||
+      (identity.acceptedAtMs > state.cursor.acceptedAtMs &&
+        identity.fencingToken < state.maximumFencingToken) ||
+      state.attempts.has(identity.attemptId)
+    ) {
+      return intervention("Saga-attempt fold identity contradicts its anchored saga action.")
+    }
+    const fence = state.fences.get(identity.fencingToken)
+    if (
+      fence !== undefined &&
+      (fence.holderId !== identity.holderId || fence.acquisitionId !== identity.acquisitionId)
+    ) {
+      return intervention("Saga-attempt fold reused a fence under another lease acquisition.")
+    }
+    const bindingKey = JSON.stringify([identity.sagaStepId, identity.phase, identity.purpose])
+    const binding = state.bindings.get(bindingKey)
+    if (
+      binding !== undefined &&
+      (binding.actionKey !== identity.actionKey ||
+        binding.idempotencyKey !== identity.idempotencyKey)
+    ) {
+      return intervention("Saga-attempt fold action binding changed between attempts.")
+    }
+
+    const summary = attemptSummary(record)
+    state.attemptFoldChecksum = await nextAttemptFoldChecksum(
+      this.#digest,
+      state.attemptFoldChecksum,
+      summary,
+    )
+    state.attempts.set(summary.attemptId, summary)
+    state.bindings.set(
+      bindingKey,
+      binding ??
+        Object.freeze({ actionKey: summary.actionKey, idempotencyKey: summary.idempotencyKey }),
+    )
+    state.cursor = Object.freeze({
+      acceptedAtMs: summary.acceptedAtMs,
+      attemptId: summary.attemptId,
+    })
+    state.fences.set(
+      summary.fencingToken,
+      fence ?? Object.freeze({ acquisitionId: summary.acquisitionId, holderId: summary.holderId }),
+    )
+    state.leaseKey = summary.leaseKey
+    state.maximumFencingToken = Math.max(state.maximumFencingToken, summary.fencingToken)
+    state.summaries.push(summary)
+  }
+
+  async append(
+    inputPage: SagaHistoryPage<SagaAttemptIdentityRow, SagaHistoryAttemptCursor>,
+  ): Promise<void> {
+    if (this.#complete) configuration("Saga-attempt history is already completely folded.")
+    if (this.#appending) configuration("A saga-attempt history page is already being folded.")
+    this.#appending = true
+    try {
+      const page = capturedAttemptPage(inputPage)
+      const state: SagaHistoryAttemptFoldState = {
+        attemptFoldChecksum: this.#state.attemptFoldChecksum,
+        attempts: new Map(this.#state.attempts),
+        bindings: new Map(this.#state.bindings),
+        cursor: this.#state.cursor,
+        fences: new Map(this.#state.fences),
+        leaseKey: this.#state.leaseKey,
+        maximumFencingToken: this.#state.maximumFencingToken,
+        summaries: [...this.#state.summaries],
+      }
+      for (const row of page.rows) await this.#foldRow(row, state)
+      const atHead =
+        this.#anchor.sagaAttemptCount === 0
+          ? state.cursor.acceptedAtMs === -1 && state.cursor.attemptId === ""
+          : state.cursor.acceptedAtMs === this.#anchor.sagaAttemptLastAcceptedAtMs &&
+            state.cursor.attemptId === this.#anchor.sagaAttemptLastId
+      if (!page.complete) {
+        if (atHead || state.summaries.length >= this.#anchor.sagaAttemptCount) {
+          return intervention("Saga-attempt fold page failed to close at its anchor.")
+        }
+      } else if (!atHead || state.summaries.length !== this.#anchor.sagaAttemptCount) {
+        return intervention("Saga-attempt fold does not reconcile with its terminal anchor.")
+      } else {
+        verifyAttemptCausality(state.attempts)
+        this.#complete = true
+      }
+      this.#state = state
+    } finally {
+      this.#appending = false
+    }
+  }
+
+  proof(): SagaHistoryAttemptProof {
+    if (!this.#complete) return resume("Saga-attempt history requires more verified pages.")
+    return Object.freeze({
+      attemptCount: this.#state.summaries.length,
+      attemptFoldChecksum: this.#state.attemptFoldChecksum,
+      attemptLastAcceptedAtMs:
+        this.#state.summaries.length === 0 ? null : this.#state.cursor.acceptedAtMs,
+      attemptLastId: this.#state.summaries.length === 0 ? null : this.#state.cursor.attemptId,
+      attempts: Object.freeze([...this.#state.summaries]),
+      operationId: this.#anchor.operationId,
+      sagaId: this.#anchor.sagaId,
       schemaVersion: 1,
     })
   }

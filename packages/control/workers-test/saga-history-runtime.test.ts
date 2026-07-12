@@ -17,8 +17,21 @@ import {
 } from "@nozzle/core"
 import { beforeAll, describe, expect, it } from "vitest"
 import { operationStepRecordJson, operationTransitionIdentity } from "../src/operation-store.js"
+import {
+  canonicalSagaReceiptJson,
+  SAGA_ATTEMPT_ERROR_DOMAIN,
+  SAGA_ATTEMPT_EVIDENCE_DOMAIN,
+  SAGA_ATTEMPT_INPUT_DOMAIN,
+  SAGA_ATTEMPT_OUTPUT_DOMAIN,
+  SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON,
+  SAGA_OUTCOME_OUTPUT_REFERENCE_JSON,
+  sagaAttemptAcceptanceChecksum,
+  sagaAttemptOutcomeChecksum,
+  sagaReceiptPayloadChecksum,
+} from "../src/saga-attempt-codec.js"
 import { D1SagaHistoryReader, type SagaHistoryEffectRow } from "../src/saga-history.js"
 import {
+  SagaHistoryAttemptFolder,
   SagaHistoryAuditFolder,
   SagaHistoryEffectFolder,
   SagaHistoryTransitionFolder,
@@ -111,6 +124,16 @@ beforeAll(async () => {
     )`,
     `CREATE TABLE "nozzle_saga_action_attempt_protocols" (
       "attempt_id" TEXT PRIMARY KEY, "protocol_version" INTEGER, "classified_at_ms" INTEGER
+    )`,
+    `CREATE TABLE "nozzle_saga_action_attempt_outcomes" (
+      "attempt_id" TEXT PRIMARY KEY, "state" TEXT, "evidence_checksum" TEXT,
+      "evidence_json" TEXT, "output_checksum" TEXT, "output_json" TEXT,
+      "error_checksum" TEXT, "error_json" TEXT, "outcome_checksum" TEXT,
+      "completed_at_ms" INTEGER
+    )`,
+    `CREATE TABLE "nozzle_saga_action_attempt_outcome_payloads" (
+      "attempt_id" TEXT, "payload_kind" TEXT, "payload_checksum" TEXT, "payload_json" TEXT,
+      PRIMARY KEY ("attempt_id", "payload_kind")
     )`,
   ]) {
     await env.DB.prepare(statement).run()
@@ -677,6 +700,306 @@ describe("real workerd D1 saga history paging", () => {
       saga: succeeded,
       sagaStateVersion: 2,
       sagaStatus: "succeeded",
+    })
+    await expect(reader.assertAnchorCurrent(anchor)).resolves.toBeUndefined()
+  })
+
+  it("folds checksum-verified saga attempt outcomes and companion payloads from D1", async () => {
+    const operationId = "runtime-attempt-operation"
+    const sagaId = "runtime-attempt-saga"
+    const environmentId = "runtime-attempt-environment"
+    const sagaStepId = "write"
+    const operationStepId = `saga:forward:${sagaStepId}`
+    const leaseKey = `saga:${sagaId}`
+    const effectAttemptId = "runtime-attempt-effect"
+    const observationAttemptId = "runtime-attempt-observation"
+    const effectInputJson = canonicalSagaReceiptJson(
+      JSON.stringify({ attempt: effectAttemptId }),
+      "Runtime effect input",
+      false,
+    )
+    const observationInputJson = canonicalSagaReceiptJson(
+      JSON.stringify({ attempt: observationAttemptId }),
+      "Runtime observation input",
+      false,
+    )
+    const effectInputChecksum = await sagaReceiptPayloadChecksum(
+      digest,
+      SAGA_ATTEMPT_INPUT_DOMAIN,
+      effectInputJson,
+    )
+    const observationInputChecksum = await sagaReceiptPayloadChecksum(
+      digest,
+      SAGA_ATTEMPT_INPUT_DOMAIN,
+      observationInputJson,
+    )
+    const effectIdentity = Object.freeze({
+      acquisitionId: "runtime-attempt-acquisition-1",
+      actionKey: `runtime-effect@1:${"a".repeat(64)}`,
+      attemptId: effectAttemptId,
+      causalAttemptId: null,
+      fencingToken: 1,
+      holderId: "runtime-attempt-holder-1",
+      idempotencyKey: "runtime-attempt-effect-key",
+      inputChecksum: effectInputChecksum,
+      inputJson: effectInputJson,
+      leaseKey,
+      operationId,
+      operationStepId,
+      phase: "forward" as const,
+      purpose: "effect" as const,
+      sagaId,
+      sagaStepId,
+    })
+    const observationIdentity = Object.freeze({
+      acquisitionId: "runtime-attempt-acquisition-2",
+      actionKey: `runtime-observation@1:${"b".repeat(64)}`,
+      attemptId: observationAttemptId,
+      causalAttemptId: effectAttemptId,
+      fencingToken: 2,
+      holderId: "runtime-attempt-holder-2",
+      idempotencyKey: `${effectIdentity.idempotencyKey}:observation`,
+      inputChecksum: observationInputChecksum,
+      inputJson: observationInputJson,
+      leaseKey,
+      operationId,
+      operationStepId,
+      phase: "forward" as const,
+      purpose: "observation" as const,
+      sagaId,
+      sagaStepId,
+    })
+    const effectAcceptance = await sagaAttemptAcceptanceChecksum(digest, effectIdentity)
+    const observationAcceptance = await sagaAttemptAcceptanceChecksum(digest, observationIdentity)
+    const effectEvidenceJson = canonicalSagaReceiptJson(
+      JSON.stringify({ provider: "runtime", receipt: "unknown" }),
+      "Runtime effect evidence",
+      false,
+    )
+    const effectErrorJson = canonicalSagaReceiptJson(
+      JSON.stringify({ classification: "unknown" }),
+      "Runtime effect error",
+      false,
+    )
+    const observationEvidenceJson = canonicalSagaReceiptJson(
+      JSON.stringify({ provider: "runtime", receipt: "observed" }),
+      "Runtime observation evidence",
+      false,
+    )
+    const observationOutputJson = canonicalSagaReceiptJson(
+      JSON.stringify({ applied: true }),
+      "Runtime observation output",
+      false,
+    )
+    const effectEvidenceChecksum = await sagaReceiptPayloadChecksum(
+      digest,
+      SAGA_ATTEMPT_EVIDENCE_DOMAIN,
+      effectEvidenceJson,
+    )
+    const effectErrorChecksum = await sagaReceiptPayloadChecksum(
+      digest,
+      SAGA_ATTEMPT_ERROR_DOMAIN,
+      effectErrorJson,
+    )
+    const observationEvidenceChecksum = await sagaReceiptPayloadChecksum(
+      digest,
+      SAGA_ATTEMPT_EVIDENCE_DOMAIN,
+      observationEvidenceJson,
+    )
+    const observationOutputChecksum = await sagaReceiptPayloadChecksum(
+      digest,
+      SAGA_ATTEMPT_OUTPUT_DOMAIN,
+      observationOutputJson,
+    )
+    const effectOutcomeChecksum = await sagaAttemptOutcomeChecksum(
+      digest,
+      effectAcceptance,
+      "unknown",
+      effectEvidenceChecksum,
+      effectEvidenceJson,
+      effectErrorChecksum,
+      effectErrorJson,
+    )
+    const observationOutcomeChecksum = await sagaAttemptOutcomeChecksum(
+      digest,
+      observationAcceptance,
+      "confirmed",
+      observationEvidenceChecksum,
+      observationEvidenceJson,
+      observationOutputChecksum,
+      observationOutputJson,
+    )
+
+    await run(
+      `INSERT INTO "nozzle_operations" VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      operationId,
+      environmentId,
+      "runtime-attempt-operation-input",
+      "runtime-attempt-operation-plan",
+      "{}",
+      "failed",
+      30,
+    )
+    await run(
+      `INSERT INTO "nozzle_sagas" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      sagaId,
+      operationId,
+      "runtime-attempt-descriptor",
+      "runtime-attempt-saga-input",
+      0,
+      "failed",
+      "runtime-attempt-effect-0",
+      "runtime-attempt-record-0",
+      30,
+    )
+    await run(
+      `INSERT INTO "nozzle_audit_log" VALUES (?, ?, ?, ?)`,
+      environmentId,
+      1,
+      "runtime-attempt-audit",
+      '{"sequence":1}',
+    )
+    await run(
+      `INSERT INTO "nozzle_operation_transitions" VALUES
+       (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      "runtime-attempt-transition",
+      operationId,
+      "saga:init",
+      '{"state":"running"}',
+      '{"state":"failed"}',
+      "running",
+      "failed",
+      "runtime-attempt-audit",
+      1,
+      leaseKey,
+      "runtime-attempt-holder-1",
+      "runtime-attempt-acquisition-1",
+      1,
+    )
+    await run(
+      `INSERT INTO "nozzle_operation_effects" VALUES
+       (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      "runtime-attempt-effect-0",
+      "runtime-attempt-transition",
+      operationId,
+      "saga:init",
+      "saga",
+      sagaId,
+      "create",
+      null,
+      0,
+      "runtime-attempt-effect-evidence",
+      "runtime-attempt-record-0",
+      '{"stateVersion":0}',
+      leaseKey,
+      "runtime-attempt-holder-1",
+      "runtime-attempt-acquisition-1",
+      1,
+      1,
+    )
+    for (const [identity, acceptance, acceptedAtMs] of [
+      [effectIdentity, effectAcceptance, 10],
+      [observationIdentity, observationAcceptance, 20],
+    ] as const) {
+      await run(
+        `INSERT INTO "nozzle_saga_action_attempts" VALUES
+         (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        identity.attemptId,
+        identity.causalAttemptId,
+        identity.sagaId,
+        identity.operationId,
+        identity.operationStepId,
+        identity.sagaStepId,
+        identity.phase,
+        identity.purpose,
+        identity.actionKey,
+        identity.idempotencyKey,
+        identity.inputChecksum,
+        identity.inputJson,
+        acceptance,
+        identity.leaseKey,
+        identity.holderId,
+        identity.acquisitionId,
+        identity.fencingToken,
+        acceptedAtMs,
+      )
+      await run(
+        `INSERT INTO "nozzle_saga_action_attempt_protocols" VALUES (?, ?, ?)`,
+        identity.attemptId,
+        2,
+        acceptedAtMs,
+      )
+    }
+    await run(
+      `INSERT INTO "nozzle_saga_action_attempt_outcomes" VALUES
+       (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      effectAttemptId,
+      "unknown",
+      effectEvidenceChecksum,
+      effectEvidenceJson,
+      null,
+      null,
+      effectErrorChecksum,
+      effectErrorJson,
+      effectOutcomeChecksum,
+      11,
+    )
+    await run(
+      `INSERT INTO "nozzle_saga_action_attempt_outcomes" VALUES
+       (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      observationAttemptId,
+      "confirmed",
+      observationEvidenceChecksum,
+      SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON,
+      observationOutputChecksum,
+      SAGA_OUTCOME_OUTPUT_REFERENCE_JSON,
+      null,
+      null,
+      observationOutcomeChecksum,
+      21,
+    )
+    for (const [kind, checksum, json] of [
+      ["evidence", observationEvidenceChecksum, observationEvidenceJson],
+      ["output", observationOutputChecksum, observationOutputJson],
+    ] as const) {
+      await run(
+        `INSERT INTO "nozzle_saga_action_attempt_outcome_payloads" VALUES (?, ?, ?, ?)`,
+        observationAttemptId,
+        kind,
+        checksum,
+        json,
+      )
+    }
+
+    const reader = new D1SagaHistoryReader(env.DB)
+    const anchor = await reader.captureAnchor(operationId, sagaId)
+    expect(anchor).toMatchObject({
+      sagaAttemptCount: 2,
+      sagaAttemptLastAcceptedAtMs: 20,
+      sagaAttemptLastId: observationAttemptId,
+    })
+    const page = await reader.attemptIdentityPage(anchor)
+    expect(page).toMatchObject({ complete: true, nextCursor: null })
+    const folder = new SagaHistoryAttemptFolder(anchor, reader, digest)
+    await folder.append(page)
+    expect(folder.proof()).toMatchObject({
+      attemptCount: 2,
+      attemptFoldChecksum: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      attemptLastAcceptedAtMs: 20,
+      attemptLastId: observationAttemptId,
+      attempts: [
+        {
+          attemptId: effectAttemptId,
+          state: "unknown",
+          valueChecksum: effectErrorChecksum,
+        },
+        {
+          attemptId: observationAttemptId,
+          causalAttemptId: effectAttemptId,
+          state: "confirmed",
+          valueChecksum: observationOutputChecksum,
+        },
+      ],
     })
     await expect(reader.assertAnchorCurrent(anchor)).resolves.toBeUndefined()
   })
