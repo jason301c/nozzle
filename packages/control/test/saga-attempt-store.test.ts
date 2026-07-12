@@ -77,6 +77,28 @@ function activateRowSafeSagaOutcomes(database: DatabaseSync): void {
     )
   database
     .prepare(
+      `INSERT INTO "nozzle_reader_barrier_verifications"
+       ("protocol_version", "reader_barrier_checksum", "verification_checksum",
+        "evidence_json", "verified_at_ms") VALUES (1, ?, ?, ?, 1)`,
+    )
+    .run(
+      TEST_READER_BARRIER_CHECKSUM,
+      "9".repeat(64),
+      JSON.stringify({
+        accountId: "a".repeat(32),
+        artifacts: [],
+        attestations: [],
+        audience: "nozzle:fictional-test",
+        deployments: [],
+        expectedScriptNames: [],
+        protocolVersion: 1,
+        readerBarrierChecksum: TEST_READER_BARRIER_CHECKSUM,
+        schemaVersion: 1,
+        verifiedAtMs: 1,
+      }),
+    )
+  database
+    .prepare(
       `INSERT INTO "nozzle_saga_outcome_payload_activations"
        ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
        VALUES (1, ?, 1)`,

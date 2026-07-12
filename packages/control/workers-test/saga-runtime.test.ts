@@ -123,6 +123,28 @@ beforeAll(async () => {
     )
     .run()
   await env.DB.prepare(
+    `INSERT INTO "nozzle_reader_barrier_verifications"
+     ("protocol_version", "reader_barrier_checksum", "verification_checksum",
+      "evidence_json", "verified_at_ms") VALUES (1, ?1, ?2, ?3, 1)`,
+  )
+    .bind(
+      "7".repeat(64),
+      "9".repeat(64),
+      JSON.stringify({
+        accountId: "a".repeat(32),
+        artifacts: [],
+        attestations: [],
+        audience: "nozzle:fictional-workerd",
+        deployments: [],
+        expectedScriptNames: [],
+        protocolVersion: 1,
+        readerBarrierChecksum: "7".repeat(64),
+        schemaVersion: 1,
+        verifiedAtMs: 1,
+      }),
+    )
+    .run()
+  await env.DB.prepare(
     `INSERT INTO "nozzle_saga_outcome_payload_activations"
      ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
      VALUES (1, ?1, 1)`,
@@ -180,6 +202,7 @@ describe("real workerd D1 saga projection", () => {
       { schema_version: 3 },
       { schema_version: 4 },
       { schema_version: 5 },
+      { schema_version: 6 },
     ])
     expect(replacementGuards.results).toEqual([
       { name: "nozzle_control_saga_attempt_insert_v2" },
@@ -251,6 +274,7 @@ describe("real workerd D1 saga projection", () => {
       { schema_version: 3 },
       { schema_version: 4 },
       { schema_version: 5 },
+      { schema_version: 6 },
     ])
     expect(replacementGuards.results).toEqual([
       { name: "nozzle_control_irreversible_authorization_body_fence_v3" },

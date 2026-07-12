@@ -1,4 +1,4 @@
-export const CONTROL_SCHEMA_VERSION = 5 as const
+export const CONTROL_SCHEMA_VERSION = 6 as const
 
 export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_audit_log",
@@ -20,6 +20,7 @@ export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_placement_constraints",
   "nozzle_provider_attempt_outcomes",
   "nozzle_provider_attempts",
+  "nozzle_reader_barrier_verifications",
   "nozzle_reader_barriers",
   "nozzle_reader_version_attestations",
   "nozzle_route_overrides",
@@ -671,6 +672,76 @@ WHEN NOT EXISTS (
 )
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_READER_BARRIER_REQUIRED'); END`
 
+const READER_BARRIER_VERIFICATION_TABLE_DEFINITION = `CREATE TABLE "nozzle_reader_barrier_verifications" (
+  "protocol_version" INTEGER PRIMARY KEY NOT NULL CHECK ("protocol_version" = 1),
+  "reader_barrier_checksum" TEXT UNIQUE NOT NULL
+    REFERENCES "nozzle_reader_barriers" ("barrier_checksum") CHECK (
+      length("reader_barrier_checksum") = 64
+        AND "reader_barrier_checksum" NOT GLOB '*[^0-9a-f]*'
+    ),
+  "verification_checksum" TEXT UNIQUE NOT NULL CHECK (
+    length("verification_checksum") = 64
+      AND "verification_checksum" NOT GLOB '*[^0-9a-f]*'
+  ),
+  "evidence_json" TEXT NOT NULL CHECK (
+    json_valid("evidence_json")
+      AND length(CAST("evidence_json" AS BLOB)) BETWEEN 1 AND 1048576
+  ),
+  "verified_at_ms" INTEGER NOT NULL CHECK ("verified_at_ms" >= 0),
+  CHECK (json_extract("evidence_json", '$.schemaVersion') IS 1),
+  CHECK (json_extract("evidence_json", '$.protocolVersion') IS "protocol_version"),
+  CHECK (
+    json_extract("evidence_json", '$.readerBarrierChecksum') IS
+      "reader_barrier_checksum"
+  ),
+  CHECK (json_extract("evidence_json", '$.verifiedAtMs') IS "verified_at_ms"),
+  CHECK (json_type("evidence_json", '$.accountId') IS 'text'),
+  CHECK (json_type("evidence_json", '$.audience') IS 'text'),
+  CHECK (json_type("evidence_json", '$.artifacts') IS 'array'),
+  CHECK (json_type("evidence_json", '$.attestations') IS 'array'),
+  CHECK (json_type("evidence_json", '$.deployments') IS 'array'),
+  CHECK (json_type("evidence_json", '$.expectedScriptNames') IS 'array')
+)`
+
+const READER_BARRIER_VERIFICATION_INSERT_V6_DEFINITION = `CREATE TRIGGER "nozzle_control_reader_barrier_verification_insert_v6"
+BEFORE INSERT ON "nozzle_reader_barrier_verifications"
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 6
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_READER_BARRIER_VERIFICATION_UNPUBLISHED'); END`
+
+const READER_BARRIER_VERIFICATION_UPDATE_DEFINITION = `CREATE TRIGGER "nozzle_control_reader_barrier_verification_update"
+BEFORE UPDATE ON "nozzle_reader_barrier_verifications"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_READER_BARRIER_VERIFICATION_IMMUTABLE'); END`
+
+const READER_BARRIER_VERIFICATION_BINDING_V6_DEFINITION = `CREATE TRIGGER "nozzle_control_reader_barrier_verification_binding_v6"
+BEFORE INSERT ON "nozzle_reader_barrier_verifications"
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_reader_barriers" AS "barrier"
+  WHERE "barrier"."protocol_version" = NEW."protocol_version"
+    AND "barrier"."barrier_checksum" = NEW."reader_barrier_checksum"
+    AND "barrier"."verified_at_ms" <= NEW."verified_at_ms"
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_READER_BARRIER_VERIFICATION_BINDING_REQUIRED'); END`
+
+const READER_BARRIER_VERIFICATION_DELETE_DEFINITION = `CREATE TRIGGER "nozzle_control_reader_barrier_verification_delete"
+BEFORE DELETE ON "nozzle_reader_barrier_verifications"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_READER_BARRIER_VERIFICATION_PERSISTENT'); END`
+
+const SAGA_OUTCOME_PAYLOAD_ACTIVATION_EVIDENCE_V6_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_outcome_payload_activation_evidence_v6"
+BEFORE INSERT ON "nozzle_saga_outcome_payload_activations"
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM "nozzle_reader_barrier_verifications" AS "verification"
+  JOIN "nozzle_reader_barriers" AS "barrier"
+    ON "barrier"."protocol_version" = "verification"."protocol_version"
+   AND "barrier"."barrier_checksum" = "verification"."reader_barrier_checksum"
+  WHERE "verification"."protocol_version" = NEW."protocol_version"
+    AND "verification"."reader_barrier_checksum" = NEW."reader_barrier_checksum"
+    AND "verification"."verified_at_ms" <= NEW."activated_at_ms"
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_SIGNED_EVIDENCE_REQUIRED'); END`
+
 const SAGA_ATTEMPT_V2_BINDING = `EXISTS (
   SELECT 1
   FROM "nozzle_sagas" AS "saga"
@@ -1204,7 +1275,7 @@ ON CONFLICT ("schema_version") DO NOTHING;`,
   `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
 SELECT 0, 0
 WHERE EXISTS (
-  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 5
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 6
 );`,
   `INSERT INTO "nozzle_control_meta" ("schema_version", "installed_at_ms")
 VALUES (1, CAST(unixepoch('subsec') * 1000 AS INTEGER))
@@ -2363,6 +2434,37 @@ WHERE EXISTS (
   `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
 VALUES (5, CAST(unixepoch('subsec') * 1000 AS INTEGER))
 ON CONFLICT ("schema_version") DO NOTHING;`,
+  tableInstallStatement(READER_BARRIER_VERIFICATION_TABLE_DEFINITION),
+  tableDefinitionGuard(READER_BARRIER_VERIFICATION_TABLE_DEFINITION),
+  triggerInstallStatement(READER_BARRIER_VERIFICATION_INSERT_V6_DEFINITION),
+  triggerDefinitionGuard(READER_BARRIER_VERIFICATION_INSERT_V6_DEFINITION),
+  triggerInstallStatement(READER_BARRIER_VERIFICATION_BINDING_V6_DEFINITION),
+  triggerDefinitionGuard(READER_BARRIER_VERIFICATION_BINDING_V6_DEFINITION),
+  triggerInstallStatement(READER_BARRIER_VERIFICATION_UPDATE_DEFINITION),
+  triggerDefinitionGuard(READER_BARRIER_VERIFICATION_UPDATE_DEFINITION),
+  triggerInstallStatement(READER_BARRIER_VERIFICATION_DELETE_DEFINITION),
+  triggerDefinitionGuard(READER_BARRIER_VERIFICATION_DELETE_DEFINITION),
+  triggerInstallStatement(SAGA_OUTCOME_PAYLOAD_ACTIVATION_EVIDENCE_V6_DEFINITION),
+  triggerDefinitionGuard(SAGA_OUTCOME_PAYLOAD_ACTIVATION_EVIDENCE_V6_DEFINITION),
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 6
+)
+AND EXISTS (
+  SELECT 1 FROM "nozzle_reader_barrier_verifications"
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 6
+)
+AND EXISTS (
+  SELECT 1 FROM "nozzle_saga_outcome_payload_activations"
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (6, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`,
 ])
 
 const CONTROL_SCHEMA_VERSION_TWO_PUBLICATION = `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
@@ -2377,11 +2479,36 @@ const CONTROL_SCHEMA_VERSION_FOUR_PUBLICATION = `INSERT INTO "nozzle_control_sch
 VALUES (4, CAST(unixepoch('subsec') * 1000 AS INTEGER))
 ON CONFLICT ("schema_version") DO NOTHING;`
 
+const CONTROL_SCHEMA_VERSION_FIVE_PUBLICATION = `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (5, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`
+
+function versionFiveArtifactStatement(statement: string): string {
+  return statement.includes(
+    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 6',
+  )
+    ? statement.replace('WHERE "schema_version" > 6', 'WHERE "schema_version" > 5')
+    : statement
+}
+
+const versionFivePublicationIndex = CONTROL_SCHEMA_STATEMENTS.indexOf(
+  CONTROL_SCHEMA_VERSION_FIVE_PUBLICATION,
+)
+
+export const CONTROL_SCHEMA_VERSION_FIVE_STATEMENTS = Object.freeze(
+  CONTROL_SCHEMA_STATEMENTS.slice(0, versionFivePublicationIndex + 1).map(
+    versionFiveArtifactStatement,
+  ),
+)
+
+export const CONTROL_SCHEMA_VERSION_FIVE_ARTIFACT_SHA256 =
+  "5850ffaecd12f80f7a74fd50f16119bf741932192119827260b098a03a816f18" as const
+
 function versionFourArtifactStatement(statement: string): string {
   return statement.includes(
-    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 5',
+    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 6',
   )
-    ? statement.replace('WHERE "schema_version" > 5', 'WHERE "schema_version" > 4')
+    ? statement.replace('WHERE "schema_version" > 6', 'WHERE "schema_version" > 4')
     : statement
 }
 
@@ -2400,9 +2527,9 @@ export const CONTROL_SCHEMA_VERSION_FOUR_ARTIFACT_SHA256 =
 
 function versionThreeArtifactStatement(statement: string): string {
   return statement.includes(
-    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 5',
+    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 6',
   )
-    ? statement.replace('WHERE "schema_version" > 5', 'WHERE "schema_version" > 3')
+    ? statement.replace('WHERE "schema_version" > 6', 'WHERE "schema_version" > 3')
     : statement
 }
 
@@ -2421,9 +2548,9 @@ export const CONTROL_SCHEMA_VERSION_THREE_ARTIFACT_SHA256 =
 
 function versionTwoArtifactStatement(statement: string): string {
   return statement.includes(
-    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 5',
+    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 6',
   )
-    ? statement.replace('WHERE "schema_version" > 5', 'WHERE "schema_version" > 2')
+    ? statement.replace('WHERE "schema_version" > 6', 'WHERE "schema_version" > 2')
     : statement
 }
 
@@ -2490,4 +2617,8 @@ export function controlSchemaVersionThreeSql(): string {
 
 export function controlSchemaVersionFourSql(): string {
   return `${CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS.join("\n\n")}\n`
+}
+
+export function controlSchemaVersionFiveSql(): string {
+  return `${CONTROL_SCHEMA_VERSION_FIVE_STATEMENTS.join("\n\n")}\n`
 }

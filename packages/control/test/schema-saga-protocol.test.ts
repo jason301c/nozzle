@@ -786,6 +786,7 @@ describe("control schema saga protocol guards", () => {
         { schema_version: 3 },
         { schema_version: 4 },
         { schema_version: 5 },
+        { schema_version: 6 },
       ])
     } finally {
       database.close()

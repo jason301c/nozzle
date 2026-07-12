@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers"
 import type { DigestFunction } from "@nozzle/core"
 import { describe, expect, it } from "vitest"
 import { D1ReaderBarrierStore, verifyReaderDeploymentBarrier } from "../src/reader-barrier-store.js"
-import { CONTROL_SCHEMA_STATEMENTS } from "../src/schema.js"
+import { CONTROL_SCHEMA_VERSION_FIVE_STATEMENTS } from "../src/schema.js"
 
 declare global {
   namespace Cloudflare {
@@ -21,7 +21,7 @@ const digest: DigestFunction = async (input) => {
 
 describe("real workerd reader deployment barrier", () => {
   it("activates an exact gradual deployment through one transactional D1 batch", async () => {
-    for (const statement of CONTROL_SCHEMA_STATEMENTS) {
+    for (const statement of CONTROL_SCHEMA_VERSION_FIVE_STATEMENTS) {
       await env.BARRIER_DB.prepare(statement).run()
     }
     const capability = await verifyReaderDeploymentBarrier(

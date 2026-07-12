@@ -14,7 +14,7 @@ import {
   type VerifyReaderBarrierInput,
   verifyReaderDeploymentBarrier,
 } from "../src/reader-barrier-store.js"
-import { controlSchemaSql } from "../src/schema.js"
+import { controlSchemaVersionFiveSql } from "../src/schema.js"
 
 const digest: DigestFunction = async (input) => {
   const copy = new Uint8Array(input.byteLength)
@@ -69,7 +69,7 @@ class DatabaseAdapter implements TransactionalControlDatabase {
 
   constructor() {
     this.database.exec("PRAGMA foreign_keys = ON;")
-    this.database.exec(controlSchemaSql())
+    this.database.exec(controlSchemaVersionFiveSql())
   }
 
   async batch(statements: readonly ControlStatement[]): Promise<readonly ControlRunResult[]> {
