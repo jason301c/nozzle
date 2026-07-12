@@ -6,6 +6,7 @@ import {
   readerVersionAttestationSigningBytes,
   type VerifiedReaderDeploymentCapability,
   type VerifiedReaderDeploymentStabilityCapability,
+  verifiedReaderDeploymentEvidence,
   verifiedReaderDeploymentStabilityEvidence,
   verifyReaderDeploymentStability,
 } from "@nozzle/cloudflare"
@@ -252,6 +253,61 @@ class QueryFaultDatabase implements TransactionalControlDatabase {
 
   prepare(sql: string): ControlStatement {
     return new QueryFaultStatement(sql, this.#delegate.prepare(sql), this.#faults)
+  }
+}
+
+class VerificationSequenceStatement implements ControlStatement {
+  readonly #delegate: ControlStatement
+  readonly #next: () => unknown
+  readonly #sql: string
+
+  constructor(sql: string, delegate: ControlStatement, next: () => unknown) {
+    this.#delegate = delegate
+    this.#next = next
+    this.#sql = sql
+  }
+
+  bind(...values: readonly ControlBindingValue[]): ControlStatement {
+    this.#delegate.bind(...values)
+    return this
+  }
+
+  all<T>(): Promise<ControlQueryResult<T>> {
+    return this.#delegate.all<T>()
+  }
+
+  async first<T>(): Promise<T | null> {
+    if (this.#sql.includes('FROM "nozzle_reader_barrier_verifications" WHERE')) {
+      return this.#next() as T | null
+    }
+    return this.#delegate.first<T>()
+  }
+
+  run(): Promise<ControlRunResult> {
+    return this.#delegate.run()
+  }
+}
+
+class VerificationSequenceDatabase implements TransactionalControlDatabase {
+  readonly #delegate: DatabaseAdapter
+  readonly #rows: readonly unknown[]
+  #index = 0
+
+  constructor(delegate: DatabaseAdapter, rows: readonly unknown[]) {
+    this.#delegate = delegate
+    this.#rows = rows
+  }
+
+  batch(statements: readonly ControlStatement[]): Promise<readonly ControlRunResult[]> {
+    return this.#delegate.batch(statements)
+  }
+
+  prepare(sql: string): ControlStatement {
+    return new VerificationSequenceStatement(sql, this.#delegate.prepare(sql), () => {
+      const row = this.#rows[this.#index]
+      this.#index += 1
+      return row
+    })
   }
 }
 
@@ -883,7 +939,9 @@ describe("signed reader-barrier store", () => {
     const source = new DatabaseAdapter()
     const partial = new DatabaseAdapter()
     try {
-      const capability = await signedCapability("legacy-reload")
+      const baseTimeMs = Date.now() - 1_000
+      const capability = await signedCapability("legacy-reload", 0, baseTimeMs)
+      const current = await observedCapability("legacy-reload", 0, 400, baseTimeMs)
       await new D1SignedReaderBarrierStore(source, digest).activate(capability)
       const legacy = await legacyVerification(rawVerification(source.database))
       const legacyStore = new D1SignedReaderBarrierStore(
@@ -892,6 +950,13 @@ describe("signed reader-barrier store", () => {
       )
       await expect(legacyStore.get()).resolves.not.toHaveProperty("stability")
       await expect(legacyStore.activate(capability)).resolves.not.toHaveProperty("stability")
+      await expect(legacyStore.assertCurrent(current)).resolves.not.toHaveProperty("stability")
+      await expect(
+        new D1SignedReaderBarrierStore(
+          new VerificationSequenceDatabase(source, [legacy, null]),
+          digest,
+        ).assertCurrent(current),
+      ).rejects.toThrow(/missing its verification evidence/u)
 
       copyRows(source.database, partial.database, "nozzle_reader_version_attestations", [
         "script_name",
@@ -1289,6 +1354,28 @@ describe("signed reader-barrier store", () => {
       ).rejects.toThrow(/reader-barrier verification exceeds/iu)
     } finally {
       oversizedVerification.close()
+    }
+
+    const oversizedCurrent = new DatabaseAdapter()
+    try {
+      const baseTimeMs = Date.now() - 1_000
+      const stable = await signedCapability("current-size", 0, baseTimeMs)
+      const current = await observedCapability("current-size", 0, 400, baseTimeMs)
+      const store = new D1SignedReaderBarrierStore(oversizedCurrent, digest)
+      await store.activate(stable)
+      const currentEvidence = structuredClone(verifiedReaderDeploymentEvidence(current))
+      const currentBytes = new TextEncoder().encode(JSON.stringify(currentEvidence)).byteLength
+      await expect(
+        withFirstClone(
+          {
+            ...currentEvidence,
+            audience: "x".repeat(1_048_577 - currentBytes + currentEvidence.audience.length),
+          },
+          () => store.assertCurrent(current),
+        ),
+      ).rejects.toThrow(/current signed reader observation exceeds/iu)
+    } finally {
+      oversizedCurrent.close()
     }
   })
 

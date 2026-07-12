@@ -1,14 +1,9 @@
 import { env } from "cloudflare:workers"
-import {
-  createCloudflareWorkerDeploymentClient,
-  createReaderDeploymentVerifier,
-  readerVersionAttestationSigningBytes,
-  verifyReaderDeploymentStability,
-} from "@nozzle/cloudflare"
+import { readerVersionAttestationSigningBytes } from "@nozzle/cloudflare"
 import type { DigestFunction } from "@nozzle/core"
 import { describe, expect, it } from "vitest"
+import { createReaderDeploymentController } from "../src/controller.js"
 import { CONTROL_SCHEMA_STATEMENTS } from "../src/schema.js"
-import { D1SignedReaderBarrierStore } from "../src/signed-reader-barrier-store.js"
 
 declare global {
   namespace Cloudflare {
@@ -51,42 +46,6 @@ describe("real workerd signed reader deployment barrier", () => {
     }
     const baseTimeMs = Date.now() - 1_000
     let observedAtMs = baseTimeMs
-    const client = createCloudflareWorkerDeploymentClient({
-      accountId,
-      apiToken: "fictional-workerd-signed-token",
-      fetch: (async (input: string | URL | Request) => {
-        const url = String(input)
-        if (url.endsWith("/deployments")) {
-          return response({
-            errors: [],
-            messages: [],
-            result: {
-              deployments: [
-                {
-                  created_on: "2026-07-12T00:00:00.000Z",
-                  id: deploymentId,
-                  strategy: "percentage",
-                  versions: [{ percentage: 100, version_id: versionId }],
-                },
-              ],
-            },
-            success: true,
-          })
-        }
-        return response({
-          errors: [],
-          messages: [],
-          result: { id: versionId, resources: { script: { etag: artifactChecksum } } },
-          success: true,
-        })
-      }) as typeof globalThis.fetch,
-      now: () => observedAtMs++,
-    })
-    const deployment = await client.getActiveDeployment(scriptName)
-    const artifact = await client.getVersionArtifact(scriptName, versionId)
-    if (deployment.kind !== "complete" || artifact.kind !== "complete") {
-      throw new Error("Expected complete fictional Cloudflare observations.")
-    }
     const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
       "sign",
       "verify",
@@ -117,38 +76,49 @@ describe("real workerd signed reader deployment barrier", () => {
         ),
       ),
     )
-    let verifiedAtMs = baseTimeMs + 100
-    const verifier = await createReaderDeploymentVerifier({
+    const controller = await createReaderDeploymentController({
       accountId,
+      apiToken: "fictional-workerd-signed-token",
+      attestations: [{ signature, statement }],
       audience: statement.audience,
+      database: env.SIGNED_BARRIER_DB,
+      digest,
+      expectedScriptNames: [scriptName],
+      fetch: (async (input: string | URL | Request) => {
+        const url = String(input)
+        if (url.endsWith("/deployments")) {
+          return response({
+            errors: [],
+            messages: [],
+            result: {
+              deployments: [
+                {
+                  created_on: "2026-07-12T00:00:00.000Z",
+                  id: deploymentId,
+                  strategy: "percentage",
+                  versions: [{ percentage: 100, version_id: versionId }],
+                },
+              ],
+            },
+            success: true,
+          })
+        }
+        return response({
+          errors: [],
+          messages: [],
+          result: { id: versionId, resources: { script: { etag: artifactChecksum } } },
+          success: true,
+        })
+      }) as typeof globalThis.fetch,
       maxAttestationValidityMs: 2_000,
+      maxExternalSubrequests: 50,
       maxObservationAgeMs: 200,
       maxObservationWindowMs: 100,
-      now: () => verifiedAtMs,
+      maxStabilityWindowMs: 5_000,
+      now: () => observedAtMs++,
       trustedKeys: [{ keyId: statement.keyId, publicKeyBase64Url }],
     })
-    const before = await verifier.verify({
-      artifactProofs: [artifact.proof],
-      attestations: [{ signature, statement }],
-      deploymentProofs: [deployment.proof],
-      expectedScriptNames: [scriptName],
-    })
-    observedAtMs = baseTimeMs + 200
-    verifiedAtMs = baseTimeMs + 300
-    const secondDeployment = await client.getActiveDeployment(scriptName)
-    const secondArtifact = await client.getVersionArtifact(scriptName, versionId)
-    if (secondDeployment.kind !== "complete" || secondArtifact.kind !== "complete") {
-      throw new Error("Expected complete fictional Cloudflare reobservations.")
-    }
-    const after = await verifier.verify({
-      artifactProofs: [secondArtifact.proof],
-      attestations: [{ signature, statement }],
-      deploymentProofs: [secondDeployment.proof],
-      expectedScriptNames: [scriptName],
-    })
-    const capability = verifyReaderDeploymentStability(before, after, 5_000)
-    const store = new D1SignedReaderBarrierStore(env.SIGNED_BARRIER_DB, digest)
-    const activated = await store.activate(capability)
+    const activated = await controller.activate()
 
     expect(activated).toMatchObject({
       accountId,
@@ -162,7 +132,7 @@ describe("real workerd signed reader deployment barrier", () => {
       audience: statement.audience,
       protocolVersion: 1,
     })
-    await expect(store.get()).resolves.toEqual(activated)
+    await expect(controller.assertCompatible()).resolves.toEqual(activated)
     await expect(
       env.SIGNED_BARRIER_DB.prepare(
         `SELECT

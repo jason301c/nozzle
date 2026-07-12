@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs"
 import { describe, expect, it } from "vitest"
+import * as controller from "../src/controller.js"
 import * as control from "../src/index.js"
 
 describe("@nozzle/control public API", () => {
@@ -49,13 +50,16 @@ describe("@nozzle/control public API", () => {
     })
   })
 
-  it("publishes only the audited package root rather than internal store subpaths", () => {
+  it("publishes only the audited root and controller composition boundary", () => {
     const manifest = JSON.parse(
       readFileSync(new URL("../package.json", import.meta.url), "utf8"),
     ) as {
       readonly exports: Readonly<Record<string, unknown>>
     }
 
-    expect(Object.keys(manifest.exports)).toEqual(["."])
+    expect(Object.keys(manifest.exports)).toEqual([".", "./controller"])
+    expect(Object.keys(controller)).toEqual(["createReaderDeploymentController"])
+    expect(controller.createReaderDeploymentController).toBeTypeOf("function")
+    expect(controller).not.toHaveProperty("D1SignedReaderBarrierStore")
   })
 })

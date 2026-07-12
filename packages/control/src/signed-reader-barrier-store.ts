@@ -1,7 +1,9 @@
 import {
+  type VerifiedReaderDeploymentCapability,
   type VerifiedReaderDeploymentEvidence,
   type VerifiedReaderDeploymentStabilityCapability,
   type VerifiedReaderDeploymentStabilityEvidence,
+  verifiedReaderDeploymentEvidence,
   verifiedReaderDeploymentStabilityEvidence,
 } from "@nozzle/cloudflare"
 import { type DigestFunction, NozzleError } from "@nozzle/core"
@@ -456,6 +458,26 @@ async function stableSourceState(
       "Reader stability identity",
     ),
   })
+}
+
+async function currentIdentityChecksum(
+  capability: VerifiedReaderDeploymentCapability,
+  digest: DigestFunction,
+): Promise<string> {
+  const evidence = sourceEvidence(
+    captured(verifiedReaderDeploymentEvidence(capability), "Current signed reader observation"),
+    "Current signed reader observation",
+  )
+  const evidenceJson = canonicalJson(evidence, "Current signed reader observation")
+  if (byteLength(evidenceJson) > MAX_EVIDENCE_BYTES) {
+    configuration("Current signed reader observation exceeds its byte limit.")
+  }
+  return digestText(
+    digest,
+    STABILITY_IDENTITY_DOMAIN,
+    canonicalJson(stabilityIdentity(evidence), "Current reader stability identity"),
+    "Current reader stability identity",
+  )
 }
 
 function verificationBody(
@@ -1122,6 +1144,37 @@ export class D1SignedReaderBarrierStore {
       return intervention("Persisted signed reader evidence contradicts its reader barrier.")
     }
     return receipt(normalized, verification)
+  }
+
+  async assertCurrent(
+    capability: VerifiedReaderDeploymentCapability,
+  ): Promise<SignedReaderBarrierReceipt> {
+    const observedIdentityChecksum = await currentIdentityChecksum(capability, this.#digest)
+    const active = await this.get()
+    if (active === undefined) {
+      return intervention("Signed reader deployment has not been activated.")
+    }
+    let expectedIdentityChecksum = active.stability?.identityChecksum
+    if (expectedIdentityChecksum === undefined) {
+      const rawVerification = await this.#rawVerification()
+      if (rawVerification === null) {
+        return intervention("Signed reader activation is missing its verification evidence.")
+      }
+      const verification = await decodeVerificationRow(rawVerification, this.#digest)
+      expectedIdentityChecksum = await digestText(
+        this.#digest,
+        STABILITY_IDENTITY_DOMAIN,
+        canonicalJson(
+          stabilityIdentity(verification.sourceEvidence),
+          "Activated reader stability identity",
+        ),
+        "Activated reader stability identity",
+      )
+    }
+    if (observedIdentityChecksum !== expectedIdentityChecksum) {
+      return intervention("Active reader deployment drifted from its verified activation.")
+    }
+    return active
   }
 
   async activate(
