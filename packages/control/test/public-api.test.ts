@@ -15,6 +15,7 @@ describe("@nozzle/control public API", () => {
     for (const internal of [
       "acceptedSagaAttemptRecord",
       "D1ReaderBarrierStore",
+      "D1SignedReaderBarrierStore",
       "D1SagaHistoryReader",
       "D1SagaTerminalStore",
       "finalizeSagaHistoryProof",
@@ -36,6 +37,7 @@ describe("@nozzle/control public API", () => {
       "SAGA_OUTCOME_EVIDENCE_REFERENCE_JSON",
       "SAGA_OUTCOME_OUTPUT_REFERENCE_JSON",
       "verifyReaderDeploymentBarrier",
+      "readerBarrierCapabilityState",
     ]) {
       expect(exports).not.toHaveProperty(internal)
     }

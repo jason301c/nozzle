@@ -60,6 +60,9 @@ importers:
 
   packages/control:
     dependencies:
+      '@nozzle/cloudflare':
+        specifier: workspace:*
+        version: link:../cloudflare
       '@nozzle/core':
         specifier: workspace:*
         version: link:../core

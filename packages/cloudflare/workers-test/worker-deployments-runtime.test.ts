@@ -123,7 +123,7 @@ describe("real workerd Worker-deployment transport", () => {
     const statements = observation.deployment.versions.map(({ versionId }, index) => ({
       artifactChecksum: (index === 0 ? "1" : "2").repeat(64),
       audience: "nozzle:fictional-workerd",
-      controlSchemaMax: 5,
+      controlSchemaMax: 6,
       controlSchemaMin: 5,
       expiresAtMs: 1_500,
       issuedAtMs: 900,

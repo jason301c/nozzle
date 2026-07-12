@@ -16,6 +16,7 @@
   "sideEffects": false,
   "license": "UNLICENSED",
   "dependencies": {
+    "@nozzle/cloudflare": "workspace:*",
     "@nozzle/core": "workspace:*"
   }
 }

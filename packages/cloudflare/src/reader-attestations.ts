@@ -4,6 +4,7 @@ import {
   type ActiveWorkerDeploymentProofState,
   activeWorkerDeploymentProofState,
 } from "./worker-deployment-proof.js"
+import type { WorkerDeploymentObservationEvidence } from "./worker-deployments.js"
 import {
   type WorkerVersionArtifactProof,
   type WorkerVersionArtifactProofState,
@@ -18,6 +19,8 @@ const MAX_ACTIVE_VERSIONS = MAX_READERS * 2
 const MAX_TRUST_KEYS = 64
 const MAX_OBSERVATION_TIME_MS = 5 * 60 * 1_000
 const MAX_ATTESTATION_VALIDITY_MS = 30 * 24 * 60 * 60 * 1_000
+const REQUIRED_CONTROL_SCHEMA_MAX = 6
+const REQUIRED_CONTROL_SCHEMA_MIN = 5
 
 export interface ReaderVersionAttestationStatement {
   readonly artifactChecksum: string
@@ -70,6 +73,7 @@ export interface VerifiedReaderAttestation {
   readonly keyId: string
   readonly outcomePayloadReaderMax: number
   readonly outcomePayloadReaderMin: number
+  readonly publicKeyBase64Url: string
   readonly signature: string
   readonly scriptName: string
   readonly versionId: string
@@ -77,15 +81,15 @@ export interface VerifiedReaderAttestation {
 
 export interface VerifiedReaderArtifact {
   readonly artifactChecksum: string
-  readonly completedAtMs: number
-  readonly responseChecksum: string
+  readonly observation: WorkerDeploymentObservationEvidence
   readonly scriptName: string
-  readonly startedAtMs: number
   readonly versionId: string
 }
 
 export interface VerifiedReaderDeployment {
+  readonly createdAtMs: number
   readonly deploymentId: string
+  readonly observation: WorkerDeploymentObservationEvidence
   readonly scriptName: string
   readonly versions: readonly {
     readonly versionId: string
@@ -94,6 +98,7 @@ export interface VerifiedReaderDeployment {
 }
 
 export interface VerifiedReaderDeploymentEvidence {
+  readonly accountId: string
   readonly artifacts: readonly VerifiedReaderArtifact[]
   readonly attestations: readonly VerifiedReaderAttestation[]
   readonly audience: string
@@ -101,6 +106,7 @@ export interface VerifiedReaderDeploymentEvidence {
   readonly expectedScriptNames: readonly string[]
   readonly observedFromMs: number
   readonly observedThroughMs: number
+  readonly schemaVersion: 1
   readonly verifiedAtMs: number
 }
 
@@ -365,7 +371,7 @@ function capturedVerificationInput(input: ReaderDeploymentVerificationInput): {
 function observedArtifactProof(
   proof: WorkerVersionArtifactProof,
   accountId: string,
-): { readonly responseChecksum: string; readonly state: WorkerVersionArtifactProofState } {
+): WorkerVersionArtifactProofState {
   const state = workerVersionArtifactProofState(proof)
   if (state === undefined) configuration("A live Worker-version artifact proof is required.")
   if (state.accountId !== accountId) {
@@ -384,7 +390,7 @@ function observedArtifactProof(
   ) {
     intervention("Worker-version artifact proof evidence is malformed.")
   }
-  return { responseChecksum: evidence.responseChecksum, state }
+  return state
 }
 
 function observedProof(
@@ -449,18 +455,20 @@ export async function createReaderDeploymentVerifier(
   if (keyInput.length < 1 || keyInput.length > MAX_TRUST_KEYS) {
     configuration(`Reader attestation trust must contain between 1 and ${MAX_TRUST_KEYS} keys.`)
   }
-  const rawKeys: { readonly keyId: string; readonly publicKey: Uint8Array }[] = []
+  const rawKeys: {
+    readonly keyId: string
+    readonly publicKey: Uint8Array
+    readonly publicKeyBase64Url: string
+  }[] = []
   const keyIds = new Set<string>()
   for (const candidate of keyInput) {
     const key = exactRecord(candidate, ["keyId", "publicKeyBase64Url"], "Reader trust key")
     const keyId = identifier(key.keyId, "Reader attestation key ID", 128)
     if (keyIds.has(keyId)) configuration("Reader attestation key IDs must be unique.")
     keyIds.add(keyId)
+    const publicKey = base64UrlBytes(key.publicKeyBase64Url, 32, "Ed25519 public key")
     rawKeys.push(
-      Object.freeze({
-        keyId,
-        publicKey: base64UrlBytes(key.publicKeyBase64Url, 32, "Ed25519 public key"),
-      }),
+      Object.freeze({ keyId, publicKey, publicKeyBase64Url: encodeBase64Url(publicKey) }),
     )
   }
   let imported: readonly CryptoKey[]
@@ -473,7 +481,12 @@ export async function createReaderDeploymentVerifier(
   } catch {
     return configuration("Reader attestation public keys could not be imported as Ed25519 keys.")
   }
-  const keys = new Map(rawKeys.map(({ keyId }, index) => [keyId, imported[index] as CryptoKey]))
+  const keys = new Map(
+    rawKeys.map(({ keyId, publicKeyBase64Url }, index) => [
+      keyId,
+      Object.freeze({ cryptoKey: imported[index] as CryptoKey, publicKeyBase64Url }),
+    ]),
+  )
 
   async function verify(
     untrustedInput: ReaderDeploymentVerificationInput,
@@ -517,7 +530,9 @@ export async function createReaderDeploymentVerifier(
       versions.sort((left, right) => binaryTextOrder(left.versionId, right.versionId))
       deployments.push(
         Object.freeze({
+          createdAtMs: deployment.createdAtMs,
           deploymentId: deployment.deploymentId,
+          observation: evidence,
           scriptName: deployment.scriptName,
           versions: Object.freeze(versions),
         }),
@@ -538,7 +553,7 @@ export async function createReaderDeploymentVerifier(
     const artifacts: VerifiedReaderArtifact[] = []
     const artifactChecksums = new Map<string, string>()
     for (const proof of input.artifactProofs) {
-      const { responseChecksum, state } = observedArtifactProof(proof, accountId)
+      const state = observedArtifactProof(proof, accountId)
       const { artifact, evidence } = state
       const key = proofKey(artifact.scriptName, artifact.versionId)
       if (artifactChecksums.has(key)) {
@@ -553,10 +568,8 @@ export async function createReaderDeploymentVerifier(
       artifacts.push(
         Object.freeze({
           artifactChecksum: artifact.artifactChecksum,
-          completedAtMs: evidence.completedAtMs,
-          responseChecksum,
+          observation: evidence,
           scriptName: artifact.scriptName,
-          startedAtMs: evidence.startedAtMs,
           versionId: artifact.versionId,
         }),
       )
@@ -606,15 +619,15 @@ export async function createReaderDeploymentVerifier(
           statement.issuedAtMs > observedFromMs ||
           statement.expiresAtMs <= verifiedAtMs ||
           statement.expiresAtMs - statement.issuedAtMs > maxAttestationValidityMs ||
-          statement.controlSchemaMin > 5 ||
-          statement.controlSchemaMax < 5 ||
+          statement.controlSchemaMin > REQUIRED_CONTROL_SCHEMA_MIN ||
+          statement.controlSchemaMax < REQUIRED_CONTROL_SCHEMA_MAX ||
           statement.outcomePayloadReaderMin !== 1 ||
           statement.outcomePayloadReaderMax < 1
         ) {
           intervention("A signed reader attestation is out of scope, stale, or incompatible.")
         }
-        const publicKey = keys.get(statement.keyId)
-        if (publicKey === undefined) {
+        const trustedKey = keys.get(statement.keyId)
+        if (trustedKey === undefined) {
           intervention("A signed reader attestation uses an untrusted key ID.")
         }
         const signature = base64UrlBytes(envelope.signature, 64, "Ed25519 signature")
@@ -622,7 +635,7 @@ export async function createReaderDeploymentVerifier(
         try {
           valid = await subtle.verify(
             { name: "Ed25519" },
-            publicKey,
+            trustedKey.cryptoKey,
             signature,
             canonical.signingBytes,
           )
@@ -640,6 +653,7 @@ export async function createReaderDeploymentVerifier(
             keyId: statement.keyId,
             outcomePayloadReaderMax: statement.outcomePayloadReaderMax,
             outcomePayloadReaderMin: statement.outcomePayloadReaderMin,
+            publicKeyBase64Url: trustedKey.publicKeyBase64Url,
             signature: encodeBase64Url(signature),
             scriptName: statement.scriptName,
             versionId: statement.versionId,
@@ -652,6 +666,7 @@ export async function createReaderDeploymentVerifier(
       return scriptOrder === 0 ? binaryTextOrder(left.versionId, right.versionId) : scriptOrder
     })
     const evidence = Object.freeze({
+      accountId,
       artifacts: Object.freeze(artifacts),
       attestations: Object.freeze(attestations),
       audience,
@@ -659,6 +674,7 @@ export async function createReaderDeploymentVerifier(
       expectedScriptNames: Object.freeze(expectedScriptNames),
       observedFromMs,
       observedThroughMs,
+      schemaVersion: 1 as const,
       verifiedAtMs,
     })
     const capability = Object.freeze({})

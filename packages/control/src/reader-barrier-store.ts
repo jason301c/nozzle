@@ -58,7 +58,7 @@ interface CanonicalAttestation extends ReaderVersionAttestationInput {
   readonly attestationJson: string
 }
 
-interface BarrierState {
+export interface CanonicalReaderBarrierState {
   readonly activeDeployments: readonly ActiveReaderDeploymentInput[]
   readonly attestationMutationJson: string
   readonly attestations: readonly CanonicalAttestation[]
@@ -103,7 +103,7 @@ interface PartialAttestationRow extends AttestationRow {
   readonly observed_at_ms: unknown
 }
 
-const capabilityStates = new WeakMap<object, BarrierState>()
+const capabilityStates = new WeakMap<object, CanonicalReaderBarrierState>()
 
 function configuration(message: string): never {
   throw new NozzleError("ConfigurationError", message)
@@ -264,7 +264,7 @@ function freezeDeployment(
 async function canonicalBarrier(
   input: VerifyReaderBarrierInput,
   digest: DigestFunction,
-): Promise<BarrierState> {
+): Promise<CanonicalReaderBarrierState> {
   const root = exactRecord(
     input,
     ["attestations", "deployments", "expectedScriptNames"],
@@ -488,7 +488,9 @@ export async function verifyReaderDeploymentBarrier(
   return capability
 }
 
-function capabilityState(capability: ReaderBarrierCapability): BarrierState {
+export function readerBarrierCapabilityState(
+  capability: ReaderBarrierCapability,
+): CanonicalReaderBarrierState {
   if (typeof capability !== "object" || capability === null) {
     configuration("A live reader-barrier capability is required.")
   }
@@ -518,7 +520,7 @@ function parsedJson(value: string, label: string): unknown {
 }
 
 function receipt(
-  state: BarrierState,
+  state: CanonicalReaderBarrierState,
   activatedAtMs: number,
   verifiedAtMs: number,
 ): ReaderBarrierReceipt {
@@ -586,7 +588,7 @@ export class D1ReaderBarrierStore {
     this.#digest = digest
   }
 
-  async #assertCompatiblePartialState(state: BarrierState): Promise<void> {
+  async #assertCompatiblePartialState(state: CanonicalReaderBarrierState): Promise<void> {
     const rawBarrier = await this.#database
       .prepare(
         `SELECT "protocol_version", "barrier_checksum", "inventory_checksum", "barrier_json",
@@ -781,7 +783,7 @@ export class D1ReaderBarrierStore {
         versionId: persistedText(attestation.version_id, "Persisted reader version ID"),
       })
     }
-    let state: BarrierState
+    let state: CanonicalReaderBarrierState
     try {
       state = await canonicalBarrier(
         {
@@ -812,7 +814,7 @@ export class D1ReaderBarrierStore {
   }
 
   async activate(capability: ReaderBarrierCapability): Promise<ReaderBarrierReceipt> {
-    const state = capabilityState(capability)
+    const state = readerBarrierCapabilityState(capability)
     const existing = await this.get()
     if (existing !== undefined) {
       if (existing.barrierChecksum !== state.barrierChecksum) {
@@ -928,5 +930,9 @@ export class D1ReaderBarrierStore {
       return intervention("Saga-outcome payload activation is bound to another reader barrier.")
     }
     return activated
+  }
+
+  async assertCompatible(capability: ReaderBarrierCapability): Promise<void> {
+    await this.#assertCompatiblePartialState(readerBarrierCapabilityState(capability))
   }
 }

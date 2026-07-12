@@ -7,7 +7,7 @@ export default defineConfig({
       miniflare: {
         compatibilityDate: "2026-07-08",
         compatibilityFlags: ["nodejs_compat"],
-        d1Databases: ["BARRIER_DB", "DB", "UPGRADE_DB", "V1_UPGRADE_DB"],
+        d1Databases: ["BARRIER_DB", "DB", "SIGNED_BARRIER_DB", "UPGRADE_DB", "V1_UPGRADE_DB"],
       },
     }),
   ],

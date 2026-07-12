@@ -63,7 +63,7 @@ function statement(
   return {
     artifactChecksum: "1".repeat(64),
     audience,
-    controlSchemaMax: 5,
+    controlSchemaMax: 6,
     controlSchemaMin: 5,
     expiresAtMs: 1_500,
     issuedAtMs: 900,
@@ -341,9 +341,11 @@ describe("signed active-reader convergence", () => {
     expect(Object.keys(capability)).toEqual([])
     const evidence = verifiedReaderDeploymentEvidence(capability)
     expect(evidence).toMatchObject({
+      accountId,
       artifacts: [
         {
           artifactChecksum: "1".repeat(64),
+          observation: { responseChecksum: "4".repeat(64) },
           scriptName: controllerScript,
           versionId: versionA,
         },
@@ -363,6 +365,7 @@ describe("signed active-reader convergence", () => {
           expiresAtMs: 1_500,
           issuedAtMs: 900,
           keyId: "release-key",
+          publicKeyBase64Url: trustKey.publicKeyBase64Url,
           scriptName: controllerScript,
           signature: expect.stringMatching(/^[A-Za-z0-9_-]{86}$/u),
           versionId: versionA,
@@ -373,7 +376,9 @@ describe("signed active-reader convergence", () => {
       audience,
       deployments: [
         {
+          createdAtMs: 800,
           deploymentId: controllerDeployment,
+          observation: { responseChecksum: "2".repeat(64) },
           scriptName: controllerScript,
           versions: [
             { versionId: versionA, weightBps: 2_500 },
@@ -385,6 +390,7 @@ describe("signed active-reader convergence", () => {
       expectedScriptNames: [controllerScript, routerScript],
       observedFromMs: 1_000,
       observedThroughMs: 1_003,
+      schemaVersion: 1,
       verifiedAtMs: 1_100,
     })
     expect(Object.isFrozen(evidence)).toBe(true)
@@ -766,7 +772,7 @@ describe("signed active-reader convergence", () => {
       { expiresAtMs: 1_100 },
       { expiresAtMs: 2_000 },
       { controlSchemaMin: 6, controlSchemaMax: 6 },
-      { controlSchemaMax: 4, controlSchemaMin: 4 },
+      { controlSchemaMax: 5, controlSchemaMin: 5 },
       { outcomePayloadReaderMin: 2, outcomePayloadReaderMax: 2 },
     ]
     for (const override of incompatible) {
