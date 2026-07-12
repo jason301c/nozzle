@@ -43,6 +43,19 @@ function deployment(
   }
 }
 
+function versionEnvelope(overrides: Readonly<Record<string, unknown>> = {}): unknown {
+  return {
+    errors: [],
+    messages: [],
+    result: {
+      id: versionA,
+      resources: { script: { etag: "1".repeat(64) } },
+      ...overrides,
+    },
+    success: true,
+  }
+}
+
 function fetchFrom(
   handler: (url: string, init: RequestInit) => Response | Promise<Response>,
 ): typeof globalThis.fetch {
@@ -124,6 +137,107 @@ describe("Cloudflare Worker deployment client configuration", () => {
     await expect(provider.getActiveDeployment("reader-\u{10000}")).resolves.toMatchObject({
       kind: "complete",
     })
+    for (const versionId of ["", "not-a-version", versionA.toUpperCase()]) {
+      await expect(provider.getVersionArtifact("reader", versionId)).rejects.toThrow()
+    }
+    await expect(provider.getVersionArtifact("", versionA)).rejects.toThrow()
+    await expect(provider.getVersionArtifact("reader", versionA, null as never)).rejects.toThrow()
+  })
+})
+
+describe("Cloudflare Worker-version artifact observation", () => {
+  it("normalizes, freezes, and account-binds the documented script etag", async () => {
+    const calls: { init: RequestInit; url: string }[] = []
+    const abort = new AbortController()
+    const provider = client((url, init) => {
+      calls.push({ init, url })
+      return jsonResponse(versionEnvelope(), 200, { "cf-ray": "fictional-version-ray" })
+    })
+    const result = await provider.getVersionArtifact("reader name/edge", versionA, {
+      signal: abort.signal,
+    })
+
+    expect(result).toMatchObject({
+      artifact: {
+        artifactChecksum: "1".repeat(64),
+        scriptName: "reader name/edge",
+        versionId: versionA,
+      },
+      evidence: { bodyState: "complete", cfRay: "fictional-version-ray", status: 200 },
+      kind: "complete",
+    })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.url).toBe(
+      `${"https://api.cloudflare.com/client/v4/accounts"}/${accountId}/workers/scripts/reader%20name%2Fedge/versions/${versionA}`,
+    )
+    expect(calls[0]?.init).toMatchObject({ method: "GET", redirect: "error", signal: abort.signal })
+    expect(new Headers(calls[0]?.init.headers).get("authorization")).toBe("Bearer fictional-token")
+    expect(Object.isFrozen(result)).toBe(true)
+    if (result.kind !== "complete") throw new Error("Expected a complete artifact observation.")
+    expect(Object.isFrozen(result.artifact)).toBe(true)
+    expect(Object.isFrozen(result.proof)).toBe(true)
+    expect(Object.keys(result.proof)).toEqual([])
+  })
+
+  it("distinguishes absent optional artifact metadata", async () => {
+    for (const result of [
+      { id: versionA, resources: undefined },
+      { id: versionA, resources: {} },
+      { id: versionA, resources: { script: {} } },
+    ]) {
+      await expect(
+        client(() => jsonResponse(versionEnvelope(result))).getVersionArtifact("reader", versionA),
+      ).resolves.toMatchObject({ kind: "inconclusive", reason: "missing_artifact" })
+    }
+  })
+
+  it("rejects malformed version envelopes, identities, resources, and etags", async () => {
+    const malformed: readonly unknown[] = [
+      [],
+      { result: { id: versionA }, success: false },
+      { result: null, success: true },
+      versionEnvelope({ id: "bad-version" }),
+      versionEnvelope({ id: versionB }),
+      versionEnvelope({ resources: null }),
+      versionEnvelope({ resources: { script: null } }),
+      versionEnvelope({ resources: { script: { etag: null } } }),
+      versionEnvelope({ resources: { script: { etag: "bad" } } }),
+      versionEnvelope({ resources: { script: { etag: "A".repeat(64) } } }),
+    ]
+    for (const body of malformed) {
+      await expect(
+        client(() => jsonResponse(body)).getVersionArtifact("reader", versionA),
+      ).resolves.toMatchObject({ kind: "inconclusive", reason: "malformed_response" })
+    }
+  })
+
+  it("keeps retry, rejection, transport, and bounded-body failures inconclusive", async () => {
+    await expect(
+      client(() =>
+        jsonResponse({ errors: [{ code: 1000, message: "try later" }], success: false }, 429, {
+          "retry-after": "1",
+        }),
+      ).getVersionArtifact("reader", versionA),
+    ).resolves.toMatchObject({ kind: "inconclusive", reason: "retry_required" })
+    await expect(
+      client(() => jsonResponse({ errors: [], success: false }, 403)).getVersionArtifact(
+        "reader",
+        versionA,
+      ),
+    ).resolves.toMatchObject({ kind: "inconclusive", reason: "provider_rejected" })
+    await expect(
+      client(() => {
+        throw new Error("network unavailable")
+      }).getVersionArtifact("reader", versionA),
+    ).resolves.toMatchObject({ kind: "inconclusive", reason: "transport_error" })
+    await expect(
+      client(() => rawResponse(null)).getVersionArtifact("reader", versionA),
+    ).resolves.toMatchObject({ kind: "inconclusive", reason: "malformed_response" })
+    await expect(
+      client(() => rawResponse(new Uint8Array(1_025)), {
+        maxResponseBytes: 1_024,
+      }).getVersionArtifact("reader", versionA),
+    ).resolves.toMatchObject({ kind: "inconclusive", reason: "malformed_response" })
   })
 })
 

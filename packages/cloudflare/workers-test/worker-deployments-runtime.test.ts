@@ -42,6 +42,21 @@ function activeResponse(): Response {
   )
 }
 
+function versionResponse(versionId: string, artifactChecksum: string): Response {
+  return new Response(
+    JSON.stringify({
+      errors: [],
+      messages: [],
+      result: {
+        id: versionId,
+        resources: { script: { etag: artifactChecksum } },
+      },
+      success: true,
+    }),
+    { headers: { "content-type": "application/json" }, status: 200 },
+  )
+}
+
 describe("real workerd Worker-deployment transport", () => {
   it("normalizes the documented active gradual-deployment response", async () => {
     let observedAuthorization: string | null = null
@@ -77,11 +92,27 @@ describe("real workerd Worker-deployment transport", () => {
     const client = createCloudflareWorkerDeploymentClient({
       accountId: "a".repeat(32),
       apiToken: "fictional-workerd-token",
-      fetch: (async () => activeResponse()) as typeof globalThis.fetch,
+      fetch: (async (input: string | URL | Request) => {
+        const url = String(input)
+        if (!url.includes("/versions/")) return activeResponse()
+        const versionId = url.slice(url.lastIndexOf("/") + 1)
+        return versionResponse(
+          versionId,
+          (versionId === "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" ? "1" : "2").repeat(64),
+        )
+      }) as typeof globalThis.fetch,
       now: () => time++,
     })
     const observation = await client.getActiveDeployment("nozzle-controller")
     if (observation.kind !== "complete") throw new Error("Expected a complete observation.")
+    const artifactObservations = await Promise.all(
+      observation.deployment.versions.map(({ versionId }) =>
+        client.getVersionArtifact("nozzle-controller", versionId),
+      ),
+    )
+    if (artifactObservations.some((item) => item.kind !== "complete")) {
+      throw new Error("Expected complete artifact observations.")
+    }
     const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
       "sign",
       "verify",
@@ -127,6 +158,10 @@ describe("real workerd Worker-deployment transport", () => {
       trustedKeys: [{ keyId: "workerd-release-key", publicKeyBase64Url }],
     })
     const capability = await verifier.verify({
+      artifactProofs: artifactObservations.map((item) => {
+        if (item.kind !== "complete") throw new Error("Expected complete artifact evidence.")
+        return item.proof
+      }),
       attestations,
       deploymentProofs: [observation.proof],
       expectedScriptNames: ["nozzle-controller"],

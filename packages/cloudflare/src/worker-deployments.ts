@@ -9,12 +9,18 @@ import {
   type ActiveWorkerDeploymentProof,
   createActiveWorkerDeploymentProof,
 } from "./worker-deployment-proof.js"
+import {
+  createWorkerVersionArtifactProof,
+  type WorkerVersionArtifactProof,
+} from "./worker-version-proof.js"
 
 export type { ActiveWorkerDeploymentProof } from "./worker-deployment-proof.js"
+export type { WorkerVersionArtifactProof } from "./worker-version-proof.js"
 
 const CLOUDFLARE_API_ORIGIN = "https://api.cloudflare.com/client/v4"
 const DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u
+const CHECKSUM = /^[0-9a-f]{64}$/u
 const UTC_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/u
 
 export interface ActiveWorkerVersion {
@@ -27,6 +33,12 @@ export interface ActiveWorkerDeployment {
   readonly deploymentId: string
   readonly scriptName: string
   readonly versions: readonly ActiveWorkerVersion[]
+}
+
+export interface WorkerVersionArtifact {
+  readonly artifactChecksum: string
+  readonly scriptName: string
+  readonly versionId: string
 }
 
 export interface WorkerDeploymentObservationEvidence {
@@ -60,11 +72,35 @@ export type ActiveWorkerDeploymentObservation =
         | "transport_error"
     }
 
+export type WorkerVersionArtifactObservation =
+  | {
+      readonly artifact: WorkerVersionArtifact
+      readonly evidence: WorkerDeploymentObservationEvidence
+      readonly kind: "complete"
+      readonly proof: WorkerVersionArtifactProof
+    }
+  | {
+      readonly errors: readonly ProviderErrorSummary[]
+      readonly evidence: WorkerDeploymentObservationEvidence
+      readonly kind: "inconclusive"
+      readonly reason:
+        | "malformed_response"
+        | "missing_artifact"
+        | "provider_rejected"
+        | "retry_required"
+        | "transport_error"
+    }
+
 export interface CloudflareWorkerDeploymentClient {
   getActiveDeployment(
     scriptName: string,
     options?: { readonly signal?: AbortSignal },
   ): Promise<ActiveWorkerDeploymentObservation>
+  getVersionArtifact(
+    scriptName: string,
+    versionId: string,
+    options?: { readonly signal?: AbortSignal },
+  ): Promise<WorkerVersionArtifactObservation>
 }
 
 export interface CloudflareWorkerDeploymentClientOptions {
@@ -334,6 +370,34 @@ function decodeDeploymentEnvelope(
   return decodeActiveDeployment(deployments[0], scriptName)
 }
 
+function decodeVersionArtifactEnvelope(
+  value: unknown,
+  scriptName: string,
+  expectedVersionId: string,
+): WorkerVersionArtifact | undefined {
+  if (!plainRecord(value) || value.success !== true || !plainRecord(value.result)) {
+    configuration("Cloudflare returned a malformed Worker-version envelope.")
+  }
+  const versionId = uuid(value.result.id, "Worker version ID")
+  if (versionId !== expectedVersionId) {
+    configuration("Cloudflare returned the wrong Worker version.")
+  }
+  if (value.result.resources === undefined) return undefined
+  if (!plainRecord(value.result.resources)) {
+    configuration("Cloudflare returned malformed Worker-version resources.")
+  }
+  if (value.result.resources.script === undefined) return undefined
+  if (!plainRecord(value.result.resources.script)) {
+    configuration("Cloudflare returned malformed Worker-version script metadata.")
+  }
+  if (value.result.resources.script.etag === undefined) return undefined
+  const artifactChecksum = value.result.resources.script.etag
+  if (typeof artifactChecksum !== "string" || !CHECKSUM.test(artifactChecksum)) {
+    configuration("Cloudflare returned a malformed Worker-version artifact checksum.")
+  }
+  return Object.freeze({ artifactChecksum, scriptName, versionId })
+}
+
 export function createCloudflareWorkerDeploymentClient(
   options: CloudflareWorkerDeploymentClientOptions,
 ): CloudflareWorkerDeploymentClient {
@@ -356,13 +420,14 @@ export function createCloudflareWorkerDeploymentClient(
 
   async function attempt(
     scriptName: string,
+    suffix: string,
     signal: AbortSignal | undefined,
   ): Promise<RawObservation> {
     const startedAtMs = safeClock(now)
     let response: Response
     try {
       response = await fetchImplementation(
-        `${accountPath}/${encodeURIComponent(scriptName)}/deployments`,
+        `${accountPath}/${encodeURIComponent(scriptName)}/${suffix}`,
         {
           headers: new Headers({
             Accept: "application/json",
@@ -431,7 +496,7 @@ export function createCloudflareWorkerDeploymentClient(
   ): Promise<ActiveWorkerDeploymentObservation> {
     nonEmpty(scriptName, "Cloudflare Worker script name", 255)
     if (!plainRecord(callOptions)) configuration("Worker deployment call options are malformed.")
-    const result = await attempt(scriptName, callOptions.signal)
+    const result = await attempt(scriptName, "deployments", callOptions.signal)
     const retryAfterMs = result.evidence.rateLimit.retryAfterMs
     const decision = classifyProviderAttempt({
       mutating: false,
@@ -489,5 +554,71 @@ export function createCloudflareWorkerDeploymentClient(
     }
   }
 
-  return Object.freeze({ getActiveDeployment })
+  async function getVersionArtifact(
+    scriptName: string,
+    versionId: string,
+    callOptions: { readonly signal?: AbortSignal } = {},
+  ): Promise<WorkerVersionArtifactObservation> {
+    nonEmpty(scriptName, "Cloudflare Worker script name", 255)
+    const normalizedVersionId = uuid(versionId, "Cloudflare Worker version ID")
+    if (!plainRecord(callOptions)) configuration("Worker version call options are malformed.")
+    const result = await attempt(
+      scriptName,
+      `versions/${encodeURIComponent(normalizedVersionId)}`,
+      callOptions.signal,
+    )
+    const retryAfterMs = result.evidence.rateLimit.retryAfterMs
+    const decision = classifyProviderAttempt({
+      mutating: false,
+      ...(retryAfterMs === undefined ? {} : { retryAfter: String(retryAfterMs / 1_000) }),
+      status: result.evidence.status,
+    })
+    if (decision.disposition !== "success") {
+      return Object.freeze({
+        errors: freezeErrors(result.body),
+        evidence: result.evidence,
+        kind: "inconclusive",
+        reason:
+          result.evidence.status === null
+            ? "transport_error"
+            : decision.disposition === "retry"
+              ? "retry_required"
+              : "provider_rejected",
+      })
+    }
+    if (result.evidence.bodyState !== "complete" || result.body === undefined) {
+      return Object.freeze({
+        errors: freezeErrors(result.body),
+        evidence: result.evidence,
+        kind: "inconclusive",
+        reason: "malformed_response",
+      })
+    }
+    try {
+      const artifact = decodeVersionArtifactEnvelope(result.body, scriptName, normalizedVersionId)
+      if (artifact === undefined) {
+        return Object.freeze({
+          errors: freezeErrors(result.body),
+          evidence: result.evidence,
+          kind: "inconclusive",
+          reason: "missing_artifact",
+        })
+      }
+      return Object.freeze({
+        artifact,
+        evidence: result.evidence,
+        kind: "complete",
+        proof: createWorkerVersionArtifactProof({ accountId, artifact, evidence: result.evidence }),
+      })
+    } catch {
+      return Object.freeze({
+        errors: freezeErrors(result.body),
+        evidence: result.evidence,
+        kind: "inconclusive",
+        reason: "malformed_response",
+      })
+    }
+  }
+
+  return Object.freeze({ getActiveDeployment, getVersionArtifact })
 }

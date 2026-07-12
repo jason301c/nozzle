@@ -9,5 +9,7 @@ describe("@nozzle/cloudflare public API", () => {
     expect(exports.verifiedReaderDeploymentEvidence).toBeTypeOf("function")
     expect(exports).not.toHaveProperty("createActiveWorkerDeploymentProof")
     expect(exports).not.toHaveProperty("activeWorkerDeploymentProofState")
+    expect(exports).not.toHaveProperty("createWorkerVersionArtifactProof")
+    expect(exports).not.toHaveProperty("workerVersionArtifactProofState")
   })
 })

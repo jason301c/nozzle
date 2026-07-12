@@ -13,6 +13,10 @@ import {
   type ActiveWorkerDeploymentProofState,
   createActiveWorkerDeploymentProof,
 } from "../src/worker-deployment-proof.js"
+import {
+  createWorkerVersionArtifactProof,
+  type WorkerVersionArtifactProofState,
+} from "../src/worker-version-proof.js"
 
 const accountId = "a".repeat(32)
 const audience = "nozzle:fictional-environment"
@@ -117,6 +121,31 @@ function proof(
   })
 }
 
+function artifactProof(
+  scriptName = controllerScript,
+  versionId = versionA,
+  artifactChecksum = "1".repeat(64),
+  overrides: {
+    readonly accountId?: string
+    readonly evidence?: Readonly<Partial<WorkerVersionArtifactProofState["evidence"]>>
+  } = {},
+) {
+  return createWorkerVersionArtifactProof({
+    accountId: overrides.accountId ?? accountId,
+    artifact: Object.freeze({ artifactChecksum, scriptName, versionId }),
+    evidence: Object.freeze({
+      bodyBytes: 100,
+      bodyState: "complete",
+      completedAtMs: 1_001,
+      rateLimit: Object.freeze({}),
+      responseChecksum: "4".repeat(64),
+      startedAtMs: 1_000,
+      status: 200,
+      ...overrides.evidence,
+    }),
+  })
+}
+
 async function verifier(overrides: Readonly<Partial<ReaderDeploymentVerifierOptions>> = {}) {
   return createReaderDeploymentVerifier({
     accountId,
@@ -132,6 +161,13 @@ async function verifier(overrides: Readonly<Partial<ReaderDeploymentVerifierOpti
 
 async function validInput(): Promise<ReaderDeploymentVerificationInput> {
   return {
+    artifactProofs: [
+      artifactProof(controllerScript, versionA, "1".repeat(64)),
+      artifactProof(controllerScript, versionB, "2".repeat(64)),
+      artifactProof(routerScript, versionC, "3".repeat(64), {
+        evidence: { completedAtMs: 1_003, startedAtMs: 1_002 },
+      }),
+    ],
     attestations: [
       await signed(statement(controllerScript, versionA)),
       await signed(
@@ -296,6 +332,7 @@ describe("signed active-reader convergence", () => {
   it("verifies, canonically orders, freezes, and opaquely retains exact evidence", async () => {
     const input = await validInput()
     const capability = await (await verifier()).verify({
+      artifactProofs: [...input.artifactProofs].reverse(),
       attestations: [...input.attestations].reverse(),
       deploymentProofs: [...input.deploymentProofs].reverse(),
       expectedScriptNames: input.expectedScriptNames,
@@ -304,8 +341,32 @@ describe("signed active-reader convergence", () => {
     expect(Object.keys(capability)).toEqual([])
     const evidence = verifiedReaderDeploymentEvidence(capability)
     expect(evidence).toMatchObject({
+      artifacts: [
+        {
+          artifactChecksum: "1".repeat(64),
+          scriptName: controllerScript,
+          versionId: versionA,
+        },
+        {
+          artifactChecksum: "2".repeat(64),
+          scriptName: controllerScript,
+          versionId: versionB,
+        },
+        {
+          artifactChecksum: "3".repeat(64),
+          scriptName: routerScript,
+          versionId: versionC,
+        },
+      ],
       attestations: [
-        { keyId: "release-key", scriptName: controllerScript, versionId: versionA },
+        {
+          expiresAtMs: 1_500,
+          issuedAtMs: 900,
+          keyId: "release-key",
+          scriptName: controllerScript,
+          signature: expect.stringMatching(/^[A-Za-z0-9_-]{86}$/u),
+          versionId: versionA,
+        },
         { keyId: "release-key", scriptName: controllerScript, versionId: versionB },
         { keyId: "release-key", scriptName: routerScript, versionId: versionC },
       ],
@@ -327,6 +388,8 @@ describe("signed active-reader convergence", () => {
       verifiedAtMs: 1_100,
     })
     expect(Object.isFrozen(evidence)).toBe(true)
+    expect(Object.isFrozen(evidence.artifacts)).toBe(true)
+    expect(Object.isFrozen(evidence.artifacts[0])).toBe(true)
     expect(Object.isFrozen(evidence.attestations)).toBe(true)
     expect(Object.isFrozen(evidence.deployments)).toBe(true)
     expect(Object.isFrozen(evidence.deployments[0]?.versions)).toBe(true)
@@ -339,13 +402,16 @@ describe("signed active-reader convergence", () => {
   it("captures signed inputs and proof arrays before asynchronous verification", async () => {
     const input = await validInput()
     const mutableAttestations = [...input.attestations]
+    const mutableArtifactProofs = [...input.artifactProofs]
     const mutableProofs = [...input.deploymentProofs]
     const verifying = (await verifier()).verify({
+      artifactProofs: mutableArtifactProofs,
       attestations: mutableAttestations,
       deploymentProofs: mutableProofs,
       expectedScriptNames: [...input.expectedScriptNames],
     })
     mutableAttestations.splice(0)
+    mutableArtifactProofs.splice(0)
     mutableProofs.splice(0)
     await expect(verifying).resolves.toBeDefined()
   })
@@ -366,6 +432,7 @@ describe("signed active-reader convergence", () => {
     })
     const nextAttestation = await signed(nextStatement, nextPair.privateKey)
     const input = {
+      artifactProofs: [artifactProof()],
       attestations: [nextAttestation],
       deploymentProofs: [proof()],
       expectedScriptNames: [controllerScript],
@@ -403,7 +470,11 @@ describe("signed active-reader convergence", () => {
       ),
     )
     const attestations = await Promise.all(statements.map((value) => signed(value)))
+    const artifactProofs = statements.map((value) =>
+      artifactProof(value.scriptName, value.versionId, value.artifactChecksum),
+    )
     const capability = await (await verifier()).verify({
+      artifactProofs: artifactProofs.reverse(),
       attestations: attestations.reverse(),
       deploymentProofs: deploymentProofs.reverse(),
       expectedScriptNames: scriptNames.reverse(),
@@ -472,6 +543,7 @@ describe("signed active-reader convergence", () => {
     ])
     await expect(
       verify({
+        artifactProofs: [],
         attestations: input.attestations.slice(0, 1),
         deploymentProofs: [duplicatedVersion],
         expectedScriptNames: [controllerScript],
@@ -484,11 +556,114 @@ describe("signed active-reader convergence", () => {
     }))
     await expect(
       verify({
+        artifactProofs: [],
         attestations: [],
         deploymentProofs: [proof(controllerScript, oversizedVersions)],
         expectedScriptNames: [controllerScript],
       }),
     ).rejects.toThrow(/exceed the reader-version proof bound/u)
+  })
+
+  it("requires one live account-bound artifact proof for every active version", async () => {
+    const input = await validInput()
+    const verify = (await verifier()).verify
+    await expect(
+      verify({ ...input, artifactProofs: input.artifactProofs.slice(1) }),
+    ).rejects.toThrow(/cover every active version/u)
+    for (const fake of [{}, null, "artifact", structuredClone(input.artifactProofs[0])]) {
+      await expect(
+        verify({ ...input, artifactProofs: [fake as object, ...input.artifactProofs.slice(1)] }),
+      ).rejects.toThrow(/live Worker-version artifact proof/u)
+    }
+    await expect(
+      verify({
+        ...input,
+        artifactProofs: [
+          artifactProof(controllerScript, versionA, "1".repeat(64), {
+            accountId: "b".repeat(32),
+          }),
+          ...input.artifactProofs.slice(1),
+        ],
+      }),
+    ).rejects.toThrow(/another Cloudflare account/u)
+    await expect(
+      verify({
+        ...input,
+        artifactProofs: [
+          artifactProof(controllerScript, versionA),
+          artifactProof(controllerScript, versionA),
+          input.artifactProofs[2] as object,
+        ],
+      }),
+    ).rejects.toThrow(/duplicate active version/u)
+    await expect(
+      verify({
+        ...input,
+        artifactProofs: [
+          artifactProof(controllerScript, versionC),
+          ...input.artifactProofs.slice(1),
+        ],
+      }),
+    ).rejects.toThrow(/does not name an active version/u)
+  })
+
+  it("rejects malformed artifact evidence and signed-to-live checksum contradictions", async () => {
+    const input = await validInput()
+    const malformedEvidence: readonly Readonly<
+      Partial<WorkerVersionArtifactProofState["evidence"]>
+    >[] = [
+      { status: 201 },
+      { bodyState: "unreadable" },
+      { responseChecksum: null as never },
+      { responseChecksum: "bad" },
+      { startedAtMs: 1.5 },
+      { startedAtMs: -1 },
+      { completedAtMs: 1.5 },
+      { completedAtMs: 999 },
+    ]
+    for (const evidence of malformedEvidence) {
+      await expect(
+        (await verifier()).verify({
+          artifactProofs: [artifactProof(controllerScript, versionA, "1".repeat(64), { evidence })],
+          attestations: input.attestations.slice(0, 1),
+          deploymentProofs: [proof()],
+          expectedScriptNames: [controllerScript],
+        }),
+      ).rejects.toThrow(/artifact proof evidence is malformed/u)
+    }
+    await expect(
+      (await verifier()).verify({
+        ...input,
+        artifactProofs: [
+          artifactProof(controllerScript, versionA, "9".repeat(64)),
+          ...input.artifactProofs.slice(1),
+        ],
+      }),
+    ).rejects.toThrow(/does not match the live Worker artifact/u)
+  })
+
+  it("includes artifact reads in freshness and convergence windows", async () => {
+    const input = await validInput()
+    for (const item of [
+      { evidence: { completedAtMs: 1_101 }, now: () => 1_100 },
+      { evidence: { completedAtMs: 1_001, startedAtMs: 900 }, now: () => 1_100 },
+      { evidence: { completedAtMs: 1_001 }, now: () => 1_202 },
+    ]) {
+      await expect(
+        (
+          await verifier({ maxObservationAgeMs: 200, maxObservationWindowMs: 100, now: item.now })
+        ).verify({
+          artifactProofs: [
+            artifactProof(controllerScript, versionA, "1".repeat(64), {
+              evidence: item.evidence,
+            }),
+          ],
+          attestations: input.attestations.slice(0, 1),
+          deploymentProofs: [proof()],
+          expectedScriptNames: [controllerScript],
+        }),
+      ).rejects.toThrow(/stale, future, or unconverged/u)
+    }
   })
 
   it("rejects every malformed trusted proof-evidence field", async () => {
@@ -509,6 +684,7 @@ describe("signed active-reader convergence", () => {
     for (const evidence of malformedEvidence) {
       await expect(
         (await verifier()).verify({
+          artifactProofs: input.artifactProofs.slice(0, 1),
           attestations: firstAttestations,
           deploymentProofs: [proof(controllerScript, undefined, { evidence })],
           expectedScriptNames: [controllerScript],
@@ -535,6 +711,7 @@ describe("signed active-reader convergence", () => {
         (
           await verifier({ maxObservationAgeMs: 200, maxObservationWindowMs: 100, now: item.now })
         ).verify({
+          artifactProofs: input.artifactProofs.slice(0, 1),
           attestations: input.attestations.slice(0, 1),
           deploymentProofs: item.proofs,
           expectedScriptNames: [controllerScript],
@@ -544,6 +721,7 @@ describe("signed active-reader convergence", () => {
 
     await expect(
       (await verifier({ maxObservationWindowMs: 50 })).verify({
+        artifactProofs: input.artifactProofs.slice(0, 2),
         attestations: input.attestations.slice(0, 2),
         deploymentProofs: [
           proof(
@@ -642,6 +820,7 @@ describe("signed active-reader convergence", () => {
     const failing = await verifier({ trustedKeys: [trustKey] })
     await expect(
       failing.verify({
+        artifactProofs: [artifactProof()],
         attestations: [{ signature: `${"A".repeat(85)}Q`, statement: statement() }],
         deploymentProofs: [proof()],
         expectedScriptNames: [controllerScript],

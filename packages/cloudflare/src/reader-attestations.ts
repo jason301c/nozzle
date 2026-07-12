@@ -4,6 +4,11 @@ import {
   type ActiveWorkerDeploymentProofState,
   activeWorkerDeploymentProofState,
 } from "./worker-deployment-proof.js"
+import {
+  type WorkerVersionArtifactProof,
+  type WorkerVersionArtifactProofState,
+  workerVersionArtifactProofState,
+} from "./worker-version-proof.js"
 
 const SIGNATURE_DOMAIN = "nozzle.reader-version-attestation-signature.v1"
 const CHECKSUM = /^[0-9a-f]{64}$/u
@@ -50,6 +55,7 @@ export interface ReaderDeploymentVerifierOptions {
 }
 
 export interface ReaderDeploymentVerificationInput {
+  readonly artifactProofs: readonly WorkerVersionArtifactProof[]
   readonly attestations: readonly SignedReaderVersionAttestation[]
   readonly deploymentProofs: readonly ActiveWorkerDeploymentProof[]
   readonly expectedScriptNames: readonly string[]
@@ -59,10 +65,22 @@ export interface VerifiedReaderAttestation {
   readonly artifactChecksum: string
   readonly controlSchemaMax: number
   readonly controlSchemaMin: number
+  readonly expiresAtMs: number
+  readonly issuedAtMs: number
   readonly keyId: string
   readonly outcomePayloadReaderMax: number
   readonly outcomePayloadReaderMin: number
+  readonly signature: string
   readonly scriptName: string
+  readonly versionId: string
+}
+
+export interface VerifiedReaderArtifact {
+  readonly artifactChecksum: string
+  readonly completedAtMs: number
+  readonly responseChecksum: string
+  readonly scriptName: string
+  readonly startedAtMs: number
   readonly versionId: string
 }
 
@@ -76,6 +94,7 @@ export interface VerifiedReaderDeployment {
 }
 
 export interface VerifiedReaderDeploymentEvidence {
+  readonly artifacts: readonly VerifiedReaderArtifact[]
   readonly attestations: readonly VerifiedReaderAttestation[]
   readonly audience: string
   readonly deployments: readonly VerifiedReaderDeployment[]
@@ -314,19 +333,22 @@ function proofKey(scriptName: string, versionId: string): string {
 }
 
 function capturedVerificationInput(input: ReaderDeploymentVerificationInput): {
+  readonly artifactProofs: readonly WorkerVersionArtifactProof[]
   readonly attestations: readonly SignedReaderVersionAttestation[]
   readonly deploymentProofs: readonly ActiveWorkerDeploymentProof[]
   readonly expectedScriptNames: readonly string[]
 } {
   const root = exactRecord(
     input,
-    ["attestations", "deploymentProofs", "expectedScriptNames"],
+    ["artifactProofs", "attestations", "deploymentProofs", "expectedScriptNames"],
     "Reader deployment verification input",
   )
+  const rawArtifactProofs = exactArray(root.artifactProofs, "Worker-version artifact proofs")
   const rawAttestations = root.attestations
   const rawProofs = exactArray(root.deploymentProofs, "Active Worker deployment proofs")
   const rawExpected = root.expectedScriptNames
   return Object.freeze({
+    artifactProofs: Object.freeze([...rawArtifactProofs] as WorkerVersionArtifactProof[]),
     attestations: Object.freeze(
       captured(
         rawAttestations,
@@ -338,6 +360,31 @@ function capturedVerificationInput(input: ReaderDeploymentVerificationInput): {
       captured(rawExpected, "Expected reader scripts") as string[],
     ),
   })
+}
+
+function observedArtifactProof(
+  proof: WorkerVersionArtifactProof,
+  accountId: string,
+): { readonly responseChecksum: string; readonly state: WorkerVersionArtifactProofState } {
+  const state = workerVersionArtifactProofState(proof)
+  if (state === undefined) configuration("A live Worker-version artifact proof is required.")
+  if (state.accountId !== accountId) {
+    intervention("A Worker-version artifact proof belongs to another Cloudflare account.")
+  }
+  const { evidence } = state
+  if (
+    evidence.status !== 200 ||
+    evidence.bodyState !== "complete" ||
+    typeof evidence.responseChecksum !== "string" ||
+    !CHECKSUM.test(evidence.responseChecksum) ||
+    !Number.isSafeInteger(evidence.startedAtMs) ||
+    evidence.startedAtMs < 0 ||
+    !Number.isSafeInteger(evidence.completedAtMs) ||
+    evidence.completedAtMs < evidence.startedAtMs
+  ) {
+    intervention("Worker-version artifact proof evidence is malformed.")
+  }
+  return { responseChecksum: evidence.responseChecksum, state }
 }
 
 function observedProof(
@@ -485,6 +532,39 @@ export async function createReaderDeploymentVerifier(
     if (activeKeys.size > MAX_ACTIVE_VERSIONS) {
       intervention("Active Worker deployments exceed the reader-version proof bound.")
     }
+    if (input.artifactProofs.length !== activeKeys.size) {
+      intervention("Worker-version artifact proofs do not cover every active version exactly once.")
+    }
+    const artifacts: VerifiedReaderArtifact[] = []
+    const artifactChecksums = new Map<string, string>()
+    for (const proof of input.artifactProofs) {
+      const { responseChecksum, state } = observedArtifactProof(proof, accountId)
+      const { artifact, evidence } = state
+      const key = proofKey(artifact.scriptName, artifact.versionId)
+      if (artifactChecksums.has(key)) {
+        intervention("Worker-version artifact proofs contain a duplicate active version.")
+      }
+      if (!activeKeys.has(key)) {
+        intervention("A Worker-version artifact proof does not name an active version.")
+      }
+      observedFromMs = Math.min(observedFromMs, evidence.startedAtMs)
+      observedThroughMs = Math.max(observedThroughMs, evidence.completedAtMs)
+      artifactChecksums.set(key, artifact.artifactChecksum)
+      artifacts.push(
+        Object.freeze({
+          artifactChecksum: artifact.artifactChecksum,
+          completedAtMs: evidence.completedAtMs,
+          responseChecksum,
+          scriptName: artifact.scriptName,
+          startedAtMs: evidence.startedAtMs,
+          versionId: artifact.versionId,
+        }),
+      )
+    }
+    artifacts.sort((left, right) => {
+      const scriptOrder = binaryTextOrder(left.scriptName, right.scriptName)
+      return scriptOrder === 0 ? binaryTextOrder(left.versionId, right.versionId) : scriptOrder
+    })
     const verifiedAtMs = safeInteger(now(), "Reader deployment verification time", 0)
     if (
       observedThroughMs > verifiedAtMs ||
@@ -517,6 +597,9 @@ export async function createReaderDeploymentVerifier(
         attestationKeys.add(key)
         if (!activeKeys.has(key)) {
           intervention("A signed reader attestation does not name an active version.")
+        }
+        if (artifactChecksums.get(key) !== statement.artifactChecksum) {
+          intervention("A signed reader attestation does not match the live Worker artifact.")
         }
         if (
           statement.audience !== audience ||
@@ -552,9 +635,12 @@ export async function createReaderDeploymentVerifier(
             artifactChecksum: statement.artifactChecksum,
             controlSchemaMax: statement.controlSchemaMax,
             controlSchemaMin: statement.controlSchemaMin,
+            expiresAtMs: statement.expiresAtMs,
+            issuedAtMs: statement.issuedAtMs,
             keyId: statement.keyId,
             outcomePayloadReaderMax: statement.outcomePayloadReaderMax,
             outcomePayloadReaderMin: statement.outcomePayloadReaderMin,
+            signature: encodeBase64Url(signature),
             scriptName: statement.scriptName,
             versionId: statement.versionId,
           }),
@@ -566,6 +652,7 @@ export async function createReaderDeploymentVerifier(
       return scriptOrder === 0 ? binaryTextOrder(left.versionId, right.versionId) : scriptOrder
     })
     const evidence = Object.freeze({
+      artifacts: Object.freeze(artifacts),
       attestations: Object.freeze(attestations),
       audience,
       deployments: Object.freeze(deployments),
