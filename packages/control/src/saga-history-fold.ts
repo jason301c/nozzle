@@ -293,6 +293,25 @@ export interface SagaHistoryFinalProof {
   readonly schemaVersion: 1
 }
 
+export interface VerifiedSagaHistoryFinalState {
+  readonly anchor: SagaHistoryAnchor
+  readonly operation: OperationRecord
+  readonly saga: SagaRecord
+}
+
+const VERIFIED_FINAL_HISTORY = new WeakMap<SagaHistoryFinalProof, VerifiedSagaHistoryFinalState>()
+
+export function loadVerifiedSagaHistoryFinalState(input: unknown): VerifiedSagaHistoryFinalState {
+  const state =
+    typeof input === "object" && input !== null
+      ? VERIFIED_FINAL_HISTORY.get(input as SagaHistoryFinalProof)
+      : undefined
+  if (state === undefined) {
+    return intervention("Saga terminal authority requires a live complete-history proof.")
+  }
+  return state
+}
+
 export interface SagaHistoryAttemptSummary {
   readonly acceptanceChecksum: string
   readonly acceptedAtMs: number
@@ -3017,16 +3036,13 @@ function directAttemptEffectKind(
   return false
 }
 
-/**
- * Reconciles the already verified operation, saga-effect, and attempt streams as exact sets. This
- * remains a read-only proof and deliberately carries no terminal settlement authority.
- */
-export async function reconcileSagaHistory(
+async function reconcileSagaHistoryWithAccess(
   transitionFolder: SagaHistoryTransitionFolder,
   effectFolder: SagaHistoryEffectFolder,
   attemptFolder: SagaHistoryAttemptFolder,
   plan: OperationPlan,
   descriptor: SagaDescriptor,
+  trustedAccess: boolean,
 ): Promise<SagaHistoryReconciliationProof> {
   if (
     !(transitionFolder instanceof SagaHistoryTransitionFolder) ||
@@ -3035,10 +3051,18 @@ export async function reconcileSagaHistory(
   ) {
     return configuration("Completed saga-history folders are required for reconciliation.")
   }
-  const planProof = await effectFolder.planProof(plan, descriptor)
-  const transitionProof = transitionFolder.proof()
-  const effectProof = effectFolder.proof()
-  const attemptProof = attemptFolder.proof()
+  const planProof = trustedAccess
+    ? await SagaHistoryEffectFolder.prototype.planProof.call(effectFolder, plan, descriptor)
+    : await effectFolder.planProof(plan, descriptor)
+  const transitionProof = trustedAccess
+    ? SagaHistoryTransitionFolder.prototype.proof.call(transitionFolder)
+    : transitionFolder.proof()
+  const effectProof = trustedAccess
+    ? SagaHistoryEffectFolder.prototype.proof.call(effectFolder)
+    : effectFolder.proof()
+  const attemptProof = trustedAccess
+    ? SagaHistoryAttemptFolder.prototype.proof.call(attemptFolder)
+    : attemptFolder.proof()
   if (
     transitionProof.operationId !== effectProof.operationId ||
     transitionProof.operationId !== attemptProof.operationId ||
@@ -3049,9 +3073,15 @@ export async function reconcileSagaHistory(
     return intervention("Saga-history component proofs belong to different operations or sagas.")
   }
 
-  const transitions = transitionFolder.reconciliationHistory()
-  const effects = effectFolder.reconciliationHistory()
-  const attempts = attemptFolder.reconciliationHistory()
+  const transitions = trustedAccess
+    ? SagaHistoryTransitionFolder.prototype.reconciliationHistory.call(transitionFolder)
+    : transitionFolder.reconciliationHistory()
+  const effects = trustedAccess
+    ? SagaHistoryEffectFolder.prototype.reconciliationHistory.call(effectFolder)
+    : effectFolder.reconciliationHistory()
+  const attempts = trustedAccess
+    ? SagaHistoryAttemptFolder.prototype.reconciliationHistory.call(attemptFolder)
+    : attemptFolder.reconciliationHistory()
   const transitionsById = new Map(
     transitions.map((transition) => [transition.transitionId, transition] as const),
   )
@@ -3252,6 +3282,27 @@ export async function reconcileSagaHistory(
 }
 
 /**
+ * Reconciles the already verified operation, saga-effect, and attempt streams as exact sets. This
+ * remains a read-only proof and deliberately carries no terminal settlement authority.
+ */
+export function reconcileSagaHistory(
+  transitionFolder: SagaHistoryTransitionFolder,
+  effectFolder: SagaHistoryEffectFolder,
+  attemptFolder: SagaHistoryAttemptFolder,
+  plan: OperationPlan,
+  descriptor: SagaDescriptor,
+): Promise<SagaHistoryReconciliationProof> {
+  return reconcileSagaHistoryWithAccess(
+    transitionFolder,
+    effectFolder,
+    attemptFolder,
+    plan,
+    descriptor,
+    false,
+  )
+}
+
+/**
  * Binds a reconciled history to the exact anchor used by every fold, then performs the final
  * database re-read. This remains evidence only and cannot authorize terminal persistence.
  */
@@ -3268,16 +3319,17 @@ export async function finalizeSagaHistoryProof(
     return configuration("A production saga-history reader is required for final reconciliation.")
   }
   const anchor = loadSagaHistoryAnchor(inputAnchor)
-  const reconciliation = await reconcileSagaHistory(
+  const reconciliation = await reconcileSagaHistoryWithAccess(
     transitionFolder,
     effectFolder,
     attemptFolder,
     plan,
     descriptor,
+    true,
   )
-  const transition = transitionFolder.proof()
-  const effect = effectFolder.proof()
-  const attempt = attemptFolder.proof()
+  const transition = SagaHistoryTransitionFolder.prototype.proof.call(transitionFolder)
+  const effect = SagaHistoryEffectFolder.prototype.proof.call(effectFolder)
+  const attempt = SagaHistoryAttemptFolder.prototype.proof.call(attemptFolder)
   const actualBinding = JSON.stringify([
     transition.auditHeadEventHash,
     transition.auditHeadSequence,
@@ -3348,5 +3400,18 @@ export async function finalizeSagaHistoryProof(
     return intervention("The reconciled saga history contradicts its final anchor.")
   }
   await D1SagaHistoryReader.prototype.assertAnchorCurrent.call(reader, anchor)
-  return Object.freeze({ anchor, reconciliation, schemaVersion: 1 })
+  const proof: SagaHistoryFinalProof = Object.freeze({
+    anchor,
+    reconciliation,
+    schemaVersion: 1,
+  })
+  VERIFIED_FINAL_HISTORY.set(
+    proof,
+    Object.freeze({
+      anchor,
+      operation: Object.freeze({ plan, steps: transition.operation.steps }),
+      saga: effect.saga,
+    }),
+  )
+  return proof
 }

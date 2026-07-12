@@ -10,6 +10,10 @@ import {
   type SagaRecord,
   sagaActionIdempotencyKey,
 } from "@nozzle/core"
+import {
+  loadVerifiedSagaHistoryFinalState,
+  type SagaHistoryFinalProof,
+} from "./saga-history-fold.js"
 import { assertTrustedSagaOperationPlan } from "./saga-plan.js"
 import {
   SAGA_INIT_OPERATION_STEP_ID,
@@ -83,6 +87,23 @@ export type SagaTerminalModelBranchDecision =
       readonly stateVersion: number
       readonly stepId: string
     }
+
+declare const SAGA_TERMINAL_CAPABILITY_BRAND: unique symbol
+
+export interface SagaTerminalCapability {
+  readonly [SAGA_TERMINAL_CAPABILITY_BRAND]: true
+}
+
+export interface SagaTerminalCapabilityState {
+  readonly branchDecisions: readonly SagaTerminalModelBranchDecision[]
+  readonly finalProof: SagaHistoryFinalProof
+  readonly operation: OperationRecord
+  readonly saga: SagaRecord
+  readonly settlementOutcome: "failed" | "intervention_required" | "succeeded"
+}
+
+const TERMINAL_CAPABILITIES = new WeakMap<SagaTerminalCapability, SagaTerminalCapabilityState>()
+const FINAL_PROOF_CAPABILITIES = new WeakMap<SagaHistoryFinalProof, SagaTerminalCapability>()
 
 function intervention(message: string): never {
   throw new NozzleError("OperationInterventionRequiredError", message)
@@ -811,4 +832,59 @@ export function modelTerminalSagaBranches(
 ): readonly SagaTerminalModelBranchDecision[] {
   const snapshot = snapshotTerminalModelInputs(operation, saga, inputEvidence)
   return evaluateTerminalSagaBranches(snapshot.operation, snapshot.saga, snapshot.evidence)
+}
+
+function verifiedTerminalEvidence(
+  operation: OperationRecord,
+  saga: SagaRecord,
+  finalProof: SagaHistoryFinalProof,
+): SagaTerminalModelEvidence {
+  const irreversibleAuthorizationChecksums: Record<string, string> = {}
+  for (const descriptorStep of saga.descriptor.steps) {
+    const action = saga.steps[descriptorStep.stepId]?.forward
+    if (!descriptorStep.irreversible || action === undefined || action.attempts === 0) continue
+    const stepId = sagaActionOperationStepId(descriptorStep.stepId, "forward")
+    const checksum = operation.steps[stepId]?.authorizationChecksum
+    if (checksum !== undefined) irreversibleAuthorizationChecksums[stepId] = checksum
+  }
+  return Object.freeze({
+    irreversibleAuthorizationChecksums: Object.freeze(irreversibleAuthorizationChecksums),
+    sagaChecksum: finalProof.anchor.sagaRecordChecksum,
+    stateVersion: finalProof.anchor.sagaStateVersion,
+  })
+}
+
+/** Mints opaque in-process authority only from a live final proof registered by history folding. */
+export function mintSagaTerminalCapability(
+  finalProof: SagaHistoryFinalProof,
+): SagaTerminalCapability {
+  const verified = loadVerifiedSagaHistoryFinalState(finalProof)
+  const existing = FINAL_PROOF_CAPABILITIES.get(finalProof)
+  if (existing !== undefined) return existing
+  const branchDecisions = modelTerminalSagaBranches(
+    verified.operation,
+    verified.saga,
+    verifiedTerminalEvidence(verified.operation, verified.saga, finalProof),
+  )
+  const capability = Object.freeze({}) as SagaTerminalCapability
+  const state: SagaTerminalCapabilityState = Object.freeze({
+    branchDecisions,
+    finalProof,
+    operation: verified.operation,
+    saga: verified.saga,
+    settlementOutcome: mapSagaSettlementOutcome(verified.saga),
+  })
+  TERMINAL_CAPABILITIES.set(capability, state)
+  FINAL_PROOF_CAPABILITIES.set(finalProof, capability)
+  return capability
+}
+
+/** Resolves opaque authority for the internal terminal persistence boundary. */
+export function loadSagaTerminalCapability(input: unknown): SagaTerminalCapabilityState {
+  const state =
+    typeof input === "object" && input !== null
+      ? TERMINAL_CAPABILITIES.get(input as SagaTerminalCapability)
+      : undefined
+  if (state === undefined) intervention("Saga terminal persistence requires verified authority.")
+  return state
 }

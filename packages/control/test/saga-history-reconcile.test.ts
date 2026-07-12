@@ -5,6 +5,7 @@ import {
   leaseProof,
   type OperationPlan,
   type SagaDescriptor,
+  sealIrreversibleAuthorization,
   sealSagaDescriptor,
 } from "@nozzle/core"
 import { describe, expect, it } from "vitest"
@@ -35,8 +36,9 @@ import {
 } from "../src/saga-history-fold.js"
 import { sealSagaInvocationInput } from "../src/saga-input.js"
 import { sealSagaOperationPlan } from "../src/saga-plan.js"
-import { sealSagaHandlerRegistry } from "../src/saga-registry.js"
-import { SAGA_INIT_OPERATION_STEP_ID } from "../src/saga-store.js"
+import { type SagaHandlerRegistration, sealSagaHandlerRegistry } from "../src/saga-registry.js"
+import { SAGA_INIT_OPERATION_STEP_ID, sagaActionOperationStepId } from "../src/saga-store.js"
+import { loadSagaTerminalCapability, mintSagaTerminalCapability } from "../src/saga-terminal.js"
 import { controlSchemaSql } from "../src/schema.js"
 
 const digest: DigestFunction = async (input) => {
@@ -120,6 +122,7 @@ type Scenario =
   | "compensation_observed"
   | "confirmed"
   | "failed"
+  | "irreversible_confirmed"
   | "not_applied"
   | "not_dispatched"
   | "retry"
@@ -135,24 +138,28 @@ interface ScenarioFixture {
   readonly sagaId: string
 }
 
-async function descriptor(maxAttempts: number): Promise<SagaDescriptor> {
+async function descriptor(maxAttempts: number, irreversible: boolean): Promise<SagaDescriptor> {
   return sealSagaDescriptor(
     {
       descriptorId: "history-reconcile",
       steps: [
         {
-          authorizationPolicyChecksum: null,
+          authorizationPolicyChecksum: irreversible ? "9".repeat(64) : null,
           baseRetryDelayMs: 0,
-          compensationAction: {
-            actionId: "history-reconcile.compensate",
-            artifactChecksum: "a".repeat(64),
-            version: 1,
-          },
-          compensationObservation: {
-            actionId: "history-reconcile.observe-compensation",
-            artifactChecksum: "b".repeat(64),
-            version: 1,
-          },
+          compensationAction: irreversible
+            ? null
+            : {
+                actionId: "history-reconcile.compensate",
+                artifactChecksum: "a".repeat(64),
+                version: 1,
+              },
+          compensationObservation: irreversible
+            ? null
+            : {
+                actionId: "history-reconcile.observe-compensation",
+                artifactChecksum: "b".repeat(64),
+                version: 1,
+              },
           forwardAction: {
             actionId: "history-reconcile.forward",
             artifactChecksum: "c".repeat(64),
@@ -164,7 +171,7 @@ async function descriptor(maxAttempts: number): Promise<SagaDescriptor> {
             version: 1,
           },
           inputSchemaChecksum: "e".repeat(64),
-          irreversible: false,
+          irreversible,
           maxAttempts,
           maxRetryDelayMs: 0,
           outputSchemaChecksum: "f".repeat(64),
@@ -197,7 +204,8 @@ async function scenarioFixture(scenario: Scenario): Promise<ScenarioFixture> {
   const sagaId = `history-reconcile-saga-${scenario}`
   const leaseKey = `saga:${sagaId}`
   const maxAttempts = scenario === "retry" ? 2 : 1
-  const sealedDescriptor = await descriptor(maxAttempts)
+  const irreversible = scenario === "irreversible_confirmed"
+  const sealedDescriptor = await descriptor(maxAttempts, irreversible)
   const step = sealedDescriptor.steps[0] as (typeof sealedDescriptor.steps)[number]
   const effectHandler = () => ({
     evidenceJson: "{}",
@@ -209,23 +217,21 @@ async function scenarioFixture(scenario: Scenario): Promise<ScenarioFixture> {
     outputJson: "{}",
     state: "applied" as const,
   })
-  const registry = await sealSagaHandlerRegistry(
-    [
-      { handler: effectHandler, kind: "effect", reference: step.forwardAction },
-      { handler: observationHandler, kind: "observation", reference: step.forwardObservation },
-      {
-        handler: effectHandler,
-        kind: "effect",
-        reference: step.compensationAction as NonNullable<typeof step.compensationAction>,
-      },
+  const registrations: SagaHandlerRegistration[] = [
+    { handler: effectHandler, kind: "effect", reference: step.forwardAction },
+    { handler: observationHandler, kind: "observation", reference: step.forwardObservation },
+  ]
+  if (step.compensationAction !== null && step.compensationObservation !== null) {
+    registrations.push(
+      { handler: effectHandler, kind: "effect", reference: step.compensationAction },
       {
         handler: observationHandler,
         kind: "observation",
-        reference: step.compensationObservation as NonNullable<typeof step.compensationObservation>,
+        reference: step.compensationObservation,
       },
-    ],
-    digest,
-  )
+    )
+  }
+  const registry = await sealSagaHandlerRegistry(registrations, digest)
   const invocation = await sealSagaInvocationInput(
     {
       descriptor: sealedDescriptor,
@@ -271,6 +277,24 @@ async function scenarioFixture(scenario: Scenario): Promise<ScenarioFixture> {
   })
   if (!acquired.acquired) throw new Error("Fixture lease was not acquired")
   let proof = leaseProof(acquired.record)
+  const irreversibleAuthorization = irreversible
+    ? await (async () => {
+        const authorized = await leases.authorizeAt(proof)
+        return sealIrreversibleAuthorization(
+          plan,
+          {
+            actorChecksum: "history-reconcile-actor",
+            authorizationId: `${sagaId}:authorization`,
+            decisionChecksum: `${sagaId}:approved`,
+            lease: authorized.record,
+            leaseProof: proof,
+            sealedAtServerTimeMs: authorized.serverTimeMs,
+            stepId: sagaActionOperationStepId("write", "forward"),
+          },
+          digest,
+        )
+      })()
+    : undefined
 
   const initPlan = plan.steps.find((candidate) => candidate.stepId === SAGA_INIT_OPERATION_STEP_ID)
   if (initPlan === undefined) throw new Error("Fixture initialization plan is missing")
@@ -304,6 +328,9 @@ async function scenarioFixture(scenario: Scenario): Promise<ScenarioFixture> {
     const decision = await coordinator.beginAction({
       actorChecksum: "history-reconcile-actor",
       attemptId,
+      ...(phase === "forward" && irreversibleAuthorization !== undefined
+        ? { irreversibleAuthorization }
+        : {}),
       operationId,
       phase,
       proof,
@@ -476,6 +503,8 @@ async function scenarioFixture(scenario: Scenario): Promise<ScenarioFixture> {
     const secondAttempt = `${sagaId}:write:2`
     await begin(secondAttempt)
     await completeEffect(secondAttempt, "confirmed")
+  } else if (scenario === "irreversible_confirmed") {
+    await completeEffect(firstAttempt, "confirmed")
   } else {
     await completeEffect(firstAttempt, scenario)
   }
@@ -592,6 +621,7 @@ describe("saga history cross-stream reconciliation", () => {
   it("reconciles direct, retry, recovery, observation, termination, and compensation histories", async () => {
     const scenarios: Scenario[] = [
       "confirmed",
+      "irreversible_confirmed",
       "failed",
       "not_applied",
       "retry",
@@ -608,27 +638,52 @@ describe("saga history cross-stream reconciliation", () => {
       const fixture = await scenarioFixture(scenario)
       try {
         const history = await foldHistory(fixture)
-        outcomes.push(
-          await finalizeSagaHistoryProof(
-            history.reader,
-            history.anchor,
-            history.transition,
-            history.effect,
-            history.attempt,
-            history.plan,
-            history.descriptor,
-          ),
+        const proof = await finalizeSagaHistoryProof(
+          history.reader,
+          history.anchor,
+          history.transition,
+          history.effect,
+          history.attempt,
+          history.plan,
+          history.descriptor,
         )
+        const capability = mintSagaTerminalCapability(proof)
+        outcomes.push({ authority: loadSagaTerminalCapability(capability), capability, proof })
       } finally {
         fixture.database.close()
       }
     }
     expect(outcomes).toHaveLength(scenarios.length)
-    expect(outcomes.every((proof) => proof.schemaVersion === 1)).toBe(true)
-    expect(outcomes.every((proof) => Object.isFrozen(proof.anchor))).toBe(true)
-    expect(outcomes.map((proof) => proof.reconciliation.observationAttemptCount)).toEqual([
-      0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1,
+    expect(outcomes.every(({ proof }) => proof.schemaVersion === 1)).toBe(true)
+    expect(outcomes.every(({ proof }) => Object.isFrozen(proof.anchor))).toBe(true)
+    expect(outcomes.map(({ proof }) => proof.reconciliation.observationAttemptCount)).toEqual([
+      0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1,
     ])
+    expect(outcomes.map(({ authority }) => authority.settlementOutcome)).toEqual([
+      "succeeded",
+      "succeeded",
+      "failed",
+      "failed",
+      "succeeded",
+      "succeeded",
+      "intervention_required",
+      "failed",
+      "failed",
+      "failed",
+      "failed",
+      "failed",
+    ])
+    expect(outcomes[1]?.authority).toMatchObject({
+      branchDecisions: [{ kind: "not_required", stepId: "saga:termination" }],
+      operation: {
+        steps: {
+          "saga:forward:write": {
+            authorizationChecksum: expect.stringMatching(/^[0-9a-f]{64}$/u),
+            irreversibleAuthorization: { schemaVersion: 1 },
+          },
+        },
+      },
+    })
   })
 
   it("does not expose reconciliation inputs before every source fold is complete", async () => {
@@ -704,10 +759,13 @@ describe("saga history cross-stream reconciliation", () => {
     const advanced = await scenarioFixture("confirmed")
     try {
       const history = await foldHistory(advanced)
-      const planProof = history.effect.planProof.bind(history.effect)
-      Object.defineProperty(history.effect, "planProof", {
-        value: async (plan: OperationPlan, descriptor: SagaDescriptor) => {
-          const proof = await planProof(plan, descriptor)
+      const mutatingDescriptor = { ...history.descriptor }
+      let mutated = false
+      Object.defineProperty(mutatingDescriptor, "descriptorId", {
+        enumerable: true,
+        get: () => {
+          if (mutated) return history.descriptor.descriptorId
+          mutated = true
           advanced.database.database
             .prepare(
               `UPDATE "nozzle_operations"
@@ -715,7 +773,7 @@ describe("saga history cross-stream reconciliation", () => {
                WHERE "operation_id" = ?`,
             )
             .run(advanced.operationId)
-          return proof
+          return history.descriptor.descriptorId
         },
       })
       await expect(
@@ -726,11 +784,59 @@ describe("saga history cross-stream reconciliation", () => {
           history.effect,
           history.attempt,
           history.plan,
-          history.descriptor,
+          mutatingDescriptor,
         ),
       ).rejects.toMatchObject({ code: "OperationResumeRequiredError" })
+      expect(mutated).toBe(true)
     } finally {
       advanced.database.close()
+    }
+  })
+
+  it("mints opaque idempotent terminal authority only from a live final proof", async () => {
+    const fixture = await scenarioFixture("confirmed")
+    try {
+      const history = await foldHistory(fixture)
+      const proof = await finalizeSagaHistoryProof(
+        history.reader,
+        history.anchor,
+        history.transition,
+        history.effect,
+        history.attempt,
+        history.plan,
+        history.descriptor,
+      )
+      const capability = mintSagaTerminalCapability(proof)
+      expect(mintSagaTerminalCapability(proof)).toBe(capability)
+      expect(Object.isFrozen(capability)).toBe(true)
+      expect(Object.keys(capability)).toEqual([])
+
+      const authority = loadSagaTerminalCapability(capability)
+      expect(authority).toMatchObject({
+        finalProof: proof,
+        operation: { plan: { operationId: fixture.operationId } },
+        saga: { sagaId: fixture.sagaId, status: "succeeded" },
+        settlementOutcome: "succeeded",
+      })
+      expect(authority.branchDecisions).toMatchObject([
+        { kind: "not_required", stepId: "saga:termination" },
+        { kind: "not_required", stepId: "saga:compensation:write" },
+      ])
+      expect(Object.isFrozen(authority)).toBe(true)
+      expect(Object.isFrozen(authority.branchDecisions)).toBe(true)
+
+      expect(() => mintSagaTerminalCapability(structuredClone(proof))).toThrowError(
+        /live complete-history proof/u,
+      )
+      expect(() => mintSagaTerminalCapability(null as never)).toThrowError(
+        /live complete-history proof/u,
+      )
+      expect(() => loadSagaTerminalCapability(Object.freeze({}))).toThrowError(
+        /verified authority/u,
+      )
+      expect(() => loadSagaTerminalCapability(null)).toThrowError(/verified authority/u)
+    } finally {
+      fixture.database.close()
     }
   })
 

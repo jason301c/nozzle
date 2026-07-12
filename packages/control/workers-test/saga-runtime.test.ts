@@ -38,6 +38,7 @@ import {
   type SagaEffectContext,
   sagaActionOperationStepId,
 } from "../src/saga-store.js"
+import { loadSagaTerminalCapability, mintSagaTerminalCapability } from "../src/saga-terminal.js"
 import {
   CONTROL_SCHEMA_STATEMENTS,
   CONTROL_SCHEMA_VERSION_ONE_STATEMENTS,
@@ -365,7 +366,7 @@ describe("real workerd D1 saga projection", () => {
     ).resolves.toEqual({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" })
   })
 
-  it("begins an authorized irreversible saga action with the real trigger receipt", async () => {
+  it("verifies an authorized irreversible saga through its real trigger receipt", async () => {
     const operationId = "workerd-irreversible-saga-operation"
     const sagaId = "workerd-irreversible-saga"
     const sagaStepId = "commit"
@@ -594,6 +595,30 @@ describe("real workerd D1 saga projection", () => {
       operationStepId,
       protocolVersion: 2,
       state: "accepted",
+    })
+    await attempts.complete({
+      attemptId,
+      evidenceJson: '{"source":"workerd-irreversible"}',
+      outputJson: '{"committed":true}',
+      proof,
+      state: "confirmed",
+    })
+    await expect(restarted.settleActionFromReceipt(actionInput)).resolves.toMatchObject({
+      status: "succeeded",
+    })
+    const finalProof = await reconcileStoredSagaHistory(operationId, sagaId)
+    const capability = mintSagaTerminalCapability(finalProof)
+    expect(loadSagaTerminalCapability(capability)).toMatchObject({
+      branchDecisions: [{ kind: "not_required", stepId: "saga:termination" }],
+      operation: {
+        steps: {
+          [operationStepId]: {
+            authorizationChecksum: authorization.authorizationChecksum,
+            irreversibleAuthorization: authorization,
+          },
+        },
+      },
+      settlementOutcome: "succeeded",
     })
   })
 
@@ -1168,7 +1193,8 @@ describe("real workerd D1 saga projection", () => {
     })
     expect(terminal.status).toBe("succeeded")
 
-    await expect(reconcileStoredSagaHistory(operationId, sagaId)).resolves.toMatchObject({
+    const finalProof = await reconcileStoredSagaHistory(operationId, sagaId)
+    expect(finalProof).toMatchObject({
       anchor: { operationId, sagaId },
       reconciliation: {
         actionBeginCount: 1,
@@ -1182,6 +1208,14 @@ describe("real workerd D1 saga projection", () => {
         transitionCount: 4,
       },
       schemaVersion: 1,
+    })
+    const capability = mintSagaTerminalCapability(finalProof)
+    expect(loadSagaTerminalCapability(capability)).toMatchObject({
+      branchDecisions: [
+        { kind: "not_required", stepId: "saga:termination" },
+        { kind: "not_required", stepId: "saga:compensation:write" },
+      ],
+      settlementOutcome: "succeeded",
     })
   })
 
