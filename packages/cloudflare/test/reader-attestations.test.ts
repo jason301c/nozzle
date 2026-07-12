@@ -7,7 +7,10 @@ import {
   type ReaderVersionAttestationStatement,
   readerVersionAttestationSigningBytes,
   type SignedReaderVersionAttestation,
+  type VerifiedReaderDeploymentCapability,
   verifiedReaderDeploymentEvidence,
+  verifiedReaderDeploymentStabilityEvidence,
+  verifyReaderDeploymentStability,
 } from "../src/reader-attestations.js"
 import {
   type ActiveWorkerDeploymentProofState,
@@ -159,13 +162,20 @@ async function verifier(overrides: Readonly<Partial<ReaderDeploymentVerifierOpti
   })
 }
 
-async function validInput(): Promise<ReaderDeploymentVerificationInput> {
+async function validInput(timeOffset = 0): Promise<ReaderDeploymentVerificationInput> {
   return {
     artifactProofs: [
-      artifactProof(controllerScript, versionA, "1".repeat(64)),
-      artifactProof(controllerScript, versionB, "2".repeat(64)),
+      artifactProof(controllerScript, versionA, "1".repeat(64), {
+        evidence: { completedAtMs: 1_001 + timeOffset, startedAtMs: 1_000 + timeOffset },
+      }),
+      artifactProof(controllerScript, versionB, "2".repeat(64), {
+        evidence: { completedAtMs: 1_001 + timeOffset, startedAtMs: 1_000 + timeOffset },
+      }),
       artifactProof(routerScript, versionC, "3".repeat(64), {
-        evidence: { completedAtMs: 1_003, startedAtMs: 1_002 },
+        evidence: {
+          completedAtMs: 1_003 + timeOffset,
+          startedAtMs: 1_002 + timeOffset,
+        },
       }),
     ],
     attestations: [
@@ -181,17 +191,33 @@ async function validInput(): Promise<ReaderDeploymentVerificationInput> {
       await signed(statement(routerScript, versionC, { artifactChecksum: "3".repeat(64) })),
     ],
     deploymentProofs: [
-      proof(controllerScript, [
-        { versionId: versionB, weightBps: 7_500 },
-        { versionId: versionA, weightBps: 2_500 },
-      ]),
+      proof(
+        controllerScript,
+        [
+          { versionId: versionB, weightBps: 7_500 },
+          { versionId: versionA, weightBps: 2_500 },
+        ],
+        {
+          evidence: {
+            completedAtMs: 1_001 + timeOffset,
+            startedAtMs: 1_000 + timeOffset,
+          },
+        },
+      ),
       proof(routerScript, [{ versionId: versionC, weightBps: 10_000 }], {
         deploymentId: routerDeployment,
-        evidence: { completedAtMs: 1_003, startedAtMs: 1_002 },
+        evidence: {
+          completedAtMs: 1_003 + timeOffset,
+          startedAtMs: 1_002 + timeOffset,
+        },
       }),
     ],
     expectedScriptNames: [routerScript, controllerScript],
   }
+}
+
+async function verifiedAt(timeOffset = 0): Promise<VerifiedReaderDeploymentCapability> {
+  return (await verifier({ now: () => 1_100 + timeOffset })).verify(await validInput(timeOffset))
 }
 
 function requiredAttestation(
@@ -479,15 +505,46 @@ describe("signed active-reader convergence", () => {
     const artifactProofs = statements.map((value) =>
       artifactProof(value.scriptName, value.versionId, value.artifactChecksum),
     )
-    const capability = await (await verifier()).verify({
-      artifactProofs: artifactProofs.reverse(),
-      attestations: attestations.reverse(),
-      deploymentProofs: deploymentProofs.reverse(),
-      expectedScriptNames: scriptNames.reverse(),
+    let verifiedAtMs = 1_100
+    const activeVerifier = await verifier({ now: () => verifiedAtMs })
+    const capability = await activeVerifier.verify({
+      artifactProofs: [...artifactProofs].reverse(),
+      attestations: [...attestations].reverse(),
+      deploymentProofs: [...deploymentProofs].reverse(),
+      expectedScriptNames: [...scriptNames].reverse(),
     })
     const evidence = verifiedReaderDeploymentEvidence(capability)
     expect(evidence.deployments).toHaveLength(256)
     expect(evidence.attestations).toHaveLength(512)
+
+    verifiedAtMs = 1_300
+    const reobserved = await activeVerifier.verify({
+      artifactProofs: statements.map((value) =>
+        artifactProof(value.scriptName, value.versionId, value.artifactChecksum, {
+          evidence: { completedAtMs: 1_201, startedAtMs: 1_200 },
+        }),
+      ),
+      attestations,
+      deploymentProofs: scriptNames.map((scriptName, scriptIndex) =>
+        proof(
+          scriptName,
+          [0, 1].map((offset) => ({
+            versionId: `00000000-0000-4000-8000-${String(scriptIndex * 2 + offset).padStart(12, "0")}`,
+            weightBps: 5_000,
+          })),
+          {
+            deploymentId: `10000000-0000-4000-8000-${String(scriptIndex).padStart(12, "0")}`,
+            evidence: { completedAtMs: 1_201, startedAtMs: 1_200 },
+          },
+        ),
+      ),
+      expectedScriptNames: scriptNames,
+    })
+    expect(
+      verifiedReaderDeploymentStabilityEvidence(
+        verifyReaderDeploymentStability(capability, reobserved, 400),
+      ).after.attestations,
+    ).toHaveLength(512)
   })
 
   it("rejects malformed input envelopes, inventories, and proof identities", async () => {
@@ -833,5 +890,109 @@ describe("signed active-reader convergence", () => {
       }),
     ).rejects.toThrow(/could not be verified/u)
     vi.stubGlobal("crypto", nativeCrypto)
+  })
+})
+
+describe("reader deployment activation stability", () => {
+  it("requires an ordered exact second observation and retains both immutable proofs", async () => {
+    const before = await verifiedAt()
+    const after = await verifiedAt(200)
+    const capability = verifyReaderDeploymentStability(before, after, 400)
+
+    expect(Object.keys(capability)).toEqual([])
+    expect(Object.isFrozen(capability)).toBe(true)
+    const evidence = verifiedReaderDeploymentStabilityEvidence(capability)
+    expect(evidence).toMatchObject({
+      after: { observedFromMs: 1_200, observedThroughMs: 1_203, verifiedAtMs: 1_300 },
+      before: { observedFromMs: 1_000, observedThroughMs: 1_003, verifiedAtMs: 1_100 },
+      firstVerifiedAtMs: 1_100,
+      maxStabilityWindowMs: 400,
+      observedFromMs: 1_000,
+      observedThroughMs: 1_203,
+      schemaVersion: 1,
+      verifiedAtMs: 1_300,
+    })
+    expect(Object.isFrozen(evidence)).toBe(true)
+    expect(Object.isFrozen(evidence.before)).toBe(true)
+    expect(Object.isFrozen(evidence.after)).toBe(true)
+
+    for (const fake of [{}, structuredClone(capability), null, "stable"]) {
+      expect(() => verifiedReaderDeploymentStabilityEvidence(fake as never)).toThrow(
+        /live verified/u,
+      )
+    }
+  })
+
+  it("rejects malformed policy and overlapping, reversed, stale, or fake observations", async () => {
+    const before = await verifiedAt()
+    const after = await verifiedAt(200)
+    for (const maximum of [0, 300_001, 1.5]) {
+      expect(() => verifyReaderDeploymentStability(before, after, maximum)).toThrow(/window/u)
+    }
+    expect(() => verifyReaderDeploymentStability(before, before, 400)).toThrow(/overlapping/u)
+    expect(() => verifyReaderDeploymentStability(after, before, 400)).toThrow(/overlapping/u)
+    expect(() => verifyReaderDeploymentStability(before, after, 299)).toThrow(/too old/u)
+    for (const fake of [{}, structuredClone(before), null, "verified"]) {
+      expect(() => verifyReaderDeploymentStability(fake as never, after, 400)).toThrow(
+        /live verified/u,
+      )
+      expect(() => verifyReaderDeploymentStability(before, fake as never, 400)).toThrow(
+        /live verified/u,
+      )
+    }
+  })
+
+  it("rejects changes to deployment, artifact, attestation, or expected-reader identity", async () => {
+    const before = await verifiedAt()
+    const base = await validInput(200)
+    const controllerVersions = [
+      { versionId: versionB, weightBps: 7_500 },
+      { versionId: versionA, weightBps: 2_500 },
+    ]
+    const evidence = { completedAtMs: 1_201, startedAtMs: 1_200 }
+    const changedDeployment = {
+      ...base,
+      deploymentProofs: [
+        proof(controllerScript, controllerVersions, {
+          deploymentId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+          evidence,
+        }),
+        base.deploymentProofs[1] as (typeof base.deploymentProofs)[number],
+      ],
+    }
+    const changedArtifact = {
+      ...base,
+      artifactProofs: [
+        artifactProof(controllerScript, versionA, "5".repeat(64), { evidence }),
+        ...base.artifactProofs.slice(1),
+      ],
+      attestations: [
+        await signed(statement(controllerScript, versionA, { artifactChecksum: "5".repeat(64) })),
+        ...base.attestations.slice(1),
+      ],
+    }
+    const changedAttestation = {
+      ...base,
+      attestations: [
+        await signed(statement(controllerScript, versionA, { issuedAtMs: 901 })),
+        ...base.attestations.slice(1),
+      ],
+    }
+    const changedInventory = {
+      artifactProofs: base.artifactProofs.slice(0, 2),
+      attestations: base.attestations.slice(0, 2),
+      deploymentProofs: base.deploymentProofs.slice(0, 1),
+      expectedScriptNames: [controllerScript],
+    }
+    const activeVerifier = await verifier({ now: () => 1_300 })
+    for (const input of [
+      changedDeployment,
+      changedArtifact,
+      changedAttestation,
+      changedInventory,
+    ]) {
+      const after = await activeVerifier.verify(input)
+      expect(() => verifyReaderDeploymentStability(before, after, 400)).toThrow(/changed/u)
+    }
   })
 })

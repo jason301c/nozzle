@@ -19,6 +19,7 @@ const MAX_ACTIVE_VERSIONS = MAX_READERS * 2
 const MAX_TRUST_KEYS = 64
 const MAX_OBSERVATION_TIME_MS = 5 * 60 * 1_000
 const MAX_ATTESTATION_VALIDITY_MS = 30 * 24 * 60 * 60 * 1_000
+const MAX_STABILITY_WINDOW_MS = 5 * 60 * 1_000
 const REQUIRED_CONTROL_SCHEMA_MAX = 6
 const REQUIRED_CONTROL_SCHEMA_MIN = 5
 
@@ -112,6 +113,19 @@ export interface VerifiedReaderDeploymentEvidence {
 
 export type VerifiedReaderDeploymentCapability = object
 
+export interface VerifiedReaderDeploymentStabilityEvidence {
+  readonly after: VerifiedReaderDeploymentEvidence
+  readonly before: VerifiedReaderDeploymentEvidence
+  readonly firstVerifiedAtMs: number
+  readonly maxStabilityWindowMs: number
+  readonly observedFromMs: number
+  readonly observedThroughMs: number
+  readonly schemaVersion: 1
+  readonly verifiedAtMs: number
+}
+
+export type VerifiedReaderDeploymentStabilityCapability = object
+
 export interface ReaderDeploymentVerifier {
   verify(input: ReaderDeploymentVerificationInput): Promise<VerifiedReaderDeploymentCapability>
 }
@@ -122,6 +136,7 @@ interface CanonicalStatement {
 }
 
 const capabilityStates = new WeakMap<object, VerifiedReaderDeploymentEvidence>()
+const stabilityCapabilityStates = new WeakMap<object, VerifiedReaderDeploymentStabilityEvidence>()
 
 function configuration(message: string): never {
   throw new NozzleError("ConfigurationError", message)
@@ -694,5 +709,92 @@ export function verifiedReaderDeploymentEvidence(
   const state = capabilityStates.get(capability)
   if (state === undefined)
     configuration("A live verified reader-deployment capability is required.")
+  return state
+}
+
+function stabilityIdentity(evidence: VerifiedReaderDeploymentEvidence): string {
+  return JSON.stringify([
+    evidence.schemaVersion,
+    evidence.accountId,
+    evidence.audience,
+    evidence.expectedScriptNames,
+    evidence.deployments.map((deployment) => [
+      deployment.scriptName,
+      deployment.deploymentId,
+      deployment.createdAtMs,
+      deployment.versions.map((version) => [version.versionId, version.weightBps]),
+    ]),
+    evidence.artifacts.map((artifact) => [
+      artifact.scriptName,
+      artifact.versionId,
+      artifact.artifactChecksum,
+    ]),
+    evidence.attestations.map((attestation) => [
+      attestation.scriptName,
+      attestation.versionId,
+      attestation.artifactChecksum,
+      attestation.controlSchemaMin,
+      attestation.controlSchemaMax,
+      attestation.outcomePayloadReaderMin,
+      attestation.outcomePayloadReaderMax,
+      attestation.issuedAtMs,
+      attestation.expiresAtMs,
+      attestation.keyId,
+      attestation.publicKeyBase64Url,
+      attestation.signature,
+    ]),
+  ])
+}
+
+export function verifyReaderDeploymentStability(
+  beforeCapability: VerifiedReaderDeploymentCapability,
+  afterCapability: VerifiedReaderDeploymentCapability,
+  maxStabilityWindowMs: number,
+): VerifiedReaderDeploymentStabilityCapability {
+  if (
+    !Number.isSafeInteger(maxStabilityWindowMs) ||
+    maxStabilityWindowMs < 1 ||
+    maxStabilityWindowMs > MAX_STABILITY_WINDOW_MS
+  ) {
+    configuration(
+      `Reader deployment stability window must be between 1 and ${MAX_STABILITY_WINDOW_MS} milliseconds.`,
+    )
+  }
+  const before = verifiedReaderDeploymentEvidence(beforeCapability)
+  const after = verifiedReaderDeploymentEvidence(afterCapability)
+  if (
+    after.observedFromMs < before.verifiedAtMs ||
+    after.verifiedAtMs - before.observedFromMs > maxStabilityWindowMs
+  ) {
+    intervention("Reader deployment reobservation is overlapping, reversed, or too old.")
+  }
+  if (stabilityIdentity(before) !== stabilityIdentity(after)) {
+    intervention("Reader deployment changed during the activation stability window.")
+  }
+  const evidence = Object.freeze({
+    after,
+    before,
+    firstVerifiedAtMs: before.verifiedAtMs,
+    maxStabilityWindowMs,
+    observedFromMs: before.observedFromMs,
+    observedThroughMs: after.observedThroughMs,
+    schemaVersion: 1 as const,
+    verifiedAtMs: after.verifiedAtMs,
+  })
+  const capability = Object.freeze({})
+  stabilityCapabilityStates.set(capability, evidence)
+  return capability
+}
+
+export function verifiedReaderDeploymentStabilityEvidence(
+  capability: VerifiedReaderDeploymentStabilityCapability,
+): VerifiedReaderDeploymentStabilityEvidence {
+  if (typeof capability !== "object" || capability === null) {
+    configuration("A live verified reader-deployment stability capability is required.")
+  }
+  const state = stabilityCapabilityStates.get(capability)
+  if (state === undefined) {
+    configuration("A live verified reader-deployment stability capability is required.")
+  }
   return state
 }

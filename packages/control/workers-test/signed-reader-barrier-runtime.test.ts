@@ -3,6 +3,7 @@ import {
   createCloudflareWorkerDeploymentClient,
   createReaderDeploymentVerifier,
   readerVersionAttestationSigningBytes,
+  verifyReaderDeploymentStability,
 } from "@nozzle/cloudflare"
 import type { DigestFunction } from "@nozzle/core"
 import { describe, expect, it } from "vitest"
@@ -48,7 +49,8 @@ describe("real workerd signed reader deployment barrier", () => {
     for (const statement of CONTROL_SCHEMA_STATEMENTS) {
       await env.SIGNED_BARRIER_DB.prepare(statement).run()
     }
-    let observedAtMs = 1_000
+    const baseTimeMs = Date.now() - 1_000
+    let observedAtMs = baseTimeMs
     const client = createCloudflareWorkerDeploymentClient({
       accountId,
       apiToken: "fictional-workerd-signed-token",
@@ -97,8 +99,8 @@ describe("real workerd signed reader deployment barrier", () => {
       audience: "nozzle:fictional-workerd-signed",
       controlSchemaMax: 6,
       controlSchemaMin: 5,
-      expiresAtMs: 2_000,
-      issuedAtMs: 900,
+      expiresAtMs: baseTimeMs + 1_500,
+      issuedAtMs: baseTimeMs - 100,
       keyId: "fictional-workerd-release-key",
       outcomePayloadReaderMax: 1,
       outcomePayloadReaderMin: 1,
@@ -115,21 +117,36 @@ describe("real workerd signed reader deployment barrier", () => {
         ),
       ),
     )
+    let verifiedAtMs = baseTimeMs + 100
     const verifier = await createReaderDeploymentVerifier({
       accountId,
       audience: statement.audience,
       maxAttestationValidityMs: 2_000,
       maxObservationAgeMs: 200,
       maxObservationWindowMs: 100,
-      now: () => 1_100,
+      now: () => verifiedAtMs,
       trustedKeys: [{ keyId: statement.keyId, publicKeyBase64Url }],
     })
-    const capability = await verifier.verify({
+    const before = await verifier.verify({
       artifactProofs: [artifact.proof],
       attestations: [{ signature, statement }],
       deploymentProofs: [deployment.proof],
       expectedScriptNames: [scriptName],
     })
+    observedAtMs = baseTimeMs + 200
+    verifiedAtMs = baseTimeMs + 300
+    const secondDeployment = await client.getActiveDeployment(scriptName)
+    const secondArtifact = await client.getVersionArtifact(scriptName, versionId)
+    if (secondDeployment.kind !== "complete" || secondArtifact.kind !== "complete") {
+      throw new Error("Expected complete fictional Cloudflare reobservations.")
+    }
+    const after = await verifier.verify({
+      artifactProofs: [secondArtifact.proof],
+      attestations: [{ signature, statement }],
+      deploymentProofs: [secondDeployment.proof],
+      expectedScriptNames: [scriptName],
+    })
+    const capability = verifyReaderDeploymentStability(before, after, 5_000)
     const store = new D1SignedReaderBarrierStore(env.SIGNED_BARRIER_DB, digest)
     const activated = await store.activate(capability)
 

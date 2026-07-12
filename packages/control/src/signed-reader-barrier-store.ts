@@ -1,7 +1,8 @@
 import {
-  type VerifiedReaderDeploymentCapability,
   type VerifiedReaderDeploymentEvidence,
-  verifiedReaderDeploymentEvidence,
+  type VerifiedReaderDeploymentStabilityCapability,
+  type VerifiedReaderDeploymentStabilityEvidence,
+  verifiedReaderDeploymentStabilityEvidence,
 } from "@nozzle/cloudflare"
 import { type DigestFunction, NozzleError } from "@nozzle/core"
 import type {
@@ -21,12 +22,14 @@ import {
 } from "./reader-barrier-store.js"
 
 const SIGNED_EVIDENCE_DOMAIN = "nozzle.reader-barrier-signed-evidence.v1"
+const STABILITY_IDENTITY_DOMAIN = "nozzle.reader-barrier-stability-identity.v1"
 const VERIFICATION_DOMAIN = "nozzle.reader-barrier-verification.v1"
 const CHECKSUM = /^[0-9a-f]{64}$/u
 const ACCOUNT_ID = /^[0-9a-f]{32}$/u
 const MAX_EVIDENCE_BYTES = 1_048_576
 const MAX_JSON_DEPTH = 16
 const MAX_JSON_MEMBERS = 16_384
+const MAX_STABILITY_WINDOW_MS = 5 * 60 * 1_000
 const SERVER_TIME_SQL = `CAST(unixepoch('subsec') * 1000 AS INTEGER)`
 
 type JsonValue = boolean | null | number | string | JsonObject | readonly JsonValue[]
@@ -37,6 +40,14 @@ interface JsonObject {
 interface SignedSourceState {
   readonly evidence: VerifiedReaderDeploymentEvidence
   readonly evidenceChecksum: string
+  readonly maxStabilityWindowMs: number
+  readonly priorArtifactObservations: JsonValue
+  readonly priorDeploymentObservations: JsonValue
+  readonly priorEvidenceChecksum: string
+  readonly priorObservedFromMs: number
+  readonly priorObservedThroughMs: number
+  readonly priorVerifiedAtMs: number
+  readonly stabilityIdentityChecksum: string
 }
 
 interface VerificationState {
@@ -47,8 +58,18 @@ interface VerificationState {
   readonly signedEvidenceChecksum: string
   readonly sourceEvidence: VerifiedReaderDeploymentEvidence
   readonly sourceVerifiedAtMs: number
+  readonly stability?: VerificationStabilityState
   readonly verificationChecksum: string
   readonly verifiedAtMs: number
+}
+
+interface VerificationStabilityState {
+  readonly identityChecksum: string
+  readonly maxStabilityWindowMs: number
+  readonly priorEvidenceChecksum: string
+  readonly priorObservedFromMs: number
+  readonly priorObservedThroughMs: number
+  readonly priorVerifiedAtMs: number
 }
 
 interface VerificationRow {
@@ -68,6 +89,14 @@ export interface SignedReaderBarrierReceipt extends ReaderBarrierReceipt {
   readonly audience: string
   readonly signedEvidenceChecksum: string
   readonly sourceVerifiedAtMs: number
+  readonly stability?: Readonly<{
+    readonly identityChecksum: string
+    readonly maxStabilityWindowMs: number
+    readonly priorSignedEvidenceChecksum: string
+    readonly priorObservedFromMs: number
+    readonly priorObservedThroughMs: number
+    readonly priorVerifiedAtMs: number
+  }>
   readonly verificationChecksum: string
 }
 
@@ -260,15 +289,9 @@ function normalizedInput(evidence: VerifiedReaderDeploymentEvidence): {
   }
 }
 
-function ownedSourceEvidence(
-  capability: VerifiedReaderDeploymentCapability,
-): VerifiedReaderDeploymentEvidence {
-  const snapshot = captured(
-    verifiedReaderDeploymentEvidence(capability),
-    "Verified signed reader evidence",
-  )
+function sourceEvidence(value: unknown, label: string): VerifiedReaderDeploymentEvidence {
   const root = exactRecord(
-    snapshot,
+    value,
     [
       "accountId",
       "artifacts",
@@ -281,7 +304,7 @@ function ownedSourceEvidence(
       "schemaVersion",
       "verifiedAtMs",
     ],
-    "Verified signed reader evidence",
+    label,
   )
   if (
     root.schemaVersion !== 1 ||
@@ -290,21 +313,103 @@ function ownedSourceEvidence(
     typeof root.audience !== "string" ||
     root.audience.length === 0
   ) {
-    configuration("Verified signed reader evidence has a malformed identity.")
+    configuration(`${label} has a malformed identity.`)
   }
-  canonicalValue(snapshot, "Verified signed reader evidence")
+  canonicalValue(value, label)
+  return value as VerifiedReaderDeploymentEvidence
+}
+
+function stabilityIdentity(evidence: VerifiedReaderDeploymentEvidence): JsonValue {
+  return [
+    evidence.schemaVersion,
+    evidence.accountId,
+    evidence.audience,
+    evidence.expectedScriptNames,
+    evidence.deployments.map((deployment) => [
+      deployment.scriptName,
+      deployment.deploymentId,
+      deployment.createdAtMs,
+      deployment.versions.map((version) => [version.versionId, version.weightBps]),
+    ]),
+    evidence.artifacts.map((artifact) => [
+      artifact.scriptName,
+      artifact.versionId,
+      artifact.artifactChecksum,
+    ]),
+    evidence.attestations.map((attestation) => [
+      attestation.scriptName,
+      attestation.versionId,
+      attestation.artifactChecksum,
+      attestation.controlSchemaMin,
+      attestation.controlSchemaMax,
+      attestation.outcomePayloadReaderMin,
+      attestation.outcomePayloadReaderMax,
+      attestation.issuedAtMs,
+      attestation.expiresAtMs,
+      attestation.keyId,
+      attestation.publicKeyBase64Url,
+      attestation.signature,
+    ]),
+  ]
+}
+
+function ownedStabilityEvidence(
+  capability: VerifiedReaderDeploymentStabilityCapability,
+): VerifiedReaderDeploymentStabilityEvidence {
+  const snapshot = captured(
+    verifiedReaderDeploymentStabilityEvidence(capability),
+    "Verified reader-deployment stability evidence",
+  )
+  const root = exactRecord(
+    snapshot,
+    [
+      "after",
+      "before",
+      "firstVerifiedAtMs",
+      "maxStabilityWindowMs",
+      "observedFromMs",
+      "observedThroughMs",
+      "schemaVersion",
+      "verifiedAtMs",
+    ],
+    "Verified reader-deployment stability evidence",
+  )
+  const before = sourceEvidence(root.before, "First signed reader observation")
+  const after = sourceEvidence(root.after, "Second signed reader observation")
+  if (
+    root.schemaVersion !== 1 ||
+    root.firstVerifiedAtMs !== before.verifiedAtMs ||
+    root.observedFromMs !== before.observedFromMs ||
+    root.observedThroughMs !== after.observedThroughMs ||
+    root.verifiedAtMs !== after.verifiedAtMs ||
+    !Number.isSafeInteger(root.maxStabilityWindowMs) ||
+    (root.maxStabilityWindowMs as number) < 1 ||
+    (root.maxStabilityWindowMs as number) > MAX_STABILITY_WINDOW_MS ||
+    after.observedFromMs < before.verifiedAtMs ||
+    after.verifiedAtMs - before.observedFromMs > (root.maxStabilityWindowMs as number) ||
+    canonicalJson(stabilityIdentity(before), "First reader stability identity") !==
+      canonicalJson(stabilityIdentity(after), "Second reader stability identity")
+  ) {
+    configuration("Verified reader-deployment stability evidence is contradictory.")
+  }
   return snapshot
 }
 
-async function signedSourceState(
-  capability: VerifiedReaderDeploymentCapability,
+async function stableSourceState(
+  capability: VerifiedReaderDeploymentStabilityCapability,
   digest: DigestFunction,
 ): Promise<SignedSourceState> {
-  const evidence = ownedSourceEvidence(capability)
+  const stable = ownedStabilityEvidence(capability)
+  const evidence = stable.after
+  const beforeJson = canonicalJson(stable.before, "First signed reader observation")
   const evidenceJson = canonicalJson(evidence, "Verified signed reader evidence")
-  if (byteLength(evidenceJson) > MAX_EVIDENCE_BYTES) {
+  if (
+    byteLength(beforeJson) > MAX_EVIDENCE_BYTES ||
+    byteLength(evidenceJson) > MAX_EVIDENCE_BYTES
+  ) {
     configuration("Verified signed reader evidence exceeds its byte limit.")
   }
+  const identityJson = canonicalJson(stabilityIdentity(evidence), "Reader stability identity")
   return Object.freeze({
     evidence,
     evidenceChecksum: await digestText(
@@ -312,6 +417,43 @@ async function signedSourceState(
       SIGNED_EVIDENCE_DOMAIN,
       evidenceJson,
       "Signed reader evidence",
+    ),
+    priorArtifactObservations: canonicalValue(
+      stable.before.artifacts.map(({ artifactChecksum, observation, scriptName, versionId }) => ({
+        artifactChecksum,
+        observation,
+        scriptName,
+        versionId,
+      })),
+      "First reader artifact observations",
+    ),
+    priorDeploymentObservations: canonicalValue(
+      stable.before.deployments.map(
+        ({ createdAtMs, deploymentId, observation, scriptName, versions }) => ({
+          createdAtMs,
+          deploymentId,
+          observation,
+          scriptName,
+          versions,
+        }),
+      ),
+      "First reader deployment observations",
+    ),
+    priorEvidenceChecksum: await digestText(
+      digest,
+      SIGNED_EVIDENCE_DOMAIN,
+      beforeJson,
+      "First signed reader evidence",
+    ),
+    priorObservedFromMs: stable.before.observedFromMs,
+    priorObservedThroughMs: stable.before.observedThroughMs,
+    priorVerifiedAtMs: stable.before.verifiedAtMs,
+    maxStabilityWindowMs: stable.maxStabilityWindowMs,
+    stabilityIdentityChecksum: await digestText(
+      digest,
+      STABILITY_IDENTITY_DOMAIN,
+      identityJson,
+      "Reader stability identity",
     ),
   })
 }
@@ -334,12 +476,21 @@ function verificationBody(
     ),
     observedFromMs: evidence.observedFromMs,
     observedThroughMs: evidence.observedThroughMs,
+    maxStabilityWindowMs: source.maxStabilityWindowMs,
+    priorArtifactObservations: source.priorArtifactObservations,
+    priorDeploymentObservations: source.priorDeploymentObservations,
+    priorObservedFromMs: source.priorObservedFromMs,
+    priorObservedThroughMs: source.priorObservedThroughMs,
+    priorSignedEvidenceChecksum: source.priorEvidenceChecksum,
+    priorVerifiedAtMs: source.priorVerifiedAtMs,
     protocolVersion: 1,
     readerBarrierChecksum: barrierChecksum,
     schemaVersion: 1,
     signedEvidenceChecksum: source.evidenceChecksum,
     sourceSchemaVersion: 1,
     sourceVerifiedAtMs: evidence.verifiedAtMs,
+    stabilityIdentityChecksum: source.stabilityIdentityChecksum,
+    stabilitySchemaVersion: 1,
     verifiedAtMs,
   }
 }
@@ -350,9 +501,6 @@ async function createVerificationState(
   verifiedAtMs: number,
   digest: DigestFunction,
 ): Promise<VerificationState> {
-  if (verifiedAtMs < source.evidence.verifiedAtMs) {
-    intervention("Control D1 time precedes the signed reader verification time.")
-  }
   const evidenceJson = canonicalJson(
     verificationBody(source, barrierChecksum, verifiedAtMs),
     "Reader-barrier verification",
@@ -368,6 +516,14 @@ async function createVerificationState(
     signedEvidenceChecksum: source.evidenceChecksum,
     sourceEvidence: source.evidence,
     sourceVerifiedAtMs: source.evidence.verifiedAtMs,
+    stability: Object.freeze({
+      identityChecksum: source.stabilityIdentityChecksum,
+      maxStabilityWindowMs: source.maxStabilityWindowMs,
+      priorEvidenceChecksum: source.priorEvidenceChecksum,
+      priorObservedFromMs: source.priorObservedFromMs,
+      priorObservedThroughMs: source.priorObservedThroughMs,
+      priorVerifiedAtMs: source.priorVerifiedAtMs,
+    }),
     verificationChecksum: await digestText(
       digest,
       VERIFICATION_DOMAIN,
@@ -376,6 +532,15 @@ async function createVerificationState(
     ),
     verifiedAtMs,
   })
+}
+
+function assertFreshActivationTime(source: SignedSourceState, verifiedAtMs: number): void {
+  if (verifiedAtMs < source.evidence.verifiedAtMs) {
+    intervention("Control D1 time precedes the signed reader verification time.")
+  }
+  if (verifiedAtMs - source.priorObservedFromMs > source.maxStabilityWindowMs) {
+    intervention("The reader deployment stability window expired before Control activation.")
+  }
 }
 
 function sourceFromVerificationBody(
@@ -393,6 +558,168 @@ function sourceFromVerificationBody(
     observedThroughMs: body.observedThroughMs as number,
     schemaVersion: body.sourceSchemaVersion as 1,
     verifiedAtMs: body.sourceVerifiedAtMs as number,
+  }
+}
+
+function observationBounds(
+  value: unknown,
+  label: string,
+): {
+  readonly completedAtMs: number
+  readonly startedAtMs: number
+} {
+  const observation = exactRecord(
+    value,
+    [
+      "bodyBytes",
+      "bodyState",
+      ...(plainRecord(value) && Object.hasOwn(value, "cfRay") ? ["cfRay"] : []),
+      "completedAtMs",
+      "rateLimit",
+      "responseChecksum",
+      "startedAtMs",
+      "status",
+    ],
+    label,
+  )
+  const bodyBytes = persistedInteger(observation.bodyBytes, `${label} body bytes`)
+  const startedAtMs = persistedInteger(observation.startedAtMs, `${label} start time`)
+  const completedAtMs = persistedInteger(observation.completedAtMs, `${label} completion time`)
+  if (
+    bodyBytes > MAX_EVIDENCE_BYTES ||
+    observation.bodyState !== "complete" ||
+    observation.status !== 200 ||
+    completedAtMs < startedAtMs ||
+    !plainRecord(observation.rateLimit) ||
+    typeof observation.responseChecksum !== "string" ||
+    !CHECKSUM.test(observation.responseChecksum) ||
+    (Object.hasOwn(observation, "cfRay") &&
+      (typeof observation.cfRay !== "string" || observation.cfRay.length === 0))
+  ) {
+    intervention(`${label} is malformed.`)
+  }
+  return { completedAtMs, startedAtMs }
+}
+
+async function decodeStabilityState(
+  root: Record<string, unknown>,
+  source: VerifiedReaderDeploymentEvidence,
+  digest: DigestFunction,
+): Promise<VerificationStabilityState | undefined> {
+  if (!Object.hasOwn(root, "stabilitySchemaVersion")) return undefined
+  try {
+    if (root.stabilitySchemaVersion !== 1) configuration("Unsupported stability schema.")
+    const priorArtifacts = root.priorArtifactObservations
+    const priorDeployments = root.priorDeploymentObservations
+    if (
+      !Array.isArray(priorArtifacts) ||
+      Object.keys(priorArtifacts).length !== priorArtifacts.length ||
+      priorArtifacts.length !== source.artifacts.length ||
+      !Array.isArray(priorDeployments) ||
+      Object.keys(priorDeployments).length !== priorDeployments.length ||
+      priorDeployments.length !== source.deployments.length ||
+      priorArtifacts.length === 0 ||
+      priorDeployments.length === 0
+    ) {
+      configuration("Prior observation inventory is malformed.")
+    }
+    let observedFromMs = Number.MAX_SAFE_INTEGER
+    let observedThroughMs = 0
+    for (const [index, value] of priorArtifacts.entries()) {
+      const row = exactRecord(
+        value,
+        ["artifactChecksum", "observation", "scriptName", "versionId"],
+        "Prior reader artifact observation",
+      )
+      const expected = source.artifacts[index]
+      if (
+        expected === undefined ||
+        row.artifactChecksum !== expected.artifactChecksum ||
+        row.scriptName !== expected.scriptName ||
+        row.versionId !== expected.versionId
+      ) {
+        configuration("Prior reader artifact identity is contradictory.")
+      }
+      const bounds = observationBounds(row.observation, "Prior reader artifact observation")
+      observedFromMs = Math.min(observedFromMs, bounds.startedAtMs)
+      observedThroughMs = Math.max(observedThroughMs, bounds.completedAtMs)
+    }
+    for (const [index, value] of priorDeployments.entries()) {
+      const row = exactRecord(
+        value,
+        ["createdAtMs", "deploymentId", "observation", "scriptName", "versions"],
+        "Prior reader deployment observation",
+      )
+      const expected = source.deployments[index]
+      if (
+        expected === undefined ||
+        row.createdAtMs !== expected.createdAtMs ||
+        row.deploymentId !== expected.deploymentId ||
+        row.scriptName !== expected.scriptName ||
+        canonicalJson(row.versions, "Prior reader deployment versions") !==
+          canonicalJson(expected.versions, "Current reader deployment versions")
+      ) {
+        configuration("Prior reader deployment identity is contradictory.")
+      }
+      const bounds = observationBounds(row.observation, "Prior reader deployment observation")
+      observedFromMs = Math.min(observedFromMs, bounds.startedAtMs)
+      observedThroughMs = Math.max(observedThroughMs, bounds.completedAtMs)
+    }
+    const priorObservedFromMs = persistedInteger(
+      root.priorObservedFromMs,
+      "Prior reader observation start",
+    )
+    const priorObservedThroughMs = persistedInteger(
+      root.priorObservedThroughMs,
+      "Prior reader observation completion",
+    )
+    const priorVerifiedAtMs = persistedInteger(
+      root.priorVerifiedAtMs,
+      "Prior reader verification time",
+    )
+    const maxStabilityWindowMs = persistedInteger(
+      root.maxStabilityWindowMs,
+      "Reader deployment stability window",
+    )
+    if (
+      maxStabilityWindowMs < 1 ||
+      maxStabilityWindowMs > MAX_STABILITY_WINDOW_MS ||
+      priorObservedFromMs !== observedFromMs ||
+      priorObservedThroughMs !== observedThroughMs ||
+      priorObservedThroughMs > priorVerifiedAtMs ||
+      priorVerifiedAtMs > source.observedFromMs ||
+      (root.verifiedAtMs as number) - priorObservedFromMs > maxStabilityWindowMs
+    ) {
+      configuration("Prior reader observation time order is contradictory.")
+    }
+    const priorEvidenceChecksum = persistedChecksum(
+      root.priorSignedEvidenceChecksum,
+      "Prior signed reader evidence checksum",
+    )
+    const identityChecksum = persistedChecksum(
+      root.stabilityIdentityChecksum,
+      "Reader stability identity checksum",
+    )
+    if (
+      (await digestText(
+        digest,
+        STABILITY_IDENTITY_DOMAIN,
+        canonicalJson(stabilityIdentity(source), "Persisted reader stability identity"),
+        "Persisted reader stability identity",
+      )) !== identityChecksum
+    ) {
+      configuration("Reader stability identity checksum is contradictory.")
+    }
+    return Object.freeze({
+      identityChecksum,
+      maxStabilityWindowMs,
+      priorEvidenceChecksum,
+      priorObservedFromMs,
+      priorObservedThroughMs,
+      priorVerifiedAtMs,
+    })
+  } catch {
+    return intervention("Persisted reader-deployment stability evidence is malformed.")
   }
 }
 
@@ -424,6 +751,20 @@ async function decodeVerificationRow(
   let root: Record<string, unknown>
   let canonical: string
   try {
+    const stabilityKeys =
+      plainRecord(body) && Object.hasOwn(body, "stabilitySchemaVersion")
+        ? [
+            "maxStabilityWindowMs",
+            "priorArtifactObservations",
+            "priorDeploymentObservations",
+            "priorObservedFromMs",
+            "priorObservedThroughMs",
+            "priorSignedEvidenceChecksum",
+            "priorVerifiedAtMs",
+            "stabilityIdentityChecksum",
+            "stabilitySchemaVersion",
+          ]
+        : []
     root = exactRecord(
       body,
       [
@@ -435,6 +776,7 @@ async function decodeVerificationRow(
         "expectedScriptNames",
         "observedFromMs",
         "observedThroughMs",
+        ...stabilityKeys,
         "protocolVersion",
         "readerBarrierChecksum",
         "schemaVersion",
@@ -492,6 +834,7 @@ async function decodeVerificationRow(
   ) {
     return intervention("Persisted signed reader verification checksum is contradictory.")
   }
+  const stability = await decodeStabilityState(root, sourceEvidence, digest)
   return Object.freeze({
     accountId: root.accountId,
     audience: root.audience,
@@ -500,6 +843,7 @@ async function decodeVerificationRow(
     signedEvidenceChecksum,
     sourceEvidence,
     sourceVerifiedAtMs,
+    ...(stability === undefined ? {} : { stability }),
     verificationChecksum,
     verifiedAtMs,
   })
@@ -515,6 +859,18 @@ function receipt(
     audience: verification.audience,
     signedEvidenceChecksum: verification.signedEvidenceChecksum,
     sourceVerifiedAtMs: verification.sourceVerifiedAtMs,
+    ...(verification.stability === undefined
+      ? {}
+      : {
+          stability: Object.freeze({
+            identityChecksum: verification.stability.identityChecksum,
+            maxStabilityWindowMs: verification.stability.maxStabilityWindowMs,
+            priorObservedFromMs: verification.stability.priorObservedFromMs,
+            priorObservedThroughMs: verification.stability.priorObservedThroughMs,
+            priorSignedEvidenceChecksum: verification.stability.priorEvidenceChecksum,
+            priorVerifiedAtMs: verification.stability.priorVerifiedAtMs,
+          }),
+        }),
     verificationChecksum: verification.verificationChecksum,
   })
 }
@@ -543,6 +899,7 @@ function signedMutationResults(results: readonly ControlRunResult[]): void {
 function mutationStatements(
   database: TransactionalControlDatabase,
   barrier: CanonicalReaderBarrierState,
+  source: SignedSourceState,
   verification: VerificationState,
 ): readonly ControlStatement[] {
   return [
@@ -647,6 +1004,7 @@ function mutationStatements(
            AND "verification"."verification_checksum" = ?2
            AND "verification"."evidence_json" = ?3
            AND "verification"."verified_at_ms" = ?4
+           AND ${SERVER_TIME_SQL} - ?5 <= ?6
          ON CONFLICT ("protocol_version") DO NOTHING`,
       )
       .bind(
@@ -654,6 +1012,8 @@ function mutationStatements(
         verification.verificationChecksum,
         verification.evidenceJson,
         verification.verifiedAtMs,
+        source.priorObservedFromMs,
+        source.maxStabilityWindowMs,
       ),
     database
       .prepare(
@@ -675,6 +1035,7 @@ function mutationStatements(
              AND "verification"."evidence_json" = ?3
              AND "verification"."verified_at_ms" = ?4
              AND "activation"."activated_at_ms" >= ?4
+             AND "activation"."activated_at_ms" - ?5 <= ?6
          )`,
       )
       .bind(
@@ -682,6 +1043,8 @@ function mutationStatements(
         verification.verificationChecksum,
         verification.evidenceJson,
         verification.verifiedAtMs,
+        source.priorObservedFromMs,
+        source.maxStabilityWindowMs,
       ),
   ]
 }
@@ -762,9 +1125,9 @@ export class D1SignedReaderBarrierStore {
   }
 
   async activate(
-    signedCapability: VerifiedReaderDeploymentCapability,
+    stabilityCapability: VerifiedReaderDeploymentStabilityCapability,
   ): Promise<SignedReaderBarrierReceipt> {
-    const source = await signedSourceState(signedCapability, this.#digest)
+    const source = await stableSourceState(stabilityCapability, this.#digest)
     const normalizedCapability = await verifyReaderDeploymentBarrier(
       normalizedInput(source.evidence),
       this.#digest,
@@ -776,7 +1139,9 @@ export class D1SignedReaderBarrierStore {
       if (
         existing === undefined ||
         existing.barrierChecksum !== barrier.barrierChecksum ||
-        existing.signedEvidenceChecksum !== source.evidenceChecksum
+        (existing.stability === undefined
+          ? existing.signedEvidenceChecksum !== source.evidenceChecksum
+          : existing.stability.identityChecksum !== source.stabilityIdentityChecksum)
       ) {
         return intervention("Signed reader activation is bound to other verification evidence.")
       }
@@ -784,27 +1149,29 @@ export class D1SignedReaderBarrierStore {
     }
     await this.#normalized.assertCompatible(normalizedCapability)
     const partial = await this.#rawVerification()
-    let verification: VerificationState
-    if (partial === null) {
-      verification = await createVerificationState(
-        source,
-        barrier.barrierChecksum,
-        await this.#serverTime(),
-        this.#digest,
-      )
-    } else {
-      verification = await decodeVerificationRow(partial, this.#digest)
+    if (partial !== null) {
+      const raced = (await this.get()) as SignedReaderBarrierReceipt
       if (
-        verification.readerBarrierChecksum !== barrier.barrierChecksum ||
-        verification.signedEvidenceChecksum !== source.evidenceChecksum
+        raced.stability === undefined ||
+        raced.barrierChecksum !== barrier.barrierChecksum ||
+        raced.stability.identityChecksum !== source.stabilityIdentityChecksum
       ) {
-        return intervention("Partial signed reader verification contradicts current evidence.")
+        return intervention("Signed reader activation is bound to other verification evidence.")
       }
+      return raced
     }
+    const activationTime = await this.#serverTime()
+    assertFreshActivationTime(source, activationTime)
+    const verification = await createVerificationState(
+      source,
+      barrier.barrierChecksum,
+      activationTime,
+      this.#digest,
+    )
     let results: readonly ControlRunResult[] | undefined
     try {
       results = await this.#database.batch(
-        mutationStatements(this.#database, barrier, verification),
+        mutationStatements(this.#database, barrier, source, verification),
       )
     } catch {
       // Exact immutable state below decides whether the signed activation committed.
@@ -817,7 +1184,7 @@ export class D1SignedReaderBarrierStore {
     }
     if (
       activated.barrierChecksum !== barrier.barrierChecksum ||
-      activated.signedEvidenceChecksum !== source.evidenceChecksum
+      activated.stability?.identityChecksum !== source.stabilityIdentityChecksum
     ) {
       return intervention("Signed reader activation is bound to other verification evidence.")
     }
