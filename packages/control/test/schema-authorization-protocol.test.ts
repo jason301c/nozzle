@@ -391,6 +391,7 @@ describe("control schema irreversible authorization protocol", () => {
         { schema_version: 2 },
         { schema_version: 3 },
         { schema_version: 4 },
+        { schema_version: 5 },
       ])
       expect(
         database

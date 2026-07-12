@@ -7,6 +7,8 @@ import { describe, expect, it } from "vitest"
 import {
   CONTROL_SCHEMA_STATEMENTS,
   CONTROL_SCHEMA_VERSION,
+  CONTROL_SCHEMA_VERSION_FOUR_ARTIFACT_SHA256,
+  CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS,
   CONTROL_SCHEMA_VERSION_ONE_ARTIFACT_SHA256,
   CONTROL_SCHEMA_VERSION_ONE_STATEMENTS,
   CONTROL_SCHEMA_VERSION_THREE_ARTIFACT_SHA256,
@@ -15,6 +17,7 @@ import {
   CONTROL_SCHEMA_VERSION_TWO_STATEMENTS,
   CONTROL_TABLE_NAMES,
   controlSchemaSql,
+  controlSchemaVersionFourSql,
   controlSchemaVersionOneSql,
   controlSchemaVersionThreeSql,
   controlSchemaVersionTwoSql,
@@ -82,6 +85,9 @@ const schemaInstallBoundaries = CONTROL_SCHEMA_STATEMENTS.flatMap((statement, in
     statement.includes("saga_outcome_payload_activation") ||
     statement.includes("saga_outcome_payload") ||
     statement.includes("saga_outcome_inline_bytes_v4") ||
+    statement.includes("reader_version_attestation") ||
+    statement.includes("reader_barrier") ||
+    statement.includes("activation_barrier_v5") ||
     statement.includes('DROP TRIGGER IF EXISTS "nozzle_control_saga_attempt_insert"') ||
     statement.includes('DROP TRIGGER IF EXISTS "nozzle_control_saga_outcome_insert"') ||
     index === CONTROL_SCHEMA_STATEMENTS.length - 1
@@ -122,10 +128,21 @@ describe("control D1 schema", () => {
     expect(sql).not.toContain("nozzle_saga_action_attempt_outcome_payloads")
   })
 
+  it("keeps the complete historical version-four install artifact checksum-locked", () => {
+    const sql = controlSchemaVersionFourSql()
+    expect(Object.isFrozen(CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS)).toBe(true)
+    expect(CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS).toHaveLength(186)
+    expect(createHash("sha256").update(sql).digest("hex")).toBe(
+      CONTROL_SCHEMA_VERSION_FOUR_ARTIFACT_SHA256,
+    )
+    expect(sql).toContain("VALUES (4, CAST(unixepoch('subsec') * 1000 AS INTEGER))")
+    expect(sql).not.toContain("nozzle_reader_barriers")
+  })
+
   it("emits one deterministic install artifact with every required ledger table", () => {
     const sql = controlSchemaSql()
     expect(sql).toBe(`${CONTROL_SCHEMA_STATEMENTS.join("\n\n")}\n`)
-    expect(CONTROL_SCHEMA_VERSION).toBe(4)
+    expect(CONTROL_SCHEMA_VERSION).toBe(5)
     expect(Object.isFrozen(CONTROL_SCHEMA_STATEMENTS)).toBe(true)
     expect(Object.isFrozen(CONTROL_TABLE_NAMES)).toBe(true)
     expect(sql).not.toContain("fictional-secret")
@@ -164,6 +181,7 @@ describe("control D1 schema", () => {
         { schema_version: 2 },
         { schema_version: 3 },
         { schema_version: 4 },
+        { schema_version: 5 },
       ])
       expect(() =>
         database.prepare(`UPDATE "nozzle_control_meta" SET "installed_at_ms" = 0`).run(),
@@ -216,6 +234,7 @@ describe("control D1 schema", () => {
         expect.objectContaining({ schema_version: 2 }),
         expect.objectContaining({ schema_version: 3 }),
         expect.objectContaining({ schema_version: 4 }),
+        expect.objectContaining({ schema_version: 5 }),
       ])
       expect(
         database
@@ -265,6 +284,7 @@ describe("control D1 schema", () => {
         { schema_version: 2 },
         { schema_version: 3 },
         { schema_version: 4 },
+        { schema_version: 5 },
       ])
       expect(
         database
@@ -300,6 +320,7 @@ describe("control D1 schema", () => {
         { schema_version: 2 },
         { schema_version: 3 },
         { schema_version: 4 },
+        { schema_version: 5 },
       ])
     } finally {
       database.close()
@@ -357,6 +378,7 @@ describe("control D1 schema", () => {
           { schema_version: 2 },
           { schema_version: 3 },
           { schema_version: 4 },
+          { schema_version: 5 },
         ])
         expect(
           installer
@@ -396,7 +418,7 @@ describe("control D1 schema", () => {
         "published_at_ms" INTEGER NOT NULL CHECK ("published_at_ms" >= 0)
       );
       INSERT INTO "nozzle_control_schema_versions"
-      VALUES (1, 1234), (2, 2345), (3, 3456), (4, 4567), (5, 5678);
+      VALUES (1, 1234), (2, 2345), (3, 3456), (4, 4567), (5, 5678), (6, 6789);
       CREATE TABLE "nozzle_saga_action_attempts" ("attempt_id" TEXT);
       CREATE TRIGGER "nozzle_control_saga_attempt_insert_v2"
       BEFORE INSERT ON "nozzle_saga_action_attempts" BEGIN SELECT 3; END;`)
@@ -567,7 +589,9 @@ describe("control D1 schema", () => {
   ] as const)("refuses version-four publication with a corrupt %s trigger", (name, table) => {
     const database = new DatabaseSync(":memory:")
     try {
-      for (const statement of CONTROL_SCHEMA_STATEMENTS.slice(0, -1)) database.exec(statement)
+      for (const statement of CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS.slice(0, -1)) {
+        database.exec(statement)
+      }
       database.exec(`DROP TRIGGER "${name}";`)
       database.exec(`CREATE TRIGGER "${name}" BEFORE INSERT ON "${table}"
         BEGIN SELECT 4; END;`)
@@ -672,11 +696,47 @@ describe("control D1 schema", () => {
           .prepare(`SELECT count(*) AS "count" FROM "nozzle_saga_outcome_payload_activations"`)
           .get(),
       ).toEqual({ count: 0 })
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO "nozzle_saga_outcome_payload_activations"
+             ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
+             VALUES (1, ?, 1)`,
+          )
+          .run("7".repeat(64)),
+      ).toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_READER_BARRIER_REQUIRED")
+      database
+        .prepare(
+          `INSERT INTO "nozzle_reader_barriers"
+           ("protocol_version", "barrier_checksum", "inventory_checksum", "barrier_json",
+            "verified_at_ms")
+           VALUES (1, ?, ?, ?, 2)`,
+        )
+        .run(
+          "7".repeat(64),
+          "8".repeat(64),
+          JSON.stringify({
+            activeDeployments: [],
+            attestations: [],
+            expectedScriptNames: [],
+            protocolVersion: 1,
+            schemaVersion: 1,
+          }),
+        )
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO "nozzle_saga_outcome_payload_activations"
+             ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
+             VALUES (1, ?, 1)`,
+          )
+          .run("7".repeat(64)),
+      ).toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_READER_BARRIER_REQUIRED")
       database
         .prepare(
           `INSERT INTO "nozzle_saga_outcome_payload_activations"
            ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
-           VALUES (1, ?, 1)`,
+           VALUES (1, ?, 2)`,
         )
         .run("7".repeat(64))
       expect(() =>
@@ -687,6 +747,87 @@ describe("control D1 schema", () => {
       expect(() =>
         database.prepare(`DELETE FROM "nozzle_saga_outcome_payload_activations"`).run(),
       ).toThrow("NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_ACTIVATION_PERSISTENT")
+    })
+  })
+
+  it("keeps reader evidence structurally bound, immutable, and persistent", () => {
+    withDatabase((database) => {
+      const body = {
+        artifactChecksum: "1".repeat(64),
+        controlSchemaMax: 5,
+        controlSchemaMin: 5,
+        outcomePayloadReaderMax: 1,
+        outcomePayloadReaderMin: 1,
+        schemaVersion: 1,
+        scriptName: "reader",
+        versionId: "version",
+      }
+      const insertAttestation = database.prepare(
+        `INSERT INTO "nozzle_reader_version_attestations"
+         ("script_name", "version_id", "artifact_checksum", "control_schema_min",
+          "control_schema_max", "outcome_payload_reader_min", "outcome_payload_reader_max",
+          "attestation_checksum", "attestation_json", "registered_at_ms")
+         VALUES (?, ?, ?, 5, 5, 1, 1, ?, ?, 1)`,
+      )
+      const { outcomePayloadReaderMax: _missing, ...missingField } = body
+      expect(() =>
+        insertAttestation.run(
+          "missing-reader",
+          "missing-version",
+          "1".repeat(64),
+          "2".repeat(64),
+          JSON.stringify({
+            ...missingField,
+            scriptName: "missing-reader",
+            versionId: "missing-version",
+          }),
+        ),
+      ).toThrow("CHECK constraint failed")
+      insertAttestation.run(
+        "reader",
+        "version",
+        "1".repeat(64),
+        "2".repeat(64),
+        JSON.stringify(body),
+      )
+      expect(() =>
+        database
+          .prepare(`UPDATE "nozzle_reader_version_attestations" SET "registered_at_ms" = 2`)
+          .run(),
+      ).toThrow("NOZZLE_CONTROL_READER_ATTESTATION_IMMUTABLE")
+      expect(() =>
+        database.prepare(`DELETE FROM "nozzle_reader_version_attestations"`).run(),
+      ).toThrow("NOZZLE_CONTROL_READER_ATTESTATION_PERSISTENT")
+
+      const insertBarrier = database.prepare(
+        `INSERT INTO "nozzle_reader_barriers"
+         ("protocol_version", "barrier_checksum", "inventory_checksum", "barrier_json",
+          "verified_at_ms") VALUES (1, ?, ?, ?, 1)`,
+      )
+      expect(() =>
+        insertBarrier.run(
+          "3".repeat(64),
+          "4".repeat(64),
+          JSON.stringify({ protocolVersion: 1, schemaVersion: 1 }),
+        ),
+      ).toThrow("CHECK constraint failed")
+      insertBarrier.run(
+        "3".repeat(64),
+        "4".repeat(64),
+        JSON.stringify({
+          activeDeployments: [],
+          attestations: [],
+          expectedScriptNames: [],
+          protocolVersion: 1,
+          schemaVersion: 1,
+        }),
+      )
+      expect(() =>
+        database.prepare(`UPDATE "nozzle_reader_barriers" SET "verified_at_ms" = 2`).run(),
+      ).toThrow("NOZZLE_CONTROL_READER_BARRIER_IMMUTABLE")
+      expect(() => database.prepare(`DELETE FROM "nozzle_reader_barriers"`).run()).toThrow(
+        "NOZZLE_CONTROL_READER_BARRIER_PERSISTENT",
+      )
     })
   })
 
@@ -758,11 +899,11 @@ describe("control D1 schema", () => {
   })
 
   it("installs every row-safe outcome guard before publishing version four", () => {
-    const publication = CONTROL_SCHEMA_STATEMENTS.length - 1
-    const activationTable = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+    const publication = CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS.length - 1
+    const activationTable = CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS.findIndex((statement) =>
       statement.startsWith('CREATE TABLE IF NOT EXISTS "nozzle_saga_outcome_payload_activations"'),
     )
-    const table = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+    const table = CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS.findIndex((statement) =>
       statement.startsWith(
         'CREATE TABLE IF NOT EXISTS "nozzle_saga_action_attempt_outcome_payloads"',
       ),
@@ -776,22 +917,219 @@ describe("control D1 schema", () => {
       "nozzle_control_saga_outcome_payload_update",
       "nozzle_control_saga_outcome_payload_delete",
     ].map((name) =>
-      CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+      CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS.findIndex((statement) =>
         statement.includes(`CREATE TRIGGER IF NOT EXISTS "${name}"`),
       ),
     )
     expect(activationTable).toBeGreaterThanOrEqual(CONTROL_SCHEMA_VERSION_THREE_STATEMENTS.length)
     expect(table).toBeGreaterThan(activationTable)
     expect(guards.every((index) => index > activationTable && index < publication)).toBe(true)
-    expect(CONTROL_SCHEMA_STATEMENTS.at(-3)).toContain(
+    expect(CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS.at(-3)).toContain(
       'SELECT 1 FROM "nozzle_saga_outcome_payload_activations"',
     )
-    expect(CONTROL_SCHEMA_STATEMENTS.at(-2)).toContain(
+    expect(CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS.at(-2)).toContain(
       'SELECT 1 FROM "nozzle_saga_action_attempt_outcome_payloads"',
+    )
+    expect(CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS.at(-1)).toBe(
+      `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (4, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`,
+    )
+  })
+
+  it.each([
+    ["nozzle_reader_version_attestations", '"script_name" TEXT PRIMARY KEY NOT NULL'],
+    ["nozzle_reader_barriers", '"protocol_version" INTEGER PRIMARY KEY NOT NULL'],
+  ] as const)("refuses version-five publication with a corrupt %s table", (name, columns) => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      database.exec(controlSchemaVersionFourSql())
+      database.exec(`CREATE TABLE "${name}" (${columns});`)
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+             WHERE "schema_version" = 5`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it.each([
+    ["nozzle_control_reader_version_attestation_insert_v5", "nozzle_reader_version_attestations"],
+    ["nozzle_control_reader_version_attestation_update", "nozzle_reader_version_attestations"],
+    ["nozzle_control_reader_version_attestation_delete", "nozzle_reader_version_attestations"],
+    ["nozzle_control_reader_barrier_insert_v5", "nozzle_reader_barriers"],
+    ["nozzle_control_reader_barrier_update", "nozzle_reader_barriers"],
+    ["nozzle_control_reader_barrier_delete", "nozzle_reader_barriers"],
+    [
+      "nozzle_control_saga_outcome_payload_activation_barrier_v5",
+      "nozzle_saga_outcome_payload_activations",
+    ],
+  ] as const)("refuses version-five publication with a corrupt %s trigger", (name, table) => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      for (const statement of CONTROL_SCHEMA_STATEMENTS.slice(0, -1)) database.exec(statement)
+      database.exec(`DROP TRIGGER "${name}";`)
+      database.exec(`CREATE TRIGGER "${name}" BEFORE INSERT ON "${table}"
+        BEGIN SELECT 5; END;`)
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+             WHERE "schema_version" = 5`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it.each([
+    "attestation",
+    "barrier",
+  ] as const)("never publishes version five over a prepublication reader %s", (kind) => {
+    const database = new DatabaseSync(":memory:")
+    const tableName =
+      kind === "attestation" ? "nozzle_reader_version_attestations" : "nozzle_reader_barriers"
+    const tableIndex = CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+      statement.startsWith(`CREATE TABLE IF NOT EXISTS "${tableName}"`),
+    )
+    try {
+      database.exec(controlSchemaVersionFourSql())
+      database.exec(CONTROL_SCHEMA_STATEMENTS[tableIndex] as string)
+      if (kind === "attestation") {
+        database
+          .prepare(
+            `INSERT INTO "nozzle_reader_version_attestations"
+               ("script_name", "version_id", "artifact_checksum", "control_schema_min",
+                "control_schema_max", "outcome_payload_reader_min", "outcome_payload_reader_max",
+                "attestation_checksum",
+                "attestation_json", "registered_at_ms")
+               VALUES ('reader', 'version', ?, 5, 5, 1, 1, ?, ?, 1)`,
+          )
+          .run(
+            "1".repeat(64),
+            "2".repeat(64),
+            JSON.stringify({
+              artifactChecksum: "1".repeat(64),
+              controlSchemaMax: 5,
+              controlSchemaMin: 5,
+              outcomePayloadReaderMax: 1,
+              outcomePayloadReaderMin: 1,
+              schemaVersion: 1,
+              scriptName: "reader",
+              versionId: "version",
+            }),
+          )
+      } else {
+        database
+          .prepare(
+            `INSERT INTO "nozzle_reader_barriers"
+               ("protocol_version", "barrier_checksum", "inventory_checksum", "barrier_json",
+                "verified_at_ms") VALUES (1, ?, ?, ?, 1)`,
+          )
+          .run(
+            "1".repeat(64),
+            "2".repeat(64),
+            JSON.stringify({
+              activeDeployments: [],
+              attestations: [],
+              expectedScriptNames: [],
+              protocolVersion: 1,
+              schemaVersion: 1,
+            }),
+          )
+      }
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+               WHERE "schema_version" = 5`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("never publishes version five over an unproved version-four activation", () => {
+    const database = new DatabaseSync(":memory:")
+    try {
+      database.exec(controlSchemaVersionFourSql())
+      database
+        .prepare(
+          `INSERT INTO "nozzle_saga_outcome_payload_activations"
+           ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
+           VALUES (1, ?, 1)`,
+        )
+        .run("7".repeat(64))
+
+      expect(() => database.exec(controlSchemaSql())).toThrow("CHECK constraint failed")
+      expect(
+        database
+          .prepare(
+            `SELECT count(*) AS "count" FROM "nozzle_control_schema_versions"
+             WHERE "schema_version" = 5`,
+          )
+          .get(),
+      ).toEqual({ count: 0 })
+    } finally {
+      database.close()
+    }
+  })
+
+  it("installs every reader-barrier guard and empty-history audit before version five", () => {
+    const publication = CONTROL_SCHEMA_STATEMENTS.length - 1
+    const tableIndices = ["nozzle_reader_version_attestations", "nozzle_reader_barriers"].map(
+      (name) =>
+        CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+          statement.startsWith(`CREATE TABLE IF NOT EXISTS "${name}"`),
+        ),
+    )
+    const triggerIndices = [
+      "nozzle_control_reader_version_attestation_insert_v5",
+      "nozzle_control_reader_version_attestation_update",
+      "nozzle_control_reader_version_attestation_delete",
+      "nozzle_control_reader_barrier_insert_v5",
+      "nozzle_control_reader_barrier_update",
+      "nozzle_control_reader_barrier_delete",
+      "nozzle_control_saga_outcome_payload_activation_barrier_v5",
+    ].map((name) =>
+      CONTROL_SCHEMA_STATEMENTS.findIndex((statement) =>
+        statement.includes(`CREATE TRIGGER IF NOT EXISTS "${name}"`),
+      ),
+    )
+    expect(
+      tableIndices.every((index) => index >= CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS.length),
+    ).toBe(true)
+    expect(
+      triggerIndices
+        .slice(0, 3)
+        .every((index) => index > (tableIndices[0] as number) && index < publication),
+    ).toBe(true)
+    expect(
+      triggerIndices
+        .slice(3)
+        .every((index) => index > (tableIndices[1] as number) && index < publication),
+    ).toBe(true)
+    expect(CONTROL_SCHEMA_STATEMENTS.slice(-4, -1).join("\n")).toContain(
+      'FROM "nozzle_saga_outcome_payload_activations" AS "activation"',
     )
     expect(CONTROL_SCHEMA_STATEMENTS.at(-1)).toBe(
       `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
-VALUES (4, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+VALUES (5, CAST(unixepoch('subsec') * 1000 AS INTEGER))
 ON CONFLICT ("schema_version") DO NOTHING;`,
     )
   })

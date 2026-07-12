@@ -60,6 +60,23 @@ const TEST_READER_BARRIER_CHECKSUM = "7".repeat(64)
 function activateRowSafeSagaOutcomes(database: DatabaseSync): void {
   database
     .prepare(
+      `INSERT INTO "nozzle_reader_barriers"
+       ("protocol_version", "barrier_checksum", "inventory_checksum", "barrier_json",
+        "verified_at_ms") VALUES (1, ?, ?, ?, 1)`,
+    )
+    .run(
+      TEST_READER_BARRIER_CHECKSUM,
+      "8".repeat(64),
+      JSON.stringify({
+        activeDeployments: [],
+        attestations: [],
+        expectedScriptNames: [],
+        protocolVersion: 1,
+        schemaVersion: 1,
+      }),
+    )
+  database
+    .prepare(
       `INSERT INTO "nozzle_saga_outcome_payload_activations"
        ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
        VALUES (1, ?, 1)`,

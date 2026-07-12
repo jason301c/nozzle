@@ -106,6 +106,23 @@ async function reconcileStoredSagaHistory(operationId: string, sagaId: string) {
 beforeAll(async () => {
   for (const statement of CONTROL_SCHEMA_STATEMENTS) await env.DB.prepare(statement).run()
   await env.DB.prepare(
+    `INSERT INTO "nozzle_reader_barriers"
+     ("protocol_version", "barrier_checksum", "inventory_checksum", "barrier_json",
+      "verified_at_ms") VALUES (1, ?1, ?2, ?3, 1)`,
+  )
+    .bind(
+      "7".repeat(64),
+      "8".repeat(64),
+      JSON.stringify({
+        activeDeployments: [],
+        attestations: [],
+        expectedScriptNames: [],
+        protocolVersion: 1,
+        schemaVersion: 1,
+      }),
+    )
+    .run()
+  await env.DB.prepare(
     `INSERT INTO "nozzle_saga_outcome_payload_activations"
      ("protocol_version", "reader_barrier_checksum", "activated_at_ms")
      VALUES (1, ?1, 1)`,
@@ -162,6 +179,7 @@ describe("real workerd D1 saga projection", () => {
       { schema_version: 2 },
       { schema_version: 3 },
       { schema_version: 4 },
+      { schema_version: 5 },
     ])
     expect(replacementGuards.results).toEqual([
       { name: "nozzle_control_saga_attempt_insert_v2" },
@@ -232,6 +250,7 @@ describe("real workerd D1 saga projection", () => {
       { schema_version: 2 },
       { schema_version: 3 },
       { schema_version: 4 },
+      { schema_version: 5 },
     ])
     expect(replacementGuards.results).toEqual([
       { name: "nozzle_control_irreversible_authorization_body_fence_v3" },

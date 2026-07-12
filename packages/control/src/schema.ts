@@ -1,4 +1,4 @@
-export const CONTROL_SCHEMA_VERSION = 4 as const
+export const CONTROL_SCHEMA_VERSION = 5 as const
 
 export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_audit_log",
@@ -20,6 +20,8 @@ export const CONTROL_TABLE_NAMES = Object.freeze([
   "nozzle_placement_constraints",
   "nozzle_provider_attempt_outcomes",
   "nozzle_provider_attempts",
+  "nozzle_reader_barriers",
+  "nozzle_reader_version_attestations",
   "nozzle_route_overrides",
   "nozzle_route_versions",
   "nozzle_saga_action_attempt_outcome_payloads",
@@ -563,6 +565,112 @@ const SAGA_OUTCOME_PAYLOAD_DELETE_DEFINITION = `CREATE TRIGGER "nozzle_control_s
 BEFORE DELETE ON "nozzle_saga_action_attempt_outcome_payloads"
 BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_PERSISTENT'); END`
 
+const READER_VERSION_ATTESTATION_TABLE_DEFINITION = `CREATE TABLE "nozzle_reader_version_attestations" (
+  "script_name" TEXT NOT NULL CHECK (length(trim("script_name")) BETWEEN 1 AND 255),
+  "version_id" TEXT NOT NULL CHECK (length(trim("version_id")) BETWEEN 1 AND 128),
+  "artifact_checksum" TEXT NOT NULL CHECK (
+    length("artifact_checksum") = 64
+      AND "artifact_checksum" NOT GLOB '*[^0-9a-f]*'
+  ),
+  "control_schema_min" INTEGER NOT NULL CHECK ("control_schema_min" >= 1),
+  "control_schema_max" INTEGER NOT NULL CHECK (
+    "control_schema_max" >= "control_schema_min"
+  ),
+  "outcome_payload_reader_min" INTEGER NOT NULL CHECK (
+    "outcome_payload_reader_min" >= 1
+  ),
+  "outcome_payload_reader_max" INTEGER NOT NULL CHECK (
+    "outcome_payload_reader_max" >= "outcome_payload_reader_min"
+  ),
+  "attestation_checksum" TEXT NOT NULL CHECK (
+    length("attestation_checksum") = 64
+      AND "attestation_checksum" NOT GLOB '*[^0-9a-f]*'
+  ),
+  "attestation_json" TEXT NOT NULL CHECK (
+    json_valid("attestation_json")
+      AND length(CAST("attestation_json" AS BLOB)) BETWEEN 1 AND 65536
+  ),
+  "registered_at_ms" INTEGER NOT NULL CHECK ("registered_at_ms" >= 0),
+  PRIMARY KEY ("script_name", "version_id"),
+  UNIQUE ("attestation_checksum"),
+  CHECK (json_extract("attestation_json", '$.schemaVersion') IS 1),
+  CHECK (json_extract("attestation_json", '$.scriptName') IS "script_name"),
+  CHECK (json_extract("attestation_json", '$.versionId') IS "version_id"),
+  CHECK (json_extract("attestation_json", '$.artifactChecksum') IS "artifact_checksum"),
+  CHECK (json_extract("attestation_json", '$.controlSchemaMin') IS "control_schema_min"),
+  CHECK (json_extract("attestation_json", '$.controlSchemaMax') IS "control_schema_max"),
+  CHECK (
+    json_extract("attestation_json", '$.outcomePayloadReaderMin') IS
+      "outcome_payload_reader_min"
+  ),
+  CHECK (
+    json_extract("attestation_json", '$.outcomePayloadReaderMax') IS
+      "outcome_payload_reader_max"
+  )
+)`
+
+const READER_BARRIER_TABLE_DEFINITION = `CREATE TABLE "nozzle_reader_barriers" (
+  "protocol_version" INTEGER PRIMARY KEY NOT NULL CHECK ("protocol_version" = 1),
+  "barrier_checksum" TEXT UNIQUE NOT NULL CHECK (
+    length("barrier_checksum") = 64
+      AND "barrier_checksum" NOT GLOB '*[^0-9a-f]*'
+  ),
+  "inventory_checksum" TEXT NOT NULL CHECK (
+    length("inventory_checksum") = 64
+      AND "inventory_checksum" NOT GLOB '*[^0-9a-f]*'
+  ),
+  "barrier_json" TEXT NOT NULL CHECK (
+    json_valid("barrier_json")
+      AND length(CAST("barrier_json" AS BLOB)) BETWEEN 1 AND 1048576
+  ),
+  "verified_at_ms" INTEGER NOT NULL CHECK ("verified_at_ms" >= 0),
+  CHECK (json_extract("barrier_json", '$.schemaVersion') IS 1),
+  CHECK (json_extract("barrier_json", '$.protocolVersion') IS "protocol_version"),
+  CHECK (json_type("barrier_json", '$.activeDeployments') IS 'array'),
+  CHECK (json_type("barrier_json", '$.attestations') IS 'array'),
+  CHECK (json_type("barrier_json", '$.expectedScriptNames') IS 'array')
+)`
+
+const READER_VERSION_ATTESTATION_INSERT_V5_DEFINITION = `CREATE TRIGGER "nozzle_control_reader_version_attestation_insert_v5"
+BEFORE INSERT ON "nozzle_reader_version_attestations"
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 5
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_READER_ATTESTATION_UNPUBLISHED'); END`
+
+const READER_VERSION_ATTESTATION_UPDATE_DEFINITION = `CREATE TRIGGER "nozzle_control_reader_version_attestation_update"
+BEFORE UPDATE ON "nozzle_reader_version_attestations"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_READER_ATTESTATION_IMMUTABLE'); END`
+
+const READER_VERSION_ATTESTATION_DELETE_DEFINITION = `CREATE TRIGGER "nozzle_control_reader_version_attestation_delete"
+BEFORE DELETE ON "nozzle_reader_version_attestations"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_READER_ATTESTATION_PERSISTENT'); END`
+
+const READER_BARRIER_INSERT_V5_DEFINITION = `CREATE TRIGGER "nozzle_control_reader_barrier_insert_v5"
+BEFORE INSERT ON "nozzle_reader_barriers"
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 5
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_READER_BARRIER_UNPUBLISHED'); END`
+
+const READER_BARRIER_UPDATE_DEFINITION = `CREATE TRIGGER "nozzle_control_reader_barrier_update"
+BEFORE UPDATE ON "nozzle_reader_barriers"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_READER_BARRIER_IMMUTABLE'); END`
+
+const READER_BARRIER_DELETE_DEFINITION = `CREATE TRIGGER "nozzle_control_reader_barrier_delete"
+BEFORE DELETE ON "nozzle_reader_barriers"
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_READER_BARRIER_PERSISTENT'); END`
+
+const SAGA_OUTCOME_PAYLOAD_ACTIVATION_BARRIER_V5_DEFINITION = `CREATE TRIGGER "nozzle_control_saga_outcome_payload_activation_barrier_v5"
+BEFORE INSERT ON "nozzle_saga_outcome_payload_activations"
+WHEN NOT EXISTS (
+  SELECT 1 FROM "nozzle_reader_barriers" AS "barrier"
+  WHERE "barrier"."protocol_version" = NEW."protocol_version"
+    AND "barrier"."barrier_checksum" = NEW."reader_barrier_checksum"
+    AND "barrier"."verified_at_ms" <= NEW."activated_at_ms"
+)
+BEGIN SELECT RAISE(ABORT, 'NOZZLE_CONTROL_SAGA_OUTCOME_PAYLOAD_READER_BARRIER_REQUIRED'); END`
+
 const SAGA_ATTEMPT_V2_BINDING = `EXISTS (
   SELECT 1
   FROM "nozzle_sagas" AS "saga"
@@ -1096,7 +1204,7 @@ ON CONFLICT ("schema_version") DO NOTHING;`,
   `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
 SELECT 0, 0
 WHERE EXISTS (
-  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 4
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 5
 );`,
   `INSERT INTO "nozzle_control_meta" ("schema_version", "installed_at_ms")
 VALUES (1, CAST(unixepoch('subsec') * 1000 AS INTEGER))
@@ -2208,6 +2316,53 @@ AND EXISTS (
   `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
 VALUES (4, CAST(unixepoch('subsec') * 1000 AS INTEGER))
 ON CONFLICT ("schema_version") DO NOTHING;`,
+  tableInstallStatement(READER_VERSION_ATTESTATION_TABLE_DEFINITION),
+  tableDefinitionGuard(READER_VERSION_ATTESTATION_TABLE_DEFINITION),
+  triggerInstallStatement(READER_VERSION_ATTESTATION_INSERT_V5_DEFINITION),
+  triggerDefinitionGuard(READER_VERSION_ATTESTATION_INSERT_V5_DEFINITION),
+  triggerInstallStatement(READER_VERSION_ATTESTATION_UPDATE_DEFINITION),
+  triggerDefinitionGuard(READER_VERSION_ATTESTATION_UPDATE_DEFINITION),
+  triggerInstallStatement(READER_VERSION_ATTESTATION_DELETE_DEFINITION),
+  triggerDefinitionGuard(READER_VERSION_ATTESTATION_DELETE_DEFINITION),
+  tableInstallStatement(READER_BARRIER_TABLE_DEFINITION),
+  tableDefinitionGuard(READER_BARRIER_TABLE_DEFINITION),
+  triggerInstallStatement(READER_BARRIER_INSERT_V5_DEFINITION),
+  triggerDefinitionGuard(READER_BARRIER_INSERT_V5_DEFINITION),
+  triggerInstallStatement(READER_BARRIER_UPDATE_DEFINITION),
+  triggerDefinitionGuard(READER_BARRIER_UPDATE_DEFINITION),
+  triggerInstallStatement(READER_BARRIER_DELETE_DEFINITION),
+  triggerDefinitionGuard(READER_BARRIER_DELETE_DEFINITION),
+  triggerInstallStatement(SAGA_OUTCOME_PAYLOAD_ACTIVATION_BARRIER_V5_DEFINITION),
+  triggerDefinitionGuard(SAGA_OUTCOME_PAYLOAD_ACTIVATION_BARRIER_V5_DEFINITION),
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 5
+)
+AND EXISTS (
+  SELECT 1 FROM "nozzle_reader_version_attestations"
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" = 5
+)
+AND EXISTS (
+  SELECT 1 FROM "nozzle_reader_barriers"
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+SELECT 0, 0
+WHERE EXISTS (
+  SELECT 1
+  FROM "nozzle_saga_outcome_payload_activations" AS "activation"
+  LEFT JOIN "nozzle_reader_barriers" AS "barrier"
+    ON "barrier"."protocol_version" = "activation"."protocol_version"
+   AND "barrier"."barrier_checksum" = "activation"."reader_barrier_checksum"
+  WHERE "barrier"."protocol_version" IS NULL
+);`,
+  `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (5, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`,
 ])
 
 const CONTROL_SCHEMA_VERSION_TWO_PUBLICATION = `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
@@ -2218,11 +2373,36 @@ const CONTROL_SCHEMA_VERSION_THREE_PUBLICATION = `INSERT INTO "nozzle_control_sc
 VALUES (3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
 ON CONFLICT ("schema_version") DO NOTHING;`
 
+const CONTROL_SCHEMA_VERSION_FOUR_PUBLICATION = `INSERT INTO "nozzle_control_schema_versions" ("schema_version", "published_at_ms")
+VALUES (4, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+ON CONFLICT ("schema_version") DO NOTHING;`
+
+function versionFourArtifactStatement(statement: string): string {
+  return statement.includes(
+    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 5',
+  )
+    ? statement.replace('WHERE "schema_version" > 5', 'WHERE "schema_version" > 4')
+    : statement
+}
+
+const versionFourPublicationIndex = CONTROL_SCHEMA_STATEMENTS.indexOf(
+  CONTROL_SCHEMA_VERSION_FOUR_PUBLICATION,
+)
+
+export const CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS = Object.freeze(
+  CONTROL_SCHEMA_STATEMENTS.slice(0, versionFourPublicationIndex + 1).map(
+    versionFourArtifactStatement,
+  ),
+)
+
+export const CONTROL_SCHEMA_VERSION_FOUR_ARTIFACT_SHA256 =
+  "23d1467bb7b49c7f07aa3253af7d15beeb115edae159c74718fc749fda81712b" as const
+
 function versionThreeArtifactStatement(statement: string): string {
   return statement.includes(
-    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 4',
+    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 5',
   )
-    ? statement.replace('WHERE "schema_version" > 4', 'WHERE "schema_version" > 3')
+    ? statement.replace('WHERE "schema_version" > 5', 'WHERE "schema_version" > 3')
     : statement
 }
 
@@ -2241,9 +2421,9 @@ export const CONTROL_SCHEMA_VERSION_THREE_ARTIFACT_SHA256 =
 
 function versionTwoArtifactStatement(statement: string): string {
   return statement.includes(
-    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 4',
+    'SELECT 1 FROM "nozzle_control_schema_versions" WHERE "schema_version" > 5',
   )
-    ? statement.replace('WHERE "schema_version" > 4', 'WHERE "schema_version" > 2')
+    ? statement.replace('WHERE "schema_version" > 5', 'WHERE "schema_version" > 2')
     : statement
 }
 
@@ -2306,4 +2486,8 @@ export function controlSchemaVersionTwoSql(): string {
 
 export function controlSchemaVersionThreeSql(): string {
   return `${CONTROL_SCHEMA_VERSION_THREE_STATEMENTS.join("\n\n")}\n`
+}
+
+export function controlSchemaVersionFourSql(): string {
+  return `${CONTROL_SCHEMA_VERSION_FOUR_STATEMENTS.join("\n\n")}\n`
 }
