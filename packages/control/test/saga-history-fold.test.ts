@@ -208,6 +208,37 @@ async function transitionPlan(
   )
 }
 
+async function settlementTransitionPlan(
+  retryClassification: "idempotent" | "never" = "never",
+): Promise<OperationPlan> {
+  return sealOperationPlan(
+    {
+      capabilitySnapshotChecksum: "operation-capabilities",
+      idempotencyKey: "operation-key",
+      inputChecksum: "operation-input-checksum",
+      operationId: "operation-a",
+      operationType: "saga:fixture@1",
+      steps: [
+        {
+          checkpoint: "reversible",
+          completionRole: "settlement",
+          dependsOn: [],
+          effectProtocol: "opaque",
+          idempotencyKey: "saga-settlement-key",
+          inputChecksum: "saga-settlement-input",
+          leaseKey: "saga:saga-a",
+          postconditionChecksum: "saga-settlement-postcondition",
+          preconditionChecksum: "saga-settlement-precondition",
+          recoveryInstructions: "Reconstruct the exact saga settlement.",
+          retryClassification,
+          stepId: "saga:settle",
+        },
+      ],
+    },
+    digest,
+  )
+}
+
 async function providerTransitionPlan(
   retryClassification: "idempotent" | "never" | "reconcile_first" = "idempotent",
 ): Promise<OperationPlan> {
@@ -1651,6 +1682,246 @@ describe("saga history transition fold", () => {
       code: "ConfigurationError",
       message: "Saga operation-transition history is already folded.",
     })
+  })
+
+  it("reconstructs terminal branch classification and every atomic saga settlement", async () => {
+    const actionPlan = await transitionPlan()
+    const actionStepId = "saga:forward:write"
+    const actionInitial = createOperationRecord(actionPlan)
+    const actionStarted = startStep(actionInitial, actionStepId, "terminal-attempt", 2)
+    const actionRetryable = recordStepFailure(actionStarted, {
+      attemptId: "terminal-attempt",
+      errorChecksum: "terminal-not-applied",
+      outcome: "definitely_not_applied",
+      stepId: actionStepId,
+    })
+    const actionTerminal = recordSagaStepTerminalClassification(actionRetryable, {
+      outcome: "not_applied",
+      receiptOutcomeChecksum: "terminal-not-applied",
+      stepId: actionStepId,
+    })
+    const actionCreated = await event(undefined, {
+      eventType: "operation.created",
+      fencingToken: null,
+      operationId: actionPlan.operationId,
+      payloadChecksum: actionPlan.inputChecksum,
+      stepId: null,
+    })
+    const actionStartedId = operationTransitionIdentity("accepted", [
+      actionPlan.operationId,
+      actionStepId,
+      "terminal-attempt",
+    ])
+    const actionStartedEvent = await event(actionCreated, {
+      eventType: "saga.action.started",
+      idempotencyKey: actionStartedId,
+      operationId: actionPlan.operationId,
+      payloadChecksum: "terminal-start",
+      stepId: actionStepId,
+    })
+    const actionRetryableId = operationTransitionIdentity("failed", [
+      actionPlan.operationId,
+      actionStepId,
+      "terminal-attempt",
+    ])
+    const actionRetryableEvent = await event(actionStartedEvent, {
+      eventType: "saga.action.classified",
+      idempotencyKey: actionRetryableId,
+      operationId: actionPlan.operationId,
+      payloadChecksum: "terminal-not-applied",
+      stepId: actionStepId,
+    })
+    const actionTerminalId = operationTransitionIdentity("saga-terminal-not-applied", [
+      actionPlan.operationId,
+      actionStepId,
+      "terminal-attempt",
+      "direct_receipt",
+    ])
+    const actionTerminalEvent = await event(actionRetryableEvent, {
+      eventType: "saga.action.terminal_not_applied.direct_receipt",
+      idempotencyKey: actionTerminalId,
+      operationId: actionPlan.operationId,
+      payloadChecksum: "terminal-not-applied",
+      stepId: actionStepId,
+    })
+    const actionRows = [
+      transitionRow(
+        actionInitial,
+        actionStarted,
+        actionStartedEvent,
+        actionStepId,
+        actionStartedId,
+      ),
+      transitionRow(
+        actionStarted,
+        actionRetryable,
+        actionRetryableEvent,
+        actionStepId,
+        actionRetryableId,
+      ),
+      transitionRow(
+        actionRetryable,
+        actionTerminal,
+        actionTerminalEvent,
+        actionStepId,
+        actionTerminalId,
+      ),
+    ]
+    await foldCustomTransitionHistory(
+      actionPlan,
+      [actionCreated, actionStartedEvent, actionRetryableEvent, actionTerminalEvent],
+      actionRows,
+      actionTerminal,
+    )
+    const wrongTerminalId = operationTransitionIdentity("saga-terminal-not-applied", [
+      actionPlan.operationId,
+      actionStepId,
+      "terminal-attempt",
+      "observation",
+    ])
+    const wrongTerminalEvent = await event(actionRetryableEvent, {
+      eventType: "saga.action.terminal_not_applied.direct_receipt",
+      idempotencyKey: wrongTerminalId,
+      operationId: actionPlan.operationId,
+      payloadChecksum: "terminal-not-applied",
+      stepId: actionStepId,
+    })
+    await expectCustomTransitionHistoryFailure(
+      actionPlan,
+      [actionCreated, actionStartedEvent, actionRetryableEvent, wrongTerminalEvent],
+      [
+        ...actionRows.slice(0, 2),
+        transitionRow(
+          actionRetryable,
+          actionTerminal,
+          wrongTerminalEvent,
+          actionStepId,
+          wrongTerminalId,
+        ),
+      ],
+      actionTerminal,
+      /terminal saga classification.*stable identity/u,
+    )
+
+    for (const state of ["succeeded", "failed", "intervention_required"] as const) {
+      const plan = await settlementTransitionPlan()
+      const initial = createOperationRecord(plan)
+      const attemptId = "nozzle.saga-settlement-attempt.v1:saga-record-checksum"
+      const outcome =
+        state === "succeeded"
+          ? {
+              observedPostconditionChecksum: "saga-settlement-postcondition",
+              resultChecksum: "saga-record-checksum",
+              state,
+            }
+          : state === "failed"
+            ? { errorChecksum: "saga-record-checksum", state }
+            : { evidenceChecksum: "saga-record-checksum", state }
+      const settled = recordAtomicStepOutcome(initial, {
+        attemptId,
+        idempotencyKey: "saga-settlement-key",
+        leaseProof: leaseProof(activeLease()),
+        observedPreconditionChecksum: "saga-settlement-precondition",
+        outcome,
+        stepId: "saga:settle",
+      })
+      const created = await event(undefined, {
+        eventType: "operation.created",
+        fencingToken: null,
+        operationId: plan.operationId,
+        payloadChecksum: plan.inputChecksum,
+        stepId: null,
+      })
+      const transitionId = operationTransitionIdentity("saga-settled", [
+        plan.operationId,
+        "saga:settle",
+        attemptId,
+      ])
+      const settledEvent = await event(created, {
+        eventType: "saga.settled",
+        idempotencyKey: transitionId,
+        operationId: plan.operationId,
+        payloadChecksum: "saga-record-checksum",
+        stepId: "saga:settle",
+      })
+      await foldCustomTransitionHistory(
+        plan,
+        [created, settledEvent],
+        [transitionRow(initial, settled, settledEvent, "saga:settle", transitionId)],
+        settled,
+      )
+      if (state === "succeeded") {
+        const wrongId = operationTransitionIdentity("saga-settled", [
+          plan.operationId,
+          "saga:settle",
+          `${attemptId}:wrong`,
+        ])
+        const wrongEvent = await event(created, {
+          eventType: "saga.settled",
+          idempotencyKey: wrongId,
+          operationId: plan.operationId,
+          payloadChecksum: "saga-record-checksum",
+          stepId: "saga:settle",
+        })
+        await expectCustomTransitionHistoryFailure(
+          plan,
+          [created, wrongEvent],
+          [transitionRow(initial, settled, wrongEvent, "saga:settle", wrongId)],
+          settled,
+          /saga settlement.*stable identity/u,
+        )
+      }
+    }
+
+    const noncanonicalPlan = await settlementTransitionPlan("idempotent")
+    const noncanonicalInitial = createOperationRecord(noncanonicalPlan)
+    const attemptId = "nozzle.saga-settlement-attempt.v1:saga-record-checksum"
+    const noncanonicalSettled = recordAtomicStepOutcome(noncanonicalInitial, {
+      attemptId,
+      idempotencyKey: "saga-settlement-key",
+      leaseProof: leaseProof(activeLease()),
+      observedPreconditionChecksum: "saga-settlement-precondition",
+      outcome: {
+        observedPostconditionChecksum: "saga-settlement-postcondition",
+        resultChecksum: "saga-record-checksum",
+        state: "succeeded",
+      },
+      stepId: "saga:settle",
+    })
+    const noncanonicalCreated = await event(undefined, {
+      eventType: "operation.created",
+      fencingToken: null,
+      operationId: noncanonicalPlan.operationId,
+      payloadChecksum: noncanonicalPlan.inputChecksum,
+      stepId: null,
+    })
+    const noncanonicalId = operationTransitionIdentity("saga-settled", [
+      noncanonicalPlan.operationId,
+      "saga:settle",
+      attemptId,
+    ])
+    const noncanonicalEvent = await event(noncanonicalCreated, {
+      eventType: "saga.settled",
+      idempotencyKey: noncanonicalId,
+      operationId: noncanonicalPlan.operationId,
+      payloadChecksum: "saga-record-checksum",
+      stepId: "saga:settle",
+    })
+    await expectCustomTransitionHistoryFailure(
+      noncanonicalPlan,
+      [noncanonicalCreated, noncanonicalEvent],
+      [
+        transitionRow(
+          noncanonicalInitial,
+          noncanonicalSettled,
+          noncanonicalEvent,
+          "saga:settle",
+          noncanonicalId,
+        ),
+      ],
+      noncanonicalSettled,
+      /settlement event lacks its canonical operation step/u,
+    )
   })
 
   it("rejects skipped acceptance and forged accepted-attempt deltas", async () => {

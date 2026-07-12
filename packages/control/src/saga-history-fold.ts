@@ -58,6 +58,7 @@ import {
 import { verifySagaOperationPlan } from "./saga-plan.js"
 import {
   SAGA_INIT_OPERATION_STEP_ID,
+  SAGA_SETTLE_OPERATION_STEP_ID,
   SAGA_TERMINATION_OPERATION_STEP_ID,
   sagaActionOperationStepId,
 } from "./saga-store.js"
@@ -67,16 +68,25 @@ const EFFECT_FOLD_DOMAIN = "nozzle.saga-history.effect-fold.v1"
 const ATTEMPT_FOLD_DOMAIN = "nozzle.saga-history.attempt-fold.v1"
 const SAGA_COORDINATOR_ID_DOMAIN = "nozzle.saga-coordinator-id.v1"
 const SAGA_RECORD_DOMAIN = "nozzle.saga-record.v1"
+const SETTLEMENT_ATTEMPT_PREFIX = "nozzle.saga-settlement-attempt.v1:"
 const EMPTY_FOLD_CHECKSUM = "0".repeat(64)
 const CHECKSUM = /^[0-9a-f]{64}$/u
 const UTF8_ENCODER = new TextEncoder()
+
+const TERMINAL_NOT_APPLIED_EVENT_TYPES = new Set([
+  "saga.action.terminal_not_applied.crash_absence",
+  "saga.action.terminal_not_applied.direct_receipt",
+  "saga.action.terminal_not_applied.observation",
+])
 
 const KNOWN_TRANSITION_AUDIT_EVENT_TYPES = new Set([
   "saga.action.classified",
   "saga.action.observed",
   "saga.action.recovered",
   "saga.action.started",
+  ...TERMINAL_NOT_APPLIED_EVENT_TYPES,
   "saga.initialized",
+  "saga.settled",
   "saga.termination.requested",
   "step.attempt.accepted",
   "step.attempt.definitely_not_applied",
@@ -868,6 +878,36 @@ function verifyTransitionIdentity(
   event: AuditEvent,
   after: OperationStepRecord,
 ): void {
+  if (TERMINAL_NOT_APPLIED_EVENT_TYPES.has(event.eventType)) {
+    const attemptId = after.lastAttemptId
+    const evidenceKind = event.eventType.slice("saga.action.terminal_not_applied.".length)
+    if (
+      after.state !== "succeeded" ||
+      !persistedText(attemptId) ||
+      operationTransitionIdentity("saga-terminal-not-applied", [
+        row.operation_id,
+        row.step_id,
+        attemptId,
+        evidenceKind,
+      ]) !== row.transition_id
+    ) {
+      intervention("A terminal saga classification has a contradictory stable identity.")
+    }
+    return
+  }
+  if (event.eventType === "saga.settled") {
+    const attemptId = after.lastAttemptId
+    if (
+      !persistedText(attemptId) ||
+      attemptId !== `${SETTLEMENT_ATTEMPT_PREFIX}${event.payloadChecksum}` ||
+      !["failed", "intervention_required", "succeeded"].includes(after.state) ||
+      operationTransitionIdentity("saga-settled", [row.operation_id, row.step_id, attemptId]) !==
+        row.transition_id
+    ) {
+      intervention("A saga settlement has a contradictory stable identity.")
+    }
+    return
+  }
   const kind = transitionIdentityKind(event.eventType, after)
   if (kind === null) {
     verifyDeferredTransitionIdentity(row, event.eventType)
@@ -923,7 +963,8 @@ function verifyTransitionFence(
   }
   if (
     event.eventType.startsWith("step.reconciled.") ||
-    event.eventType === "saga.action.classified"
+    event.eventType === "saga.action.classified" ||
+    TERMINAL_NOT_APPLIED_EVENT_TYPES.has(event.eventType)
   ) {
     if (predecessorFence === undefined || row.fencing_token < predecessorFence) {
       intervention("A saga classification transition regressed its consumer fence.")
@@ -962,6 +1003,20 @@ function verifySagaEventPlan(event: AuditEvent, planStep: OperationStepPlan): vo
       planStep.retryClassification !== "idempotent"
     ) {
       intervention("A saga termination event lacks its canonical operation step.")
+    }
+    return
+  }
+  if (event.eventType === "saga.settled") {
+    if (
+      planStep.stepId !== SAGA_SETTLE_OPERATION_STEP_ID ||
+      planStep.activation !== "required" ||
+      planStep.checkpoint !== "reversible" ||
+      planStep.completionRole !== "settlement" ||
+      planStep.dependsOn.length !== 0 ||
+      planStep.effectProtocol !== "opaque" ||
+      planStep.retryClassification !== "never"
+    ) {
+      intervention("A saga settlement event lacks its canonical operation step.")
     }
     return
   }
@@ -1331,6 +1386,42 @@ function coreTransition(
       stepId: row.step_id,
     })
   }
+  if (event.eventType === "saga.settled") {
+    const outcome =
+      after.state === "succeeded"
+        ? {
+            observedPostconditionChecksum: planStep.postconditionChecksum,
+            resultChecksum: requiredEvidence(after.resultChecksum, "its settlement result"),
+            state: "succeeded" as const,
+          }
+        : after.state === "failed"
+          ? {
+              errorChecksum: requiredEvidence(after.errorChecksum, "its settlement failure"),
+              state: "failed" as const,
+            }
+          : {
+              evidenceChecksum: requiredEvidence(
+                after.reconciliationEvidenceChecksum,
+                "its settlement intervention evidence",
+              ),
+              state: "intervention_required" as const,
+            }
+    return recordAtomicStepOutcome(operation, {
+      attemptId: requiredEvidence(after.lastAttemptId, "its atomic attempt identity"),
+      idempotencyKey: planStep.idempotencyKey,
+      leaseProof: proof,
+      observedPreconditionChecksum: planStep.preconditionChecksum,
+      outcome,
+      stepId: row.step_id,
+    })
+  }
+  if (TERMINAL_NOT_APPLIED_EVENT_TYPES.has(event.eventType)) {
+    return recordSagaStepTerminalClassification(operation, {
+      outcome: "not_applied",
+      receiptOutcomeChecksum: event.payloadChecksum,
+      stepId: row.step_id,
+    })
+  }
   if (
     event.eventType === "step.attempt.succeeded" ||
     event.eventType === "saga.initialized" ||
@@ -1521,7 +1612,11 @@ function verifyDirectAuditPayload(
   if (event.eventType === "step.attempt.accepted") expected = planStep.inputChecksum
   else if (event.eventType === "step.attempt.succeeded") expected = after.resultChecksum
   else if (event.eventType === "saga.termination.requested") expected = after.resultChecksum
-  else if (event.eventType === "saga.action.classified") {
+  else if (event.eventType === "saga.settled") {
+    expected = after.resultChecksum ?? after.errorChecksum ?? after.reconciliationEvidenceChecksum
+  } else if (TERMINAL_NOT_APPLIED_EVENT_TYPES.has(event.eventType)) {
+    expected = after.reconciliationEvidenceChecksum
+  } else if (event.eventType === "saga.action.classified") {
     expected = after.state === "succeeded" ? after.resultChecksum : after.errorChecksum
   } else if (event.eventType === "saga.action.observed") {
     expected = after.reconciliationEvidenceChecksum
