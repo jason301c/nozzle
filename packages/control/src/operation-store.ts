@@ -331,6 +331,17 @@ function isReservedSagaOperation(operation: OperationRecord): boolean {
   return operation.plan.operationType.startsWith("saga:")
 }
 
+function isSagaOperationPlan(plan: OperationPlan): boolean {
+  return (
+    plan.operationType.startsWith("saga:") ||
+    plan.steps.some(
+      (step) => step.stepId.startsWith("saga:") || step.effectProtocol === "saga_receipt",
+    )
+  )
+}
+
+const sagaOperationCreationStores = new WeakSet<D1OperationStore>()
+
 function sagaCoordinatorRequired(): never {
   return intervention(
     "Reserved saga operation mutations must be consumed through D1SagaCoordinatorStore.",
@@ -617,6 +628,9 @@ export class D1OperationStore {
   }
 
   async create(input: CreateOperationInput): Promise<OperationCreationResult> {
+    if (isSagaOperationPlan(input.plan) && !sagaOperationCreationStores.has(this)) {
+      configuration("Saga operation creation is reserved for the internal controller boundary.")
+    }
     nonEmpty(input.environmentId, "Environment ID")
     nonEmpty(input.idempotencyScope, "Idempotency scope")
     nonEmpty(input.actorChecksum, "Operation actor checksum")
@@ -1463,4 +1477,13 @@ export class D1OperationStore {
       "Recording an operation outcome exceeded the bounded transition retry budget.",
     )
   }
+}
+
+export function createInternalSagaOperationStore(
+  database: TransactionalControlDatabase,
+  digest: DigestFunction,
+): D1OperationStore {
+  const store = new D1OperationStore(database, digest)
+  sagaOperationCreationStores.add(store)
+  return store
 }

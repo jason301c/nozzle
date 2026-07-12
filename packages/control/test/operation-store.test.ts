@@ -18,7 +18,7 @@ import type {
   TransactionalControlDatabase,
 } from "../src/database.js"
 import { D1LeaseStore } from "../src/lease-store.js"
-import { D1OperationStore } from "../src/operation-store.js"
+import { createInternalSagaOperationStore, D1OperationStore } from "../src/operation-store.js"
 import { controlSchemaSql } from "../src/schema.js"
 
 const digest: DigestFunction = async (input) => {
@@ -492,6 +492,55 @@ describe("D1OperationStore", () => {
     expect(
       database.database.prepare(`SELECT count(*) AS "count" FROM "nozzle_idempotency_keys"`).get(),
     ).toEqual({ count: 1 })
+  })
+
+  it("reserves every saga-shaped operation creation for the internal controller boundary", async () => {
+    const base = planInput()
+    const first = base.steps[0]
+    const second = base.steps[1]
+    if (!first || !second) throw new Error("Fixture steps are missing.")
+    const variants: readonly OperationPlanInput[] = [
+      {
+        ...base,
+        idempotencyKey: "reserved-type-key",
+        operationId: "reserved-type-operation",
+        operationType: "saga:reserved@1",
+      },
+      {
+        ...base,
+        idempotencyKey: "reserved-step-key",
+        operationId: "reserved-step-operation",
+        steps: [first, { ...second, stepId: "saga:forward:a" }],
+      },
+      {
+        ...base,
+        idempotencyKey: "reserved-protocol-key",
+        operationId: "reserved-protocol-operation",
+        steps: [{ ...first, effectProtocol: "saga_receipt" }, second],
+      },
+    ]
+
+    for (const variant of variants) {
+      const plan = await sealTestPlan(variant)
+      await expect(store.create(creationInput(plan))).rejects.toThrow(
+        /reserved for the internal controller boundary/u,
+      )
+    }
+    expect(
+      database.database.prepare(`SELECT count(*) AS "count" FROM "nozzle_operations"`).get(),
+    ).toEqual({ count: 0 })
+
+    const authorizedPlan = await sealTestPlan({
+      ...base,
+      idempotencyKey: "authorized-saga-key",
+      operationId: "authorized-saga-operation",
+      operationType: "saga:authorized@1",
+    })
+    const authorized = createInternalSagaOperationStore(database, digest)
+    await expect(authorized.create(creationInput(authorizedPlan))).resolves.toMatchObject({
+      created: true,
+      operation: { plan: { operationId: "authorized-saga-operation" } },
+    })
   })
 
   it("persists canonical reconstructible input and capability snapshots", async () => {
@@ -1502,7 +1551,7 @@ describe("D1OperationStore", () => {
         ...input,
         steps: [{ ...firstStep, effectProtocol: "saga_receipt", leaseKey }],
       })
-      await store.create(creationInput(plan))
+      await createInternalSagaOperationStore(database, digest).create(creationInput(plan))
       const leases = new D1LeaseStore(database)
       const first = await leases.acquire({
         acquisitionId: `saga-recovery-${suffix}-first`,
@@ -1564,7 +1613,7 @@ describe("D1OperationStore", () => {
       ...input,
       steps: [{ ...firstStep, effectProtocol: "saga_receipt", leaseKey }],
     })
-    await store.create(creationInput(plan))
+    await createInternalSagaOperationStore(database, digest).create(creationInput(plan))
     const leases = new D1LeaseStore(database)
     const acquired = await leases.acquire({
       acquisitionId: "saga-outcome-acquisition",

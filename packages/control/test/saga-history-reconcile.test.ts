@@ -19,7 +19,7 @@ import type {
   TransactionalControlDatabase,
 } from "../src/database.js"
 import { D1LeaseStore } from "../src/lease-store.js"
-import { D1OperationStore } from "../src/operation-store.js"
+import { createInternalSagaOperationStore } from "../src/operation-store.js"
 import { D1SagaAttemptStore } from "../src/saga-attempt-store.js"
 import { D1SagaCoordinatorStore } from "../src/saga-coordinator-store.js"
 import {
@@ -432,7 +432,7 @@ async function scenarioFixture(
     },
     digest,
   )
-  const operations = new D1OperationStore(database, digest)
+  const operations = createInternalSagaOperationStore(database, digest)
   const leases = new D1LeaseStore(database)
   const attempts = new D1SagaAttemptStore(database, digest)
   const coordinator = new D1SagaCoordinatorStore(database, digest)
@@ -820,7 +820,7 @@ async function maximumWidthScenarioFixture(): Promise<ScenarioFixture> {
     },
     digest,
   )
-  const operations = new D1OperationStore(database, digest)
+  const operations = createInternalSagaOperationStore(database, digest)
   const leases = new D1LeaseStore(database)
   const coordinator = new D1SagaCoordinatorStore(database, digest)
   await operations.create({

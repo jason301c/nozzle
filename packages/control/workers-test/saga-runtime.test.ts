@@ -9,7 +9,7 @@ import {
 import { beforeAll, describe, expect, it } from "vitest"
 import { D1LeaseStore } from "../src/lease-store.js"
 import {
-  D1OperationStore,
+  createInternalSagaOperationStore,
   operationStepRecordJson,
   operationTransitionIdentity,
 } from "../src/operation-store.js"
@@ -448,7 +448,7 @@ describe("real workerd D1 saga projection", () => {
       },
       digest,
     )
-    const operations = new D1OperationStore(env.DB, digest)
+    const operations = createInternalSagaOperationStore(env.DB, digest)
     const leases = new D1LeaseStore(env.DB)
     const attempts = new D1SagaAttemptStore(env.DB, digest)
     const coordinator = new D1SagaCoordinatorStore(env.DB, digest)
@@ -730,7 +730,7 @@ describe("real workerd D1 saga projection", () => {
       },
       digest,
     )
-    const operations = new D1OperationStore(env.DB, digest)
+    const operations = createInternalSagaOperationStore(env.DB, digest)
     const leases = new D1LeaseStore(env.DB)
     const attempts = new D1SagaAttemptStore(env.DB, digest)
     const coordinator = new D1SagaCoordinatorStore(env.DB, digest)
@@ -1116,7 +1116,7 @@ describe("real workerd D1 saga projection", () => {
       },
       digest,
     )
-    const operations = new D1OperationStore(env.DB, digest)
+    const operations = createInternalSagaOperationStore(env.DB, digest)
     const leases = new D1LeaseStore(env.DB)
     const attempts = new D1SagaAttemptStore(env.DB, digest)
     const coordinator = new D1SagaCoordinatorStore(env.DB, digest)
@@ -1272,7 +1272,7 @@ describe("real workerd D1 saga projection", () => {
       },
       digest,
     )
-    const operations = new D1OperationStore(env.DB, digest)
+    const operations = createInternalSagaOperationStore(env.DB, digest)
     const leases = new D1LeaseStore(env.DB)
     const sagas = new D1SagaStore(env.DB, digest)
     const attempts = new D1SagaAttemptStore(env.DB, digest)

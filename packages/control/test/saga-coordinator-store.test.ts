@@ -21,7 +21,8 @@ import type {
 } from "../src/database.js"
 import { D1LeaseStore } from "../src/lease-store.js"
 import {
-  D1OperationStore,
+  createInternalSagaOperationStore,
+  type D1OperationStore,
   operationStepRecordJson,
   operationTransitionIdentity,
 } from "../src/operation-store.js"
@@ -1146,7 +1147,7 @@ async function fixture(
       : fault === undefined
         ? base
         : new FaultDatabase(base, fault)
-  const operations = new D1OperationStore(base, digest)
+  const operations = createInternalSagaOperationStore(base, digest)
   const leases = new D1LeaseStore(base)
   const sagas = new D1SagaStore(base, digest)
   const attempts = new D1SagaAttemptStore(base, digest)

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs"
 import { describe, expect, it } from "vitest"
 import * as control from "../src/index.js"
 
@@ -6,6 +7,9 @@ describe("@nozzle/control public API", () => {
     const exports = control as Readonly<Record<string, unknown>>
 
     expect(exports).not.toHaveProperty("D1SagaStore")
+    expect(exports).not.toHaveProperty("D1SagaAttemptStore")
+    expect(exports).not.toHaveProperty("D1SagaCoordinatorStore")
+    expect(exports).not.toHaveProperty("createInternalSagaOperationStore")
     expect(exports).not.toHaveProperty("loadSagaAttemptRecordRow")
     expect(exports).not.toHaveProperty("SAGA_ATTEMPT_ROW_SELECT")
     for (const internal of [
@@ -39,5 +43,15 @@ describe("@nozzle/control public API", () => {
       SAGA_TERMINATION_OPERATION_STEP_ID: "saga:termination",
       sagaActionOperationStepId: expect.any(Function),
     })
+  })
+
+  it("publishes only the audited package root rather than internal store subpaths", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as {
+      readonly exports: Readonly<Record<string, unknown>>
+    }
+
+    expect(Object.keys(manifest.exports)).toEqual(["."])
   })
 })

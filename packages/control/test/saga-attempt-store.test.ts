@@ -16,7 +16,11 @@ import type {
   TransactionalControlDatabase,
 } from "../src/database.js"
 import { D1LeaseStore } from "../src/lease-store.js"
-import { D1OperationStore, operationTransitionIdentity } from "../src/operation-store.js"
+import {
+  createInternalSagaOperationStore,
+  type D1OperationStore,
+  operationTransitionIdentity,
+} from "../src/operation-store.js"
 import {
   acceptedSagaAttemptRecord,
   loadSagaAttemptIdentityRow,
@@ -512,7 +516,7 @@ describe("D1SagaAttemptStore", () => {
   beforeEach(() => {
     database = new DatabaseAdapter()
     leases = new D1LeaseStore(database)
-    operations = new D1OperationStore(database, digest)
+    operations = createInternalSagaOperationStore(database, digest)
     sagaStore = new D1SagaStore(database, digest)
     attempts = new D1SagaAttemptStore(database, digest)
     coordinator = new D1SagaCoordinatorStore(database, digest)
@@ -972,7 +976,7 @@ describe("D1SagaAttemptStore", () => {
     database.close()
     database = new DatabaseAdapter(controlSchemaVersionThreeSql())
     leases = new D1LeaseStore(database)
-    operations = new D1OperationStore(database, digest)
+    operations = createInternalSagaOperationStore(database, digest)
     sagaStore = new D1SagaStore(database, digest)
     attempts = new D1SagaAttemptStore(database, digest)
     coordinator = new D1SagaCoordinatorStore(database, digest)

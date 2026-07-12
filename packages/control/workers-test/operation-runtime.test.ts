@@ -8,7 +8,7 @@ import {
 } from "@nozzle/core"
 import { beforeAll, describe, expect, it } from "vitest"
 import { D1LeaseStore } from "../src/lease-store.js"
-import { D1OperationStore } from "../src/operation-store.js"
+import { createInternalSagaOperationStore, D1OperationStore } from "../src/operation-store.js"
 import { D1ProviderAttemptStore } from "../src/provider-attempt-store.js"
 import { CONTROL_SCHEMA_STATEMENTS, CONTROL_SCHEMA_VERSION } from "../src/schema.js"
 
@@ -266,7 +266,7 @@ describe("real workerd operation ledger", () => {
   })
 
   it("persists an unused conditional path without fabricating an attempt", async () => {
-    const store = new D1OperationStore(env.DB, digest)
+    const store = createInternalSagaOperationStore(env.DB, digest)
     const leases = new D1LeaseStore(env.DB)
     const capabilitySnapshotJson = '{"runtime":"workerd-conditional-v1"}'
     const inputJson = '{"branch":"required"}'
