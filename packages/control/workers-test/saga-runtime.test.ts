@@ -22,7 +22,7 @@ import {
   type SagaHistoryTransitionCursor,
 } from "../src/saga-history.js"
 import {
-  reconcileSagaHistory,
+  finalizeSagaHistoryProof,
   SagaHistoryAttemptFolder,
   SagaHistoryAuditFolder,
   SagaHistoryEffectFolder,
@@ -98,8 +98,7 @@ async function reconcileStoredSagaHistory(operationId: string, sagaId: string) {
     if (page.complete) break
     attemptCursor = page.nextCursor as SagaHistoryAttemptCursor
   }
-  await reader.assertAnchorCurrent(anchor)
-  return reconcileSagaHistory(transition, effect, attempt, plan, descriptor)
+  return finalizeSagaHistoryProof(reader, anchor, transition, effect, attempt, plan, descriptor)
 }
 
 beforeAll(async () => {
@@ -1170,16 +1169,19 @@ describe("real workerd D1 saga projection", () => {
     expect(terminal.status).toBe("succeeded")
 
     await expect(reconcileStoredSagaHistory(operationId, sagaId)).resolves.toMatchObject({
-      actionBeginCount: 1,
-      attemptCount: 1,
-      coupledTransitionCount: 3,
-      effectAttemptCount: 1,
-      effectCount: 3,
-      observationAttemptCount: 0,
-      operationId,
-      sagaId,
+      anchor: { operationId, sagaId },
+      reconciliation: {
+        actionBeginCount: 1,
+        attemptCount: 1,
+        coupledTransitionCount: 3,
+        effectAttemptCount: 1,
+        effectCount: 3,
+        observationAttemptCount: 0,
+        operationId,
+        sagaId,
+        transitionCount: 4,
+      },
       schemaVersion: 1,
-      transitionCount: 4,
     })
   })
 

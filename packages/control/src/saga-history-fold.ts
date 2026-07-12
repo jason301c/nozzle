@@ -192,7 +192,10 @@ const AUDIT_PROOF_KEYS = [
 ] as const satisfies readonly (keyof SagaHistoryAuditProof)[]
 
 export interface SagaHistoryTransitionProof {
+  readonly auditHeadEventHash: string
+  readonly auditHeadSequence: number
   readonly auditTransitionFoldChecksum: string
+  readonly environmentId: string
   readonly operation: OperationRecord
   readonly operationId: string
   readonly operationPlanChecksum: string
@@ -282,6 +285,12 @@ export interface SagaHistoryReconciliationProof {
   readonly sagaRecordChecksum: string
   readonly schemaVersion: 1
   readonly transitionCount: number
+}
+
+export interface SagaHistoryFinalProof {
+  readonly anchor: SagaHistoryAnchor
+  readonly reconciliation: SagaHistoryReconciliationProof
+  readonly schemaVersion: 1
 }
 
 export interface SagaHistoryAttemptSummary {
@@ -2503,7 +2512,10 @@ export class SagaHistoryTransitionFolder {
       return resume("Saga operation-transition history requires more verified pages.")
     }
     return Object.freeze({
+      auditHeadEventHash: this.#auditProof.auditHeadEventHash,
+      auditHeadSequence: this.#auditProof.auditHeadSequence,
       auditTransitionFoldChecksum: this.#state.auditTransitionFoldChecksum,
+      environmentId: this.#auditProof.environmentId,
       operation: this.#state.operation,
       operationId: this.#anchor.operationId,
       operationPlanChecksum: this.#anchor.operationPlanChecksum,
@@ -3237,4 +3249,104 @@ export async function reconcileSagaHistory(
     schemaVersion: 1,
     transitionCount: transitionProof.transitionCount,
   })
+}
+
+/**
+ * Binds a reconciled history to the exact anchor used by every fold, then performs the final
+ * database re-read. This remains evidence only and cannot authorize terminal persistence.
+ */
+export async function finalizeSagaHistoryProof(
+  reader: D1SagaHistoryReader,
+  inputAnchor: SagaHistoryAnchor,
+  transitionFolder: SagaHistoryTransitionFolder,
+  effectFolder: SagaHistoryEffectFolder,
+  attemptFolder: SagaHistoryAttemptFolder,
+  plan: OperationPlan,
+  descriptor: SagaDescriptor,
+): Promise<SagaHistoryFinalProof> {
+  if (!(reader instanceof D1SagaHistoryReader)) {
+    return configuration("A production saga-history reader is required for final reconciliation.")
+  }
+  const anchor = loadSagaHistoryAnchor(inputAnchor)
+  const reconciliation = await reconcileSagaHistory(
+    transitionFolder,
+    effectFolder,
+    attemptFolder,
+    plan,
+    descriptor,
+  )
+  const transition = transitionFolder.proof()
+  const effect = effectFolder.proof()
+  const attempt = attemptFolder.proof()
+  const actualBinding = JSON.stringify([
+    transition.auditHeadEventHash,
+    transition.auditHeadSequence,
+    transition.environmentId,
+    transition.operationId,
+    transition.operation.plan.inputChecksum,
+    transition.operationPlanChecksum,
+    transition.operationStatus,
+    transition.transitionCount,
+    transition.transitionLastAuditSequence,
+    transition.transitionLastId,
+    effect.operationId,
+    effect.sagaDescriptorChecksum,
+    effect.effectCount,
+    effect.effectLastId,
+    effect.sagaId,
+    effect.sagaInputChecksum,
+    effect.sagaRecordChecksum,
+    effect.sagaStateVersion,
+    effect.sagaStatus,
+    attempt.operationId,
+    attempt.sagaId,
+    attempt.attemptCount,
+    attempt.attemptLastAcceptedAtMs,
+    attempt.attemptLastId,
+    reconciliation.operationId,
+    reconciliation.operationPlanChecksum,
+    reconciliation.sagaId,
+    reconciliation.transitionCount,
+    reconciliation.effectCount,
+    reconciliation.attemptCount,
+    reconciliation.sagaRecordChecksum,
+  ])
+  const expectedBinding = JSON.stringify([
+    anchor.auditHeadEventHash,
+    anchor.auditHeadSequence,
+    anchor.environmentId,
+    anchor.operationId,
+    anchor.operationInputChecksum,
+    anchor.operationPlanChecksum,
+    anchor.operationStatus,
+    anchor.operationTransitionCount,
+    anchor.operationTransitionLastAuditSequence,
+    anchor.operationTransitionLastId,
+    anchor.operationId,
+    anchor.sagaDescriptorChecksum,
+    anchor.sagaEffectCount,
+    anchor.sagaLastEffectId,
+    anchor.sagaId,
+    anchor.sagaInputChecksum,
+    anchor.sagaRecordChecksum,
+    anchor.sagaStateVersion,
+    anchor.sagaStatus,
+    anchor.operationId,
+    anchor.sagaId,
+    anchor.sagaAttemptCount,
+    anchor.sagaAttemptLastAcceptedAtMs,
+    anchor.sagaAttemptLastId,
+    anchor.operationId,
+    anchor.operationPlanChecksum,
+    anchor.sagaId,
+    anchor.operationTransitionCount,
+    anchor.sagaEffectCount,
+    anchor.sagaAttemptCount,
+    anchor.sagaRecordChecksum,
+  ])
+  if (actualBinding !== expectedBinding) {
+    return intervention("The reconciled saga history contradicts its final anchor.")
+  }
+  await D1SagaHistoryReader.prototype.assertAnchorCurrent.call(reader, anchor)
+  return Object.freeze({ anchor, reconciliation, schemaVersion: 1 })
 }

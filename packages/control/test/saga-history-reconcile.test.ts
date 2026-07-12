@@ -21,10 +21,12 @@ import { D1SagaAttemptStore } from "../src/saga-attempt-store.js"
 import { D1SagaCoordinatorStore } from "../src/saga-coordinator-store.js"
 import {
   D1SagaHistoryReader,
+  type SagaHistoryAnchor,
   type SagaHistoryAttemptCursor,
   type SagaHistoryTransitionCursor,
 } from "../src/saga-history.js"
 import {
+  finalizeSagaHistoryProof,
   reconcileSagaHistory,
   SagaHistoryAttemptFolder,
   SagaHistoryAuditFolder,
@@ -482,10 +484,12 @@ async function scenarioFixture(scenario: Scenario): Promise<ScenarioFixture> {
 }
 
 interface FoldedHistory {
+  readonly anchor: SagaHistoryAnchor
   readonly attempt: SagaHistoryAttemptFolder
   readonly descriptor: SagaDescriptor
   readonly effect: SagaHistoryEffectFolder
   readonly plan: OperationPlan
+  readonly reader: D1SagaHistoryReader
   readonly transition: SagaHistoryTransitionFolder
 }
 
@@ -526,8 +530,7 @@ async function foldHistory(fixture: ScenarioFixture): Promise<FoldedHistory> {
     if (page.complete) break
     attemptCursor = page.nextCursor as SagaHistoryAttemptCursor
   }
-  await reader.assertAnchorCurrent(anchor)
-  return { attempt, descriptor: loadedDescriptor, effect, plan, transition }
+  return { anchor, attempt, descriptor: loadedDescriptor, effect, plan, reader, transition }
 }
 
 interface MutableReconciliationRows {
@@ -606,7 +609,9 @@ describe("saga history cross-stream reconciliation", () => {
       try {
         const history = await foldHistory(fixture)
         outcomes.push(
-          await reconcileSagaHistory(
+          await finalizeSagaHistoryProof(
+            history.reader,
+            history.anchor,
             history.transition,
             history.effect,
             history.attempt,
@@ -620,7 +625,8 @@ describe("saga history cross-stream reconciliation", () => {
     }
     expect(outcomes).toHaveLength(scenarios.length)
     expect(outcomes.every((proof) => proof.schemaVersion === 1)).toBe(true)
-    expect(outcomes.map((proof) => proof.observationAttemptCount)).toEqual([
+    expect(outcomes.every((proof) => Object.isFrozen(proof.anchor))).toBe(true)
+    expect(outcomes.map((proof) => proof.reconciliation.observationAttemptCount)).toEqual([
       0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1,
     ])
   })
@@ -656,6 +662,75 @@ describe("saga history cross-stream reconciliation", () => {
       ).toThrowError(/requires more verified pages/u)
     } finally {
       fixture.database.close()
+    }
+  })
+
+  it("binds every folded head and performs the database re-read after reconciliation", async () => {
+    const mismatched = await scenarioFixture("confirmed")
+    try {
+      const history = await foldHistory(mismatched)
+      await expect(
+        finalizeSagaHistoryProof(
+          history.reader,
+          {
+            ...history.anchor,
+            operationTransitionCount: history.anchor.operationTransitionCount + 1,
+          },
+          history.transition,
+          history.effect,
+          history.attempt,
+          history.plan,
+          history.descriptor,
+        ),
+      ).rejects.toMatchObject({
+        code: "OperationInterventionRequiredError",
+        message: "The reconciled saga history contradicts its final anchor.",
+      })
+      await expect(
+        finalizeSagaHistoryProof(
+          {} as D1SagaHistoryReader,
+          history.anchor,
+          history.transition,
+          history.effect,
+          history.attempt,
+          history.plan,
+          history.descriptor,
+        ),
+      ).rejects.toMatchObject({ code: "ConfigurationError" })
+    } finally {
+      mismatched.database.close()
+    }
+
+    const advanced = await scenarioFixture("confirmed")
+    try {
+      const history = await foldHistory(advanced)
+      const planProof = history.effect.planProof.bind(history.effect)
+      Object.defineProperty(history.effect, "planProof", {
+        value: async (plan: OperationPlan, descriptor: SagaDescriptor) => {
+          const proof = await planProof(plan, descriptor)
+          advanced.database.database
+            .prepare(
+              `UPDATE "nozzle_operations"
+               SET "updated_at_ms" = "updated_at_ms" + 1
+               WHERE "operation_id" = ?`,
+            )
+            .run(advanced.operationId)
+          return proof
+        },
+      })
+      await expect(
+        finalizeSagaHistoryProof(
+          history.reader,
+          history.anchor,
+          history.transition,
+          history.effect,
+          history.attempt,
+          history.plan,
+          history.descriptor,
+        ),
+      ).rejects.toMatchObject({ code: "OperationResumeRequiredError" })
+    } finally {
+      advanced.database.close()
     }
   })
 
