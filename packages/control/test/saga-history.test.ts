@@ -1,5 +1,10 @@
 import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite"
-import { type DigestFunction, type OperationPlan, sealOperationPlan } from "@nozzle/core"
+import {
+  type DigestFunction,
+  type OperationPlan,
+  sealOperationPlan,
+  sealSagaDescriptor,
+} from "@nozzle/core"
 import { describe, expect, it } from "vitest"
 import type {
   ControlBindingValue,
@@ -49,6 +54,49 @@ async function sealedHistoryPlan(
           stepId: "saga:init",
         },
       ],
+    },
+    digest,
+  )
+}
+
+async function sealedHistoryDescriptor() {
+  return sealSagaDescriptor(
+    {
+      descriptorId: "history-descriptor",
+      steps: [
+        {
+          authorizationPolicyChecksum: null,
+          baseRetryDelayMs: 1,
+          compensationAction: {
+            actionId: "history-compensate",
+            artifactChecksum: "a".repeat(64),
+            version: 1,
+          },
+          compensationObservation: {
+            actionId: "history-observe-compensation",
+            artifactChecksum: "b".repeat(64),
+            version: 1,
+          },
+          forwardAction: {
+            actionId: "history-write",
+            artifactChecksum: "c".repeat(64),
+            version: 1,
+          },
+          forwardObservation: {
+            actionId: "history-observe-write",
+            artifactChecksum: "d".repeat(64),
+            version: 1,
+          },
+          inputSchemaChecksum: "e".repeat(64),
+          irreversible: false,
+          maxAttempts: 1,
+          maxRetryDelayMs: 1,
+          outputSchemaChecksum: "f".repeat(64),
+          stepId: "write",
+          timeoutMs: 100,
+        },
+      ],
+      version: 1,
     },
     digest,
   )
@@ -579,6 +627,95 @@ describe("D1SagaHistoryReader", () => {
     expect(loaded).toEqual(plan)
     expect(Object.isFrozen(loaded)).toBe(true)
     database.expectComplete()
+  })
+
+  it("loads the canonical immutable saga descriptor bound to an anchor", async () => {
+    const descriptor = await sealedHistoryDescriptor()
+    const inputAnchor = Object.freeze({
+      ...anchor,
+      sagaDescriptorChecksum: descriptor.descriptorChecksum,
+    })
+    const database = new ScriptedDatabase([
+      {
+        kind: "first",
+        result: {
+          descriptor_checksum: descriptor.descriptorChecksum,
+          descriptor_id: descriptor.descriptorId,
+          descriptor_json: JSON.stringify(descriptor),
+          descriptor_version: descriptor.version,
+        },
+        sql: `SELECT "descriptor_id", "descriptor_version", "descriptor_checksum", "descriptor_json"`,
+      },
+    ])
+    const loaded = await new D1SagaHistoryReader(database).sagaDescriptor(inputAnchor, digest)
+    expect(loaded).toEqual(descriptor)
+    expect(Object.isFrozen(loaded)).toBe(true)
+    database.expectComplete()
+  })
+
+  it("rejects missing, malformed, oversized, or noncanonical persisted saga descriptors", async () => {
+    const descriptor = await sealedHistoryDescriptor()
+    const inputAnchor = Object.freeze({
+      ...anchor,
+      sagaDescriptorChecksum: descriptor.descriptorChecksum,
+    })
+    await expect(
+      new D1SagaHistoryReader(new ScriptedDatabase([])).sagaDescriptor(
+        inputAnchor,
+        undefined as unknown as DigestFunction,
+      ),
+    ).rejects.toMatchObject({ code: "ConfigurationError" })
+
+    const anchoredRow = {
+      descriptor_checksum: descriptor.descriptorChecksum,
+      descriptor_id: descriptor.descriptorId,
+      descriptor_json: JSON.stringify(descriptor),
+      descriptor_version: descriptor.version,
+    }
+    const malformedRows: readonly [unknown, RegExp][] = [
+      [null, /disappeared/u],
+      [{ ...anchoredRow, extra: true }, /fields/u],
+      [{ ...anchoredRow, descriptor_checksum: "0".repeat(64) }, /contradicts/u],
+      [{ ...anchoredRow, descriptor_id: "" }, /contradicts/u],
+      [{ ...anchoredRow, descriptor_version: 0 }, /contradicts/u],
+      [{ ...anchoredRow, descriptor_json: "{" }, /contradicts/u],
+      [{ ...anchoredRow, descriptor_json: JSON.stringify("x".repeat(2_000_000)) }, /contradicts/u],
+      [{ ...anchoredRow, descriptor_json: JSON.stringify(descriptor, null, 2) }, /not canonical/u],
+      [{ ...anchoredRow, descriptor_id: "other" }, /not canonical/u],
+      [{ ...anchoredRow, descriptor_version: 2 }, /not canonical/u],
+    ]
+    for (const [result, message] of malformedRows) {
+      const database = new ScriptedDatabase([
+        {
+          kind: "first",
+          result,
+          sql: `SELECT "descriptor_id", "descriptor_version", "descriptor_checksum", "descriptor_json"`,
+        },
+      ])
+      await expect(
+        new D1SagaHistoryReader(database).sagaDescriptor(inputAnchor, digest),
+      ).rejects.toMatchObject({
+        code: "OperationInterventionRequiredError",
+        message: expect.stringMatching(message),
+      })
+      database.expectComplete()
+    }
+
+    const changedBody = {
+      ...descriptor,
+      steps: descriptor.steps.map((step) => ({ ...step, timeoutMs: step.timeoutMs + 1 })),
+    }
+    const checksumDatabase = new ScriptedDatabase([
+      {
+        kind: "first",
+        result: { ...anchoredRow, descriptor_json: JSON.stringify(changedBody) },
+        sql: `SELECT "descriptor_id", "descriptor_version", "descriptor_checksum", "descriptor_json"`,
+      },
+    ])
+    await expect(
+      new D1SagaHistoryReader(checksumDatabase).sagaDescriptor(inputAnchor, digest),
+    ).rejects.toMatchObject({ code: "OperationInterventionRequiredError" })
+    checksumDatabase.expectComplete()
   })
 
   it("rejects missing, malformed, oversized, noncanonical, or non-saga operation plans", async () => {

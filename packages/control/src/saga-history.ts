@@ -1,8 +1,10 @@
 import {
   type DigestFunction,
   loadOperationPlan,
+  loadSagaDescriptor,
   NozzleError,
   type OperationPlan,
+  type SagaDescriptor,
 } from "@nozzle/core"
 import type { TransactionalControlDatabase } from "./database.js"
 import {
@@ -64,6 +66,13 @@ interface OperationPlanRow {
   readonly operation_id: string
   readonly plan_checksum: string
   readonly plan_json: string
+}
+
+interface SagaDescriptorRow {
+  readonly descriptor_checksum: string
+  readonly descriptor_id: string
+  readonly descriptor_json: string
+  readonly descriptor_version: number
 }
 
 interface TransitionSummaryRow {
@@ -216,6 +225,13 @@ const OPERATION_PLAN_ROW_KEYS = [
   "plan_checksum",
   "plan_json",
 ] as const satisfies readonly (keyof OperationPlanRow)[]
+
+const SAGA_DESCRIPTOR_ROW_KEYS = [
+  "descriptor_checksum",
+  "descriptor_id",
+  "descriptor_json",
+  "descriptor_version",
+] as const satisfies readonly (keyof SagaDescriptorRow)[]
 
 const TRANSITION_ROW_KEYS = [
   "acquisition_id",
@@ -908,6 +924,48 @@ export class D1SagaHistoryReader {
       return intervention("The persisted saga operation plan is not canonical for its anchor.")
     }
     return plan
+  }
+
+  async sagaDescriptor(
+    inputAnchor: SagaHistoryAnchor,
+    digest: DigestFunction,
+  ): Promise<SagaDescriptor> {
+    const anchor = loadSagaHistoryAnchor(inputAnchor)
+    if (typeof digest !== "function") {
+      configuration("A saga-history descriptor digest is required.")
+    }
+    const candidate = await this.#database
+      .prepare(
+        `SELECT "descriptor_id", "descriptor_version", "descriptor_checksum", "descriptor_json"
+         FROM "nozzle_sagas" WHERE "saga_id" = ?1`,
+      )
+      .bind(anchor.sagaId)
+      .first<SagaDescriptorRow>()
+    if (candidate === null) return intervention("The anchored saga descriptor disappeared.")
+    const row = captured<SagaDescriptorRow>(
+      candidate,
+      SAGA_DESCRIPTOR_ROW_KEYS,
+      "Persisted saga-history descriptor",
+    )
+    if (
+      row.descriptor_checksum !== anchor.sagaDescriptorChecksum ||
+      !persistedText(row.descriptor_id) ||
+      !safeInteger(row.descriptor_version, 1) ||
+      !validJson(row.descriptor_json) ||
+      UTF8_ENCODER.encode(row.descriptor_json).byteLength > 2_000_000
+    ) {
+      return intervention("The persisted saga descriptor contradicts its history anchor.")
+    }
+    const descriptor = await loadSagaDescriptor(JSON.parse(row.descriptor_json), digest)
+    if (
+      descriptor.descriptorId !== row.descriptor_id ||
+      descriptor.version !== row.descriptor_version ||
+      descriptor.descriptorChecksum !== row.descriptor_checksum ||
+      JSON.stringify(descriptor) !== row.descriptor_json
+    ) {
+      return intervention("The persisted saga descriptor is not canonical for its anchor.")
+    }
+    return descriptor
   }
 
   async auditPage(

@@ -8,6 +8,7 @@ import {
   type DigestFunction,
   loadAuditEvent,
   loadOperationRecord,
+  loadSagaDescriptor,
   loadSagaRecord,
   markOperationStepNotRequired,
   markRunningSagaActionUnknown,
@@ -31,6 +32,7 @@ import {
   requestSagaTermination,
   type SagaActionPhase,
   type SagaActionRecord,
+  type SagaDescriptor,
   type SagaRecord,
 } from "@nozzle/core"
 import { operationStepRecordJson, operationTransitionIdentity } from "./operation-store.js"
@@ -52,6 +54,7 @@ import {
   type SagaHistoryTransitionCursor,
   type SagaHistoryTransitionRow,
 } from "./saga-history.js"
+import { verifySagaOperationPlan } from "./saga-plan.js"
 import {
   SAGA_INIT_OPERATION_STEP_ID,
   SAGA_TERMINATION_OPERATION_STEP_ID,
@@ -211,6 +214,20 @@ export interface SagaHistoryEffectProof {
   readonly sagaRecordChecksum: string
   readonly sagaStateVersion: number
   readonly sagaStatus: SagaRecord["status"]
+  readonly schemaVersion: 1
+}
+
+export interface SagaHistoryPlanProof {
+  readonly descriptorChecksum: string
+  readonly descriptorId: string
+  readonly descriptorVersion: number
+  readonly operationId: string
+  readonly operationPlanChecksum: string
+  readonly operationStepCount: number
+  readonly operationType: string
+  readonly sagaId: string
+  readonly sagaInputChecksum: string
+  readonly sagaStepCount: number
   readonly schemaVersion: 1
 }
 
@@ -2492,6 +2509,45 @@ export class SagaHistoryEffectFolder {
     } finally {
       this.#appending = false
     }
+  }
+
+  async planProof(
+    inputPlan: OperationPlan,
+    inputDescriptor: SagaDescriptor,
+  ): Promise<SagaHistoryPlanProof> {
+    if (!this.#complete) return resume("Saga history requires a complete effect fold first.")
+    const plan = inputPlan
+    let descriptorSnapshot: unknown
+    try {
+      descriptorSnapshot = structuredClone(inputDescriptor)
+    } catch {
+      return intervention("The persisted saga descriptor could not be captured safely.")
+    }
+    const descriptor = await loadSagaDescriptor(descriptorSnapshot, this.#digest)
+    const saga = this.#state.saga as SagaRecord
+    if (
+      descriptor.descriptorChecksum !== this.#anchor.sagaDescriptorChecksum ||
+      JSON.stringify(descriptor) !== JSON.stringify(saga.descriptor) ||
+      plan.operationId !== this.#anchor.operationId ||
+      plan.inputChecksum !== this.#anchor.operationInputChecksum ||
+      plan.planChecksum !== this.#anchor.operationPlanChecksum
+    ) {
+      return intervention("The saga descriptor or operation plan contradicts its history proof.")
+    }
+    await verifySagaOperationPlan(plan, saga, this.#digest)
+    return Object.freeze({
+      descriptorChecksum: descriptor.descriptorChecksum,
+      descriptorId: descriptor.descriptorId,
+      descriptorVersion: descriptor.version,
+      operationId: plan.operationId,
+      operationPlanChecksum: plan.planChecksum,
+      operationStepCount: plan.steps.length,
+      operationType: plan.operationType,
+      sagaId: saga.sagaId,
+      sagaInputChecksum: saga.inputChecksum,
+      sagaStepCount: descriptor.steps.length,
+      schemaVersion: 1,
+    })
   }
 
   proof(): SagaHistoryEffectProof {

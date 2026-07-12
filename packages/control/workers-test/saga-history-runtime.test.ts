@@ -36,6 +36,8 @@ import {
   SagaHistoryEffectFolder,
   SagaHistoryTransitionFolder,
 } from "../src/saga-history-fold.js"
+import { sealSagaOperationPlan } from "../src/saga-plan.js"
+import { sealSagaHandlerRegistry } from "../src/saga-registry.js"
 
 declare global {
   namespace Cloudflare {
@@ -91,7 +93,8 @@ beforeAll(async () => {
       "plan_checksum" TEXT, "plan_json" TEXT, "status" TEXT, "updated_at_ms" INTEGER
     )`,
     `CREATE TABLE "nozzle_sagas" (
-      "saga_id" TEXT PRIMARY KEY, "operation_id" TEXT, "descriptor_checksum" TEXT,
+      "saga_id" TEXT PRIMARY KEY, "operation_id" TEXT, "descriptor_id" TEXT,
+      "descriptor_version" INTEGER, "descriptor_checksum" TEXT, "descriptor_json" TEXT,
       "input_checksum" TEXT, "state_version" INTEGER, "status" TEXT,
       "last_effect_id" TEXT, "record_checksum" TEXT, "updated_at_ms" INTEGER
     )`,
@@ -149,10 +152,13 @@ beforeAll(async () => {
     11,
   )
   await run(
-    `INSERT INTO "nozzle_sagas" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO "nozzle_sagas" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     "history-saga",
     "history-operation",
+    "history-descriptor",
+    1,
     "saga-descriptor",
+    "{}",
     "saga-input",
     2,
     "failed",
@@ -361,10 +367,13 @@ describe("real workerd D1 saga history paging", () => {
       3,
     )
     await run(
-      `INSERT INTO "nozzle_sagas" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO "nozzle_sagas" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       sagaId,
       operationId,
       "runtime-descriptor",
+      1,
+      "runtime-descriptor",
+      "{}",
       "runtime-saga-input",
       0,
       "succeeded",
@@ -512,6 +521,56 @@ describe("real workerd D1 saga history paging", () => {
       },
       digest,
     )
+    const descriptorStep = descriptor.steps[0] as (typeof descriptor.steps)[number]
+    const effectHandler = () => ({
+      evidenceJson: "{}",
+      outputJson: "{}",
+      state: "confirmed" as const,
+    })
+    const observationHandler = () => ({
+      evidenceJson: "{}",
+      outputJson: "{}",
+      state: "applied" as const,
+    })
+    const registry = await sealSagaHandlerRegistry(
+      [
+        { handler: effectHandler, kind: "effect", reference: descriptorStep.forwardAction },
+        {
+          handler: observationHandler,
+          kind: "observation",
+          reference: descriptorStep.forwardObservation,
+        },
+        {
+          handler: effectHandler,
+          kind: "effect",
+          reference: descriptorStep.compensationAction as NonNullable<
+            typeof descriptorStep.compensationAction
+          >,
+        },
+        {
+          handler: observationHandler,
+          kind: "observation",
+          reference: descriptorStep.compensationObservation as NonNullable<
+            typeof descriptorStep.compensationObservation
+          >,
+        },
+      ],
+      digest,
+    )
+    const plan = await sealSagaOperationPlan(
+      {
+        capabilitySnapshotChecksum: "9".repeat(64),
+        descriptor,
+        inputChecksum: "1".repeat(64),
+        leaseKey,
+        operationId,
+        operationIdempotencyKey: "runtime-effect-operation-key",
+        registry,
+        sagaId,
+        stepInputChecksums: { [stepId]: "2".repeat(64) },
+      },
+      digest,
+    )
     const initial = createSagaRecord({
       deadlineAtMs: 100,
       descriptor,
@@ -619,18 +678,21 @@ describe("real workerd D1 saga history paging", () => {
       `INSERT INTO "nozzle_operations" VALUES (?, ?, ?, ?, ?, ?, ?)`,
       operationId,
       environmentId,
-      "runtime-effect-operation-input",
-      "runtime-effect-operation-plan",
-      "{}",
+      plan.inputChecksum,
+      plan.planChecksum,
+      JSON.stringify(plan),
       "succeeded",
       3,
     )
     const finalEffect = effectRows[2] as SagaHistoryEffectRow
     await run(
-      `INSERT INTO "nozzle_sagas" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO "nozzle_sagas" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       sagaId,
       operationId,
+      descriptor.descriptorId,
+      descriptor.version,
       descriptor.descriptorChecksum,
+      JSON.stringify(descriptor),
       succeeded.inputChecksum,
       succeeded.stateVersion,
       succeeded.status,
@@ -700,6 +762,15 @@ describe("real workerd D1 saga history paging", () => {
       saga: succeeded,
       sagaStateVersion: 2,
       sagaStatus: "succeeded",
+    })
+    const loadedDescriptor = await reader.sagaDescriptor(anchor, digest)
+    const loadedPlan = await reader.operationPlan(anchor, digest)
+    await expect(folder.planProof(loadedPlan, loadedDescriptor)).resolves.toMatchObject({
+      descriptorChecksum: descriptor.descriptorChecksum,
+      operationPlanChecksum: plan.planChecksum,
+      operationStepCount: 5,
+      sagaId,
+      sagaStepCount: 1,
     })
     await expect(reader.assertAnchorCurrent(anchor)).resolves.toBeUndefined()
   })
@@ -841,10 +912,13 @@ describe("real workerd D1 saga history paging", () => {
       30,
     )
     await run(
-      `INSERT INTO "nozzle_sagas" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO "nozzle_sagas" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       sagaId,
       operationId,
       "runtime-attempt-descriptor",
+      1,
+      "runtime-attempt-descriptor",
+      "{}",
       "runtime-attempt-saga-input",
       0,
       "failed",

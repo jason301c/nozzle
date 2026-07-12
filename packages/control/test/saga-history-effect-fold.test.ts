@@ -21,6 +21,8 @@ import type {
   SagaHistoryPage,
 } from "../src/saga-history.js"
 import { SagaHistoryEffectFolder, type SagaHistoryEffectProof } from "../src/saga-history-fold.js"
+import { sealSagaOperationPlan } from "../src/saga-plan.js"
+import { sealSagaHandlerRegistry } from "../src/saga-registry.js"
 
 const COORDINATOR_DOMAIN = "nozzle.saga-coordinator-id.v1"
 const RECORD_DOMAIN = "nozzle.saga-record.v1"
@@ -123,6 +125,56 @@ async function initialSaga(maxAttempts = 2): Promise<SagaRecord> {
     serverTimeMs: 0,
     stepInputChecksums: { [SAGA_STEP_ID]: checksum("2") },
   })
+}
+
+async function canonicalPlan(
+  saga: SagaRecord,
+  overrides: {
+    readonly capabilitySnapshotChecksum?: string
+    readonly inputChecksum?: string
+    readonly operationId?: string
+  } = {},
+) {
+  const step = saga.descriptor.steps[0] as SagaDescriptor["steps"][number]
+  const effect = () => ({ evidenceJson: "{}", outputJson: "{}", state: "confirmed" as const })
+  const observation = () => ({
+    evidenceJson: "{}",
+    outputJson: "{}",
+    state: "applied" as const,
+  })
+  const registry = await sealSagaHandlerRegistry(
+    [
+      { handler: effect, kind: "effect", reference: step.forwardAction },
+      { handler: observation, kind: "observation", reference: step.forwardObservation },
+      {
+        handler: effect,
+        kind: "effect",
+        reference: step.compensationAction as NonNullable<typeof step.compensationAction>,
+      },
+      {
+        handler: observation,
+        kind: "observation",
+        reference: step.compensationObservation as NonNullable<typeof step.compensationObservation>,
+      },
+    ],
+    digest,
+  )
+  return sealSagaOperationPlan(
+    {
+      capabilitySnapshotChecksum: overrides.capabilitySnapshotChecksum ?? checksum("9"),
+      descriptor: saga.descriptor,
+      inputChecksum: overrides.inputChecksum ?? saga.inputChecksum,
+      leaseKey: LEASE_KEY,
+      operationId: overrides.operationId ?? OPERATION_ID,
+      operationIdempotencyKey: "effect-fold-operation-key",
+      registry,
+      sagaId: saga.sagaId,
+      stepInputChecksums: {
+        [SAGA_STEP_ID]: saga.steps[SAGA_STEP_ID]?.inputChecksum as string,
+      },
+    },
+    digest,
+  )
 }
 
 function operationStepId(phase: SagaActionPhase): string {
@@ -665,6 +717,64 @@ describe("SagaHistoryEffectFolder", () => {
     })
     await expect(folder.append(effectPage(builder.rows.slice(2), true))).rejects.toMatchObject({
       code: "ConfigurationError",
+    })
+  })
+
+  it("binds the persisted descriptor and exact canonical saga operation plan", async () => {
+    const builder = await successfulFixture()
+    const saga = builder.saga as SagaRecord
+    const plan = await canonicalPlan(saga)
+    const folder = new SagaHistoryEffectFolder(
+      terminalAnchor(builder, {
+        operationInputChecksum: plan.inputChecksum,
+        operationPlanChecksum: plan.planChecksum,
+      }),
+      digest,
+    )
+    await expect(folder.planProof(plan, saga.descriptor)).rejects.toMatchObject({
+      code: "OperationResumeRequiredError",
+    })
+    await folder.append(effectPage(builder.rows.slice(0, 2), false))
+    await folder.append(effectPage(builder.rows.slice(2), true))
+    await expect(folder.planProof(plan, saga.descriptor)).resolves.toEqual({
+      descriptorChecksum: saga.descriptor.descriptorChecksum,
+      descriptorId: saga.descriptor.descriptorId,
+      descriptorVersion: saga.descriptor.version,
+      operationId: OPERATION_ID,
+      operationPlanChecksum: plan.planChecksum,
+      operationStepCount: 5,
+      operationType: `saga:${saga.descriptor.descriptorId}@${saga.descriptor.version}`,
+      sagaId: SAGA_ID,
+      sagaInputChecksum: saga.inputChecksum,
+      sagaStepCount: 1,
+      schemaVersion: 1,
+    })
+
+    await expect(folder.planProof(structuredClone(plan), saga.descriptor)).rejects.toMatchObject({
+      code: "OperationInterventionRequiredError",
+    })
+    await expect(folder.planProof(plan, await descriptor(3))).rejects.toMatchObject({
+      code: "OperationInterventionRequiredError",
+    })
+    await expect(
+      folder.planProof(
+        await canonicalPlan(saga, { capabilitySnapshotChecksum: checksum("8") }),
+        saga.descriptor,
+      ),
+    ).rejects.toMatchObject({ code: "OperationInterventionRequiredError" })
+    await expect(
+      folder.planProof(
+        plan,
+        new Proxy(saga.descriptor, {
+          get(target, property, receiver) {
+            if (property === "descriptorId") throw new Error("private descriptor detail")
+            return Reflect.get(target, property, receiver)
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({
+      code: "OperationInterventionRequiredError",
+      message: "The persisted saga descriptor could not be captured safely.",
     })
   })
 
