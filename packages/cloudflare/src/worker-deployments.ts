@@ -5,6 +5,12 @@ import {
   type ProviderErrorSummary,
   parseCloudflareRateLimit,
 } from "./provider-http.js"
+import {
+  type ActiveWorkerDeploymentProof,
+  createActiveWorkerDeploymentProof,
+} from "./worker-deployment-proof.js"
+
+export type { ActiveWorkerDeploymentProof } from "./worker-deployment-proof.js"
 
 const CLOUDFLARE_API_ORIGIN = "https://api.cloudflare.com/client/v4"
 const DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024
@@ -40,6 +46,7 @@ export type ActiveWorkerDeploymentObservation =
       readonly deployment: ActiveWorkerDeployment
       readonly evidence: WorkerDeploymentObservationEvidence
       readonly kind: "complete"
+      readonly proof: ActiveWorkerDeploymentProof
     }
   | {
       readonly errors: readonly ProviderErrorSummary[]
@@ -345,6 +352,7 @@ export function createCloudflareWorkerDeploymentClient(
   const now = options.now ?? Date.now
   if (typeof now !== "function") configuration("A provider clock is required.")
   const accountPath = `${CLOUDFLARE_API_ORIGIN}/accounts/${options.accountId}/workers/scripts`
+  const accountId = options.accountId
 
   async function attempt(
     scriptName: string,
@@ -465,6 +473,11 @@ export function createCloudflareWorkerDeploymentClient(
         deployment,
         evidence: result.evidence,
         kind: "complete",
+        proof: createActiveWorkerDeploymentProof({
+          accountId,
+          deployment,
+          evidence: result.evidence,
+        }),
       })
     } catch {
       return Object.freeze({

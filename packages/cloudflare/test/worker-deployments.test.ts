@@ -164,6 +164,8 @@ describe("Cloudflare active Worker deployment observation", () => {
     expect(Object.isFrozen(result.deployment.versions)).toBe(true)
     expect(Object.isFrozen(result.deployment.versions[0])).toBe(true)
     expect(Object.isFrozen(result.evidence)).toBe(true)
+    expect(Object.isFrozen(result.proof)).toBe(true)
+    expect(Object.keys(result.proof)).toEqual([])
   })
 
   it("normalizes exact gradual percentages and canonical version order", async () => {
