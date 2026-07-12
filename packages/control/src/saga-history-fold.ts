@@ -34,6 +34,7 @@ import {
   type SagaActionRecord,
   type SagaDescriptor,
   type SagaRecord,
+  sagaActionKey,
 } from "@nozzle/core"
 import { operationStepRecordJson, operationTransitionIdentity } from "./operation-store.js"
 import {
@@ -231,6 +232,58 @@ export interface SagaHistoryPlanProof {
   readonly schemaVersion: 1
 }
 
+interface SagaHistoryTransitionReconciliationSummary {
+  readonly acquisitionId: string
+  readonly auditSequence: number
+  readonly createdAtMs: number
+  readonly eventType: string
+  readonly fencingToken: number
+  readonly holderId: string
+  readonly leaseKey: string
+  readonly payloadChecksum: string
+  readonly stepId: string
+  readonly transitionId: string
+}
+
+interface SagaHistoryEffectReconciliationSummary {
+  readonly acquisitionId: string
+  readonly actionAttemptId: string | null
+  readonly actionErrorChecksum: string | null
+  readonly actionIdempotencyKey: string | null
+  readonly actionObservationEvidenceChecksum: string | null
+  readonly actionResultChecksum: string | null
+  readonly actionState: SagaActionRecord["state"] | null
+  readonly createdAtMs: number
+  readonly effectId: string
+  readonly effectKind: string
+  readonly evidenceChecksum: string
+  readonly fencingToken: number
+  readonly holderId: string
+  readonly leaseKey: string
+  readonly phase: SagaActionPhase | null
+  readonly sagaStepId: string | null
+  readonly stepId: string
+  readonly transitionId: string
+}
+
+export interface SagaHistoryReconciliationProof {
+  readonly actionBeginCount: number
+  readonly attemptCount: number
+  readonly attemptFoldChecksum: string
+  readonly auditTransitionFoldChecksum: string
+  readonly coupledTransitionCount: number
+  readonly effectAttemptCount: number
+  readonly effectCount: number
+  readonly effectFoldChecksum: string
+  readonly observationAttemptCount: number
+  readonly operationId: string
+  readonly operationPlanChecksum: string
+  readonly sagaId: string
+  readonly sagaRecordChecksum: string
+  readonly schemaVersion: 1
+  readonly transitionCount: number
+}
+
 export interface SagaHistoryAttemptSummary {
   readonly acceptanceChecksum: string
   readonly acceptedAtMs: number
@@ -279,6 +332,7 @@ interface SagaHistoryTransitionFoldState {
   auditTransitionFoldChecksum: string
   cursor: SagaHistoryTransitionCursor
   operation: OperationRecord
+  reconciliation: SagaHistoryTransitionReconciliationSummary[]
   transitionCount: number
 }
 
@@ -291,6 +345,7 @@ interface SagaHistoryEffectFoldState {
   fencingToken: number | null
   holderId: string | null
   leaseKey: string | null
+  reconciliation: SagaHistoryEffectReconciliationSummary[]
   recordChecksum: string | null
   saga: SagaRecord | undefined
   stateVersion: number
@@ -1472,6 +1527,24 @@ function verifyDirectAuditPayload(
   }
 }
 
+function transitionReconciliationSummary(
+  row: SagaHistoryTransitionRow,
+  event: AuditEvent,
+): SagaHistoryTransitionReconciliationSummary {
+  return Object.freeze({
+    acquisitionId: row.acquisition_id,
+    auditSequence: row.audit_sequence,
+    createdAtMs: row.created_at_ms,
+    eventType: event.eventType,
+    fencingToken: row.fencing_token,
+    holderId: row.holder_id,
+    leaseKey: row.lease_key,
+    payloadChecksum: event.payloadChecksum,
+    stepId: row.step_id,
+    transitionId: row.transition_id,
+  })
+}
+
 type ParsedSagaEffectKind =
   | { readonly kind: "create" }
   | { readonly cause: "cancellation" | "timeout"; readonly kind: "termination" }
@@ -1842,6 +1915,87 @@ async function verifyBeginEvidence(
   }
 }
 
+async function verifyRecoveryEvidence(
+  row: SagaHistoryEffectRow,
+  kind: ParsedSagaEffectKind,
+  before: SagaRecord | undefined,
+  digest: DigestFunction,
+): Promise<void> {
+  if (kind.kind !== "action" || kind.action !== "recovery:not-dispatched") return
+  if (before === undefined) return intervention("Saga recovery effect has no predecessor.")
+  const sagaStepId = effectActionStepId(row, kind.phase)
+  const attemptId = requiredActionText(
+    effectAction(before, sagaStepId, kind.phase).activeAttemptId,
+    "its recovered attempt identity",
+  )
+  const recoveryId = verifyTransitionSuffix(row, "crash-recovered")
+  const expected = await checkedFoldDigest(digest, SAGA_COORDINATOR_ID_DOMAIN, [
+    "recovery-not-dispatched",
+    row.operation_id,
+    row.step_id,
+    attemptId,
+    recoveryId,
+    row.fencing_token.toString(10),
+  ])
+  if (row.evidence_checksum !== expected) {
+    return intervention("Saga not-dispatched recovery has contradictory deterministic evidence.")
+  }
+}
+
+function effectReconciliationSummary(
+  row: SagaHistoryEffectRow,
+  kind: ParsedSagaEffectKind,
+  after: SagaRecord,
+): SagaHistoryEffectReconciliationSummary {
+  if (kind.kind !== "action") {
+    return Object.freeze({
+      acquisitionId: row.acquisition_id,
+      actionAttemptId: null,
+      actionErrorChecksum: null,
+      actionIdempotencyKey: null,
+      actionObservationEvidenceChecksum: null,
+      actionResultChecksum: null,
+      actionState: null,
+      createdAtMs: row.created_at_ms,
+      effectId: row.effect_id,
+      effectKind: row.effect_kind,
+      evidenceChecksum: row.evidence_checksum,
+      fencingToken: row.fencing_token,
+      holderId: row.holder_id,
+      leaseKey: row.lease_key,
+      phase: null,
+      sagaStepId: null,
+      stepId: row.step_id,
+      transitionId: row.transition_id,
+    })
+  }
+  const sagaStepId = effectActionStepId(row, kind.phase)
+  const action = effectAction(after, sagaStepId, kind.phase)
+  return Object.freeze({
+    acquisitionId: row.acquisition_id,
+    actionAttemptId: requiredActionText(
+      action.lastAttemptId,
+      "its reconciliation attempt identity",
+    ),
+    actionErrorChecksum: action.errorChecksum ?? null,
+    actionIdempotencyKey: action.idempotencyKey,
+    actionObservationEvidenceChecksum: action.observationEvidenceChecksum ?? null,
+    actionResultChecksum: action.resultChecksum ?? null,
+    actionState: action.state,
+    createdAtMs: row.created_at_ms,
+    effectId: row.effect_id,
+    effectKind: row.effect_kind,
+    evidenceChecksum: row.evidence_checksum,
+    fencingToken: row.fencing_token,
+    holderId: row.holder_id,
+    leaseKey: row.lease_key,
+    phase: kind.phase,
+    sagaStepId,
+    stepId: row.step_id,
+    transitionId: row.transition_id,
+  })
+}
+
 async function nextEffectFoldChecksum(
   digest: DigestFunction,
   previous: string,
@@ -2174,6 +2328,7 @@ export class SagaHistoryTransitionFolder {
       auditTransitionFoldChecksum: EMPTY_FOLD_CHECKSUM,
       cursor: Object.freeze({ auditSequence: 0, transitionId: "" }),
       operation,
+      reconciliation: [],
       transitionCount: 0,
     }
   }
@@ -2286,6 +2441,7 @@ export class SagaHistoryTransitionFolder {
       state.auditTransitionFoldChecksum,
       event,
     )
+    state.reconciliation.push(transitionReconciliationSummary(row, event))
     state.cursor = Object.freeze({
       auditSequence: row.audit_sequence,
       transitionId: row.transition_id,
@@ -2308,6 +2464,7 @@ export class SagaHistoryTransitionFolder {
         auditTransitionFoldChecksum: this.#state.auditTransitionFoldChecksum,
         cursor: this.#state.cursor,
         operation: this.#state.operation,
+        reconciliation: [...this.#state.reconciliation],
         transitionCount: this.#state.transitionCount,
       }
       for (const row of page.rows) await this.#foldRow(row, state)
@@ -2332,6 +2489,13 @@ export class SagaHistoryTransitionFolder {
     } finally {
       this.#appending = false
     }
+  }
+
+  reconciliationHistory(): readonly SagaHistoryTransitionReconciliationSummary[] {
+    if (!this.#complete) {
+      return resume("Saga operation-transition history requires more verified pages.")
+    }
+    return Object.freeze([...this.#state.reconciliation])
   }
 
   proof(): SagaHistoryTransitionProof {
@@ -2371,6 +2535,7 @@ export class SagaHistoryEffectFolder {
     fencingToken: null,
     holderId: null,
     leaseKey: null,
+    reconciliation: [],
     recordChecksum: null,
     saga: undefined,
     stateVersion: -1,
@@ -2446,6 +2611,7 @@ export class SagaHistoryEffectFolder {
     if (row.effect_id !== (await expectedSagaEffectId(row, this.#digest))) {
       return intervention("Saga effect history has a contradictory deterministic identity.")
     }
+    await verifyRecoveryEvidence(row, kind, state.saga, this.#digest)
     verifyEffectTransition(row, kind, after)
     await verifyBeginEvidence(row, kind, after, this.#digest)
 
@@ -2474,6 +2640,7 @@ export class SagaHistoryEffectFolder {
     state.fencingToken = row.fencing_token
     state.holderId = row.holder_id
     state.leaseKey = row.lease_key
+    state.reconciliation.push(effectReconciliationSummary(row, kind, after))
     state.recordChecksum = recordChecksum
     state.saga = after
     state.stateVersion = row.to_state_version
@@ -2485,7 +2652,10 @@ export class SagaHistoryEffectFolder {
     this.#appending = true
     try {
       const page = capturedEffectPage(inputPage)
-      const state: SagaHistoryEffectFoldState = { ...this.#state }
+      const state: SagaHistoryEffectFoldState = {
+        ...this.#state,
+        reconciliation: [...this.#state.reconciliation],
+      }
       for (const row of page.rows) await this.#foldRow(row, state)
       const atHead =
         state.stateVersion === this.#anchor.sagaStateVersion &&
@@ -2548,6 +2718,11 @@ export class SagaHistoryEffectFolder {
       sagaStepCount: descriptor.steps.length,
       schemaVersion: 1,
     })
+  }
+
+  reconciliationHistory(): readonly SagaHistoryEffectReconciliationSummary[] {
+    if (!this.#complete) return resume("Saga effect history requires more verified pages.")
+    return Object.freeze([...this.#state.reconciliation])
   }
 
   proof(): SagaHistoryEffectProof {
@@ -2724,6 +2899,11 @@ export class SagaHistoryAttemptFolder {
     }
   }
 
+  reconciliationHistory(): readonly SagaHistoryAttemptSummary[] {
+    if (!this.#complete) return resume("Saga-attempt history requires more verified pages.")
+    return Object.freeze([...this.#state.summaries])
+  }
+
   proof(): SagaHistoryAttemptProof {
     if (!this.#complete) return resume("Saga-attempt history requires more verified pages.")
     return Object.freeze({
@@ -2738,4 +2918,323 @@ export class SagaHistoryAttemptFolder {
       schemaVersion: 1,
     })
   }
+}
+
+const COUPLED_SAGA_EVENT_TYPES = new Set([
+  "saga.action.classified",
+  "saga.action.observed",
+  "saga.action.recovered",
+  "saga.action.started",
+  "saga.initialized",
+  "saga.termination.requested",
+])
+
+function effectEventType(effectKind: ParsedSagaEffectKind): string {
+  if (effectKind.kind === "create") return "saga.initialized"
+  if (effectKind.kind === "termination") return "saga.termination.requested"
+  if (effectKind.action === "begin") return "saga.action.started"
+  if (effectKind.action.startsWith("recovery:")) return "saga.action.recovered"
+  if (effectKind.action.startsWith("observation:")) return "saga.action.observed"
+  return "saga.action.classified"
+}
+
+function attemptActionBinding(
+  saga: SagaRecord,
+  attempt: SagaHistoryAttemptSummary,
+): { readonly actionKey: string; readonly idempotencyKey: string } {
+  const descriptorStep = saga.descriptor.steps.find(
+    (candidate) => candidate.stepId === attempt.sagaStepId,
+  )
+  const action = saga.steps[attempt.sagaStepId]?.[attempt.phase]
+  if (descriptorStep === undefined || action === undefined) {
+    return intervention("Saga-attempt history names an action outside the verified descriptor.")
+  }
+  const reference =
+    attempt.purpose === "observation"
+      ? attempt.phase === "forward"
+        ? descriptorStep.forwardObservation
+        : descriptorStep.compensationObservation
+      : attempt.phase === "forward"
+        ? descriptorStep.forwardAction
+        : descriptorStep.compensationAction
+  if (reference === null) {
+    return intervention("Saga-attempt history names an unavailable descriptor action.")
+  }
+  return Object.freeze({
+    actionKey: sagaActionKey(reference),
+    idempotencyKey:
+      attempt.purpose === "observation"
+        ? `${action.idempotencyKey}:observation`
+        : action.idempotencyKey,
+  })
+}
+
+function sameAttemptConsumer(
+  effect: SagaHistoryEffectReconciliationSummary,
+  attempt: SagaHistoryAttemptSummary,
+  requireNewerFence: boolean,
+): boolean {
+  return (
+    effect.leaseKey === attempt.leaseKey &&
+    (requireNewerFence
+      ? effect.fencingToken > attempt.fencingToken
+      : effect.fencingToken >= attempt.fencingToken) &&
+    (effect.fencingToken !== attempt.fencingToken ||
+      (effect.holderId === attempt.holderId && effect.acquisitionId === attempt.acquisitionId)) &&
+    effect.createdAtMs >= attempt.acceptedAtMs &&
+    (attempt.completedAtMs === null || effect.createdAtMs >= attempt.completedAtMs)
+  )
+}
+
+function directAttemptEffectKind(
+  attempt: SagaHistoryAttemptSummary,
+  effect: SagaHistoryEffectReconciliationSummary,
+): boolean {
+  const prefix = `action:${attempt.phase}:`
+  if (attempt.state === "confirmed") return effect.effectKind === `${prefix}success`
+  if (attempt.state === "unknown") return effect.effectKind === `${prefix}failure:unknown`
+  if (attempt.state === "failed") {
+    return effect.effectKind === `${prefix}failure:definitely_not_applied_terminal`
+  }
+  if (attempt.state === "not_applied") {
+    return (
+      effect.effectKind === `${prefix}failure:definitely_not_applied_retryable` ||
+      effect.effectKind === `${prefix}failure:definitely_not_applied_terminal`
+    )
+  }
+  return false
+}
+
+/**
+ * Reconciles the already verified operation, saga-effect, and attempt streams as exact sets. This
+ * remains a read-only proof and deliberately carries no terminal settlement authority.
+ */
+export async function reconcileSagaHistory(
+  transitionFolder: SagaHistoryTransitionFolder,
+  effectFolder: SagaHistoryEffectFolder,
+  attemptFolder: SagaHistoryAttemptFolder,
+  plan: OperationPlan,
+  descriptor: SagaDescriptor,
+): Promise<SagaHistoryReconciliationProof> {
+  if (
+    !(transitionFolder instanceof SagaHistoryTransitionFolder) ||
+    !(effectFolder instanceof SagaHistoryEffectFolder) ||
+    !(attemptFolder instanceof SagaHistoryAttemptFolder)
+  ) {
+    return configuration("Completed saga-history folders are required for reconciliation.")
+  }
+  const planProof = await effectFolder.planProof(plan, descriptor)
+  const transitionProof = transitionFolder.proof()
+  const effectProof = effectFolder.proof()
+  const attemptProof = attemptFolder.proof()
+  if (
+    transitionProof.operationId !== effectProof.operationId ||
+    transitionProof.operationId !== attemptProof.operationId ||
+    transitionProof.operationPlanChecksum !== planProof.operationPlanChecksum ||
+    effectProof.sagaId !== attemptProof.sagaId ||
+    effectProof.sagaId !== planProof.sagaId
+  ) {
+    return intervention("Saga-history component proofs belong to different operations or sagas.")
+  }
+
+  const transitions = transitionFolder.reconciliationHistory()
+  const effects = effectFolder.reconciliationHistory()
+  const attempts = attemptFolder.reconciliationHistory()
+  const transitionsById = new Map(
+    transitions.map((transition) => [transition.transitionId, transition] as const),
+  )
+  const effectsByTransition = new Map(
+    effects.map((effect) => [effect.transitionId, effect] as const),
+  )
+  if (transitionsById.size !== transitions.length || effectsByTransition.size !== effects.length) {
+    return intervention("Saga history contains duplicate cross-stream transition identities.")
+  }
+  if (
+    transitions.filter((transition) => COUPLED_SAGA_EVENT_TYPES.has(transition.eventType))
+      .length !== effects.length
+  ) {
+    return intervention("Saga operation and effect histories have different coupled cardinality.")
+  }
+
+  for (const transition of transitions) {
+    const effect = effectsByTransition.get(transition.transitionId)
+    if (COUPLED_SAGA_EVENT_TYPES.has(transition.eventType) !== (effect !== undefined)) {
+      return intervention("Saga operation and effect histories do not form an exact coupled set.")
+    }
+    if (effect === undefined) continue
+    const kind = parsedSagaEffectKind(effect.effectKind)
+    if (
+      effectEventType(kind) !== transition.eventType ||
+      effect.stepId !== transition.stepId ||
+      effect.evidenceChecksum !== transition.payloadChecksum ||
+      effect.leaseKey !== transition.leaseKey ||
+      effect.holderId !== transition.holderId ||
+      effect.acquisitionId !== transition.acquisitionId ||
+      effect.fencingToken !== transition.fencingToken
+    ) {
+      return intervention("A coupled saga transition and effect carry contradictory evidence.")
+    }
+  }
+
+  const attemptsById = new Map(attempts.map((attempt) => [attempt.attemptId, attempt] as const))
+  if (attemptsById.size !== attempts.length) {
+    return intervention("Saga-attempt reconciliation contains duplicate identities.")
+  }
+  const actionEffects = effects.filter((effect) => effect.phase !== null)
+  const beginEffects = actionEffects.filter((effect) => effect.effectKind.endsWith(":begin"))
+  const beginByAttempt = new Map<string, SagaHistoryEffectReconciliationSummary>()
+  for (const effect of beginEffects) {
+    if (effect.actionAttemptId === null || beginByAttempt.has(effect.actionAttemptId)) {
+      return intervention("Saga action begin history has an ambiguous attempt identity.")
+    }
+    beginByAttempt.set(effect.actionAttemptId, effect)
+  }
+  const consumed = new Set<string>()
+  let effectAttemptCount = 0
+  let observationAttemptCount = 0
+
+  for (const attempt of attempts) {
+    const binding = attemptActionBinding(effectProof.saga, attempt)
+    const sagaStep = effectProof.saga.steps[attempt.sagaStepId]
+    if (
+      attempt.actionKey !== binding.actionKey ||
+      attempt.idempotencyKey !== binding.idempotencyKey ||
+      (attempt.purpose === "effect" &&
+        attempt.phase === "forward" &&
+        attempt.inputChecksum !== sagaStep?.inputChecksum)
+    ) {
+      return intervention("Saga-attempt history contradicts its descriptor-bound action.")
+    }
+
+    if (attempt.purpose === "effect") {
+      effectAttemptCount += 1
+      const begin = beginByAttempt.get(attempt.attemptId)
+      if (
+        begin === undefined ||
+        begin.sagaStepId !== attempt.sagaStepId ||
+        begin.phase !== attempt.phase ||
+        begin.actionIdempotencyKey !== attempt.idempotencyKey ||
+        begin.leaseKey !== attempt.leaseKey ||
+        begin.holderId !== attempt.holderId ||
+        begin.acquisitionId !== attempt.acquisitionId ||
+        begin.fencingToken !== attempt.fencingToken ||
+        attempt.acceptedAtMs < begin.createdAtMs
+      ) {
+        return intervention("Saga effect attempt lacks its exact coupled action begin.")
+      }
+      const related = actionEffects.filter(
+        (effect) =>
+          effect.actionAttemptId === attempt.attemptId &&
+          effect.effectId !== begin.effectId &&
+          !effect.effectKind.includes(":observation:"),
+      )
+      if (attempt.state === "accepted") {
+        const recovery = related.filter((effect) => effect.effectKind.endsWith(":recovery:unknown"))
+        if (
+          recovery.length !== 1 ||
+          related.length !== 1 ||
+          recovery[0]?.evidenceChecksum !== attempt.acceptanceChecksum ||
+          recovery[0]?.actionErrorChecksum !== attempt.acceptanceChecksum ||
+          !sameAttemptConsumer(recovery[0] as SagaHistoryEffectReconciliationSummary, attempt, true)
+        ) {
+          return intervention("An accepted saga attempt lacks its exact unknown recovery effect.")
+        }
+        consumed.add((recovery[0] as SagaHistoryEffectReconciliationSummary).effectId)
+        continue
+      }
+      const terminal = related.filter((effect) => directAttemptEffectKind(attempt, effect))
+      const exact = terminal[0]
+      if (
+        terminal.length !== 1 ||
+        related.length !== 1 ||
+        exact === undefined ||
+        exact.evidenceChecksum !== attempt.outcomeChecksum ||
+        !sameAttemptConsumer(exact, attempt, false) ||
+        (attempt.state === "confirmed"
+          ? exact.actionResultChecksum !== attempt.valueChecksum
+          : exact.actionErrorChecksum !== attempt.valueChecksum)
+      ) {
+        return intervention(
+          "A terminal saga effect receipt lacks its exact coupled outcome effect.",
+        )
+      }
+      consumed.add(exact.effectId)
+      continue
+    }
+
+    observationAttemptCount += 1
+    if (attempt.state === "accepted" || beginByAttempt.has(attempt.attemptId)) {
+      return intervention("A terminal saga contains an unresolved or dispatched observation.")
+    }
+    const transitionId = operationTransitionIdentity("reconciled", [
+      effectProof.operationId,
+      attempt.operationStepId,
+      attempt.attemptId,
+    ])
+    const effect = effectsByTransition.get(transitionId)
+    const expectedKind = `action:${attempt.phase}:observation:${
+      attempt.state === "confirmed" ? "applied" : attempt.state
+    }`
+    if (
+      effect === undefined ||
+      effect.effectKind !== expectedKind ||
+      effect.actionAttemptId !== attempt.causalAttemptId ||
+      effect.evidenceChecksum !== attempt.outcomeChecksum ||
+      effect.actionObservationEvidenceChecksum !== attempt.outcomeChecksum ||
+      !sameAttemptConsumer(effect, attempt, false) ||
+      (attempt.state === "confirmed" && effect.actionResultChecksum !== attempt.valueChecksum)
+    ) {
+      return intervention("A saga observation receipt lacks its exact causal coupled effect.")
+    }
+    consumed.add(effect.effectId)
+  }
+
+  for (const begin of beginEffects) {
+    if (begin.actionAttemptId === null || attemptsById.has(begin.actionAttemptId)) continue
+    const recoveries = actionEffects.filter(
+      (effect) =>
+        effect.actionAttemptId === begin.actionAttemptId &&
+        effect.effectKind.endsWith(":recovery:not-dispatched"),
+    )
+    const recovery = recoveries[0]
+    if (
+      recoveries.length !== 1 ||
+      recovery === undefined ||
+      recovery.leaseKey !== begin.leaseKey ||
+      recovery.fencingToken <= begin.fencingToken ||
+      recovery.createdAtMs < begin.createdAtMs ||
+      recovery.actionErrorChecksum !== recovery.evidenceChecksum
+    ) {
+      return intervention("A receipt-free saga begin lacks its exact not-dispatched recovery.")
+    }
+    consumed.add(recovery.effectId)
+  }
+
+  const nonBeginActionEffects = actionEffects.filter(
+    (effect) => !effect.effectKind.endsWith(":begin"),
+  )
+  if (
+    consumed.size !== nonBeginActionEffects.length ||
+    nonBeginActionEffects.some((effect) => !consumed.has(effect.effectId))
+  ) {
+    return intervention("Saga action effects and attempt receipts are not an exhaustive set.")
+  }
+
+  return Object.freeze({
+    actionBeginCount: beginEffects.length,
+    attemptCount: attemptProof.attemptCount,
+    attemptFoldChecksum: attemptProof.attemptFoldChecksum,
+    auditTransitionFoldChecksum: transitionProof.auditTransitionFoldChecksum,
+    coupledTransitionCount: effects.length,
+    effectAttemptCount,
+    effectCount: effectProof.effectCount,
+    effectFoldChecksum: effectProof.effectFoldChecksum,
+    observationAttemptCount,
+    operationId: effectProof.operationId,
+    operationPlanChecksum: planProof.operationPlanChecksum,
+    sagaId: effectProof.sagaId,
+    sagaRecordChecksum: effectProof.sagaRecordChecksum,
+    schemaVersion: 1,
+    transitionCount: transitionProof.transitionCount,
+  })
 }

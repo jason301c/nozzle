@@ -16,6 +16,18 @@ import {
 import { D1SagaAttemptStore, sagaActionInputChecksum } from "../src/saga-attempt-store.js"
 import { D1SagaCoordinatorStore } from "../src/saga-coordinator-store.js"
 import { invokeSagaEffectHandler } from "../src/saga-handler.js"
+import {
+  D1SagaHistoryReader,
+  type SagaHistoryAttemptCursor,
+  type SagaHistoryTransitionCursor,
+} from "../src/saga-history.js"
+import {
+  reconcileSagaHistory,
+  SagaHistoryAttemptFolder,
+  SagaHistoryAuditFolder,
+  SagaHistoryEffectFolder,
+  SagaHistoryTransitionFolder,
+} from "../src/saga-history-fold.js"
 import { loadSagaInvocationInput, sealSagaInvocationInput } from "../src/saga-input.js"
 import { sealSagaOperationPlan } from "../src/saga-plan.js"
 import { sealSagaHandlerRegistry } from "../src/saga-registry.js"
@@ -47,6 +59,47 @@ const digest: DigestFunction = async (input) => {
   copy.set(input)
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", copy.buffer))
   return [...hash].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+}
+
+async function reconcileStoredSagaHistory(operationId: string, sagaId: string) {
+  const reader = new D1SagaHistoryReader(env.DB)
+  const anchor = await reader.captureAnchor(operationId, sagaId)
+  const plan = await reader.operationPlan(anchor, digest)
+  const descriptor = await reader.sagaDescriptor(anchor, digest)
+  const audit = new SagaHistoryAuditFolder(anchor, digest)
+  let auditCursor = 0
+  for (;;) {
+    const page = await reader.auditPage(anchor, auditCursor)
+    await audit.append(page)
+    if (page.complete) break
+    auditCursor = page.nextCursor as number
+  }
+  const transition = new SagaHistoryTransitionFolder(anchor, audit.proof(), plan, digest)
+  let transitionCursor: SagaHistoryTransitionCursor | undefined
+  for (;;) {
+    const page = await reader.transitionPage(anchor, transitionCursor)
+    await transition.append(page)
+    if (page.complete) break
+    transitionCursor = page.nextCursor as SagaHistoryTransitionCursor
+  }
+  const effect = new SagaHistoryEffectFolder(anchor, digest)
+  let effectCursor: number | undefined
+  for (;;) {
+    const page = await reader.effectPage(anchor, effectCursor)
+    await effect.append(page)
+    if (page.complete) break
+    effectCursor = page.nextCursor as number
+  }
+  const attempt = new SagaHistoryAttemptFolder(anchor, reader, digest)
+  let attemptCursor: SagaHistoryAttemptCursor | undefined
+  for (;;) {
+    const page = await reader.attemptIdentityPage(anchor, attemptCursor)
+    await attempt.append(page)
+    if (page.complete) break
+    attemptCursor = page.nextCursor as SagaHistoryAttemptCursor
+  }
+  await reader.assertAnchorCurrent(anchor)
+  return reconcileSagaHistory(transition, effect, attempt, plan, descriptor)
 }
 
 beforeAll(async () => {
@@ -931,6 +984,203 @@ describe("real workerd D1 saga projection", () => {
     })
     expect(successor.acquired).toBe(true)
     for (const statement of CONTROL_SCHEMA_STATEMENTS) await env.DB.prepare(statement).run()
+  })
+
+  it("reconciles every terminal saga stream from real paged D1 history", async () => {
+    const operationId = "workerd-history-reconciliation-operation"
+    const sagaId = "workerd-history-reconciliation-saga"
+    const leaseKey = `saga:${sagaId}`
+    const forwardAction = {
+      actionId: "workerd.history-reconciliation.forward",
+      artifactChecksum: "3".repeat(64),
+      version: 1,
+    }
+    const forwardObservation = {
+      actionId: "workerd.history-reconciliation.observe-forward",
+      artifactChecksum: "4".repeat(64),
+      version: 1,
+    }
+    const compensationAction = {
+      actionId: "workerd.history-reconciliation.compensate",
+      artifactChecksum: "5".repeat(64),
+      version: 1,
+    }
+    const compensationObservation = {
+      actionId: "workerd.history-reconciliation.observe-compensation",
+      artifactChecksum: "6".repeat(64),
+      version: 1,
+    }
+    const effectHandler = () => ({
+      evidenceJson: "{}",
+      outputJson: "{}",
+      state: "confirmed" as const,
+    })
+    const observationHandler = () => ({
+      evidenceJson: "{}",
+      outputJson: "{}",
+      state: "applied" as const,
+    })
+    const registry = await sealSagaHandlerRegistry(
+      [
+        { handler: effectHandler, kind: "effect", reference: forwardAction },
+        { handler: observationHandler, kind: "observation", reference: forwardObservation },
+        { handler: effectHandler, kind: "effect", reference: compensationAction },
+        {
+          handler: observationHandler,
+          kind: "observation",
+          reference: compensationObservation,
+        },
+      ],
+      digest,
+    )
+    const descriptor = await sealSagaDescriptor(
+      {
+        descriptorId: "workerd-history-reconciliation",
+        steps: [
+          {
+            authorizationPolicyChecksum: null,
+            baseRetryDelayMs: 0,
+            compensationAction,
+            compensationObservation,
+            forwardAction,
+            forwardObservation,
+            inputSchemaChecksum: "7".repeat(64),
+            irreversible: false,
+            maxAttempts: 1,
+            maxRetryDelayMs: 0,
+            outputSchemaChecksum: "8".repeat(64),
+            stepId: "write",
+            timeoutMs: 1_000,
+          },
+        ],
+        version: 1,
+      },
+      digest,
+    )
+    const invocation = await sealSagaInvocationInput(
+      {
+        descriptor,
+        inputJson: '{"request":"reconcile-history"}',
+        sagaId,
+        stepInputJsons: { write: '{"value":1}' },
+      },
+      digest,
+    )
+    const capabilitySnapshotJson = '{"runtime":"workerd-history-reconciliation-v1"}'
+    const plan = await sealSagaOperationPlan(
+      {
+        capabilitySnapshotChecksum: await digest(new TextEncoder().encode(capabilitySnapshotJson)),
+        descriptor,
+        inputChecksum: invocation.inputChecksum,
+        leaseKey,
+        operationId,
+        operationIdempotencyKey: `${operationId}:key`,
+        registry,
+        sagaId,
+        stepInputChecksums: invocation.stepInputChecksums,
+      },
+      digest,
+    )
+    const operations = new D1OperationStore(env.DB, digest)
+    const leases = new D1LeaseStore(env.DB)
+    const attempts = new D1SagaAttemptStore(env.DB, digest)
+    const coordinator = new D1SagaCoordinatorStore(env.DB, digest)
+    await operations.create({
+      actorChecksum: "workerd-history-reconciliation-actor",
+      capabilitySnapshotJson,
+      environmentId: "workerd-history-reconciliation",
+      idempotencyScope: "workerd-history-reconciliation",
+      inputJson: invocation.operationInputJson,
+      plan,
+      requiredShardIds: ["workerd-history-reconciliation-shard"],
+    })
+    const acquired = await leases.acquire({
+      acquisitionId: "workerd-history-reconciliation-acquisition",
+      holderId: "workerd-history-reconciliation-holder",
+      leaseKey,
+      ttlMs: 60_000,
+    })
+    if (!acquired.acquired) throw new Error("History reconciliation lease acquisition failed.")
+    const proof = leaseProof(acquired.record)
+    const initPlan = plan.steps.find((step) => step.stepId === SAGA_INIT_OPERATION_STEP_ID)
+    if (initPlan === undefined) throw new Error("History reconciliation init plan is missing.")
+    const initAttemptId = `${sagaId}:init`
+    await operations.beginStep({
+      actorChecksum: "workerd-history-reconciliation-actor",
+      attemptId: initAttemptId,
+      idempotencyKey: initPlan.idempotencyKey,
+      observedPreconditionChecksum: initPlan.preconditionChecksum,
+      operationId,
+      proof,
+      stepId: initPlan.stepId,
+    })
+    await coordinator.initializeSaga({
+      actorChecksum: "workerd-history-reconciliation-actor",
+      attemptId: initAttemptId,
+      deadlineAtMs: 8_000_000_000_000_000,
+      descriptor,
+      evidenceChecksum: `${sagaId}:init:evidence`,
+      idempotencyKey: `${sagaId}:key`,
+      inputChecksum: invocation.inputChecksum,
+      observedPostconditionChecksum: initPlan.postconditionChecksum,
+      operationId,
+      proof,
+      resultChecksum: `${sagaId}:init:result`,
+      sagaId,
+      stepInputChecksums: invocation.stepInputChecksums,
+    })
+    const attemptId = `${sagaId}:write:1`
+    const begun = await coordinator.beginAction({
+      actorChecksum: "workerd-history-reconciliation-actor",
+      attemptId,
+      operationId,
+      phase: "forward",
+      proof,
+      sagaId,
+      stepId: "write",
+    })
+    if (begun.disposition !== "execute") {
+      throw new Error("History reconciliation action did not begin.")
+    }
+    await attempts.accept({
+      attemptId,
+      inputJson: invocation.stepInputJsons.write as string,
+      phase: "forward",
+      proof,
+      purpose: "effect",
+      sagaId,
+      sagaStepId: "write",
+    })
+    await attempts.complete({
+      attemptId,
+      evidenceJson: '{"source":"workerd-history-reconciliation"}',
+      outputJson: '{"written":true}',
+      proof,
+      state: "confirmed",
+    })
+    const terminal = await coordinator.settleActionFromReceipt({
+      actorChecksum: "workerd-history-reconciliation-actor",
+      attemptId,
+      operationId,
+      phase: "forward",
+      proof,
+      sagaId,
+      stepId: "write",
+    })
+    expect(terminal.status).toBe("succeeded")
+
+    await expect(reconcileStoredSagaHistory(operationId, sagaId)).resolves.toMatchObject({
+      actionBeginCount: 1,
+      attemptCount: 1,
+      coupledTransitionCount: 3,
+      effectAttemptCount: 1,
+      effectCount: 3,
+      observationAttemptCount: 0,
+      operationId,
+      sagaId,
+      schemaVersion: 1,
+      transitionCount: 4,
+    })
   })
 
   it("atomically advances a saga only through exact fenced operation transitions", async () => {

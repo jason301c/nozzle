@@ -502,7 +502,17 @@ async function recoveryFixture(mode: "not-dispatched" | "unknown"): Promise<Effe
     stepId: operationStepId("forward"),
     transitionId: exactTransition("accepted", operationStepId("forward"), `recovery-${mode}`),
   })
-  const evidence = `recovery-evidence-${mode}`
+  const evidence =
+    mode === "not-dispatched"
+      ? await domainChecksum(COORDINATOR_DOMAIN, [
+          "recovery-not-dispatched",
+          OPERATION_ID,
+          operationStepId("forward"),
+          `recovery-${mode}`,
+          `gap-${mode}`,
+          "2",
+        ])
+      : `recovery-evidence-${mode}`
   const recovered =
     mode === "unknown"
       ? markRunningSagaActionUnknown(running, {
@@ -952,6 +962,15 @@ describe("SagaHistoryEffectFolder", () => {
 
   it("rejects semantic relabeling, evidence forgery, invalid time, and stale recovery fences", async () => {
     const success = await successfulFixture()
+    const noPredecessor = await resealRow(success.rows[0] as SagaHistoryEffectRow, {
+      effect_kind: "action:forward:recovery:not-dispatched",
+    })
+    await expect(
+      new SagaHistoryEffectFolder(terminalAnchor(success), digest).append(
+        effectPage([noPredecessor], true),
+      ),
+    ).rejects.toMatchObject({ message: expect.stringMatching(/no predecessor/u) })
+
     const begin = success.rows[1] as SagaHistoryEffectRow
     const badEvidence = { ...begin, evidence_checksum: "wrong" }
     const beginFolder = new SagaHistoryEffectFolder(terminalAnchor(success), digest)
@@ -999,6 +1018,21 @@ describe("SagaHistoryEffectFolder", () => {
     await recoveryFolder.append(effectPage(recovery.rows.slice(0, 2), false))
     await expect(recoveryFolder.append(effectPage([stale], true))).rejects.toMatchObject({
       message: expect.stringMatching(/strictly newer/u),
+    })
+
+    const recovered = recovery.rows[2] as SagaHistoryEffectRow
+    const forgedRecord = JSON.parse(recovered.record_json) as {
+      steps: { write: { forward: { errorChecksum: string } } }
+    }
+    forgedRecord.steps.write.forward.errorChecksum = "forged-recovery-evidence"
+    const forged = await resealRow(recovered, {
+      evidence_checksum: "forged-recovery-evidence",
+      record_json: JSON.stringify(canonicalValue(forgedRecord)),
+    })
+    const forgedFolder = new SagaHistoryEffectFolder(terminalAnchor(recovery), digest)
+    await forgedFolder.append(effectPage(recovery.rows.slice(0, 2), false))
+    await expect(forgedFolder.append(effectPage([forged], true))).rejects.toMatchObject({
+      message: expect.stringMatching(/deterministic evidence/u),
     })
   })
 
